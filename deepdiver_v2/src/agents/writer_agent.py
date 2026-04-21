@@ -36,6 +36,10 @@ class WriterAgent(BaseAgent):
         self.progress_callback = None
         # Chapter progress tracking
         self._crash_test_part_count = 0
+        # Chapter numbering validation
+        self._expected_next_chapter = 1
+        self._total_chapters = 0
+        self._written_chapters = set()
 
     def set_cancellation_token(self, cancellation_token):
         """
@@ -543,9 +547,43 @@ For each function call, return a JSON object placed within the [unused11][unused
                     })
 
                     tool_calls = extract_tool_calls(assistant_message["content"])
+                    
+                    # 增强日志：记录工具调用解析结果
+                    if len(tool_calls) == 0:
+                        self.logger.warning(f"[工具调用] 第{iteration}次迭代未解析到任何工具调用")
+                        # 记录原始内容的前500字符用于调试
+                        content_preview = assistant_message["content"][:500] if assistant_message.get("content") else "None"
+                        self.logger.debug(f"[工具调用] 原始响应内容预览: {content_preview}")
+                        
+                        # 智能检测：如果Reasoning中提到section_writer但未成功调用，立即重试
+                        content = assistant_message.get("content", "")
+                        has_tool_marker = "[unused11]" in content and "[unused12]" in content
+                        mentions_section_writer = "section_writer" in content
+                        
+                        if mentions_section_writer and has_tool_marker:
+                            # 确定：AI生成了工具调用标记但解析失败（JSON格式错误或不完整）
+                            self.logger.error(f"[工具调用] 检测到工具调用标记但解析失败，JSON可能格式错误或不完整")
+                            retry_prompt = (
+                                "工具调用格式有误，未能成功解析。请重新生成section_writer工具调用，"
+                                "确保JSON格式正确且完整。格式示例：[unused11][{\"name\": \"section_writer\", \"arguments\": {...}}][unused12] /no_think"
+                            )
+                            conversation_history.append({"role": "user", "content": retry_prompt})
+                            continue  # 立即进入下一次LLM调用，不增加迭代计数
+                        elif mentions_section_writer and not has_tool_marker:
+                            # 推断：AI在思考中提到section_writer但可能忘记生成工具调用
+                            self.logger.warning(f"[工具调用] Reasoning中提到section_writer但未生成工具调用标记")
+                            retry_prompt = (
+                                "你在思考中提到要调用section_writer工具，但没有生成工具调用。"
+                                "请使用正确的格式生成工具调用：[unused11][{\"name\": \"section_writer\", \"arguments\": {...}}][unused12] /no_think"
+                            )
+                            conversation_history.append({"role": "user", "content": retry_prompt})
+                            continue
+                    else:
+                        self.logger.debug(f"[工具调用] 第{iteration}次迭代解析到{len(tool_calls)}个工具调用: {[tc.get('name') for tc in tool_calls]}")
 
                     # Execute tool calls if any (Acting phase)
                     for tool_call in tool_calls:
+                        tool_name = tool_call["name"]
                         # Str
                         arguments = tool_call["arguments"]
                         tool_name = tool_call["name"]
@@ -559,33 +597,111 @@ For each function call, return a JSON object placed within the [unused11][unused
                         if tool_name in ["think"]:
                             tool_result = {
                                 "tool_results": "You can proceed to invoke other tools if needed. But the next step cannot call the reflect tool"}
+                        elif tool_name == "section_writer":
+                            # 章节编号验证
+                            import re
+                            write_file_path = ""
+                            if isinstance(arguments, dict):
+                                write_file_path = arguments.get('write_file_path', '')
+                            elif isinstance(arguments, str):
+                                args_dict = json.loads(arguments)
+                                write_file_path = args_dict.get('write_file_path', '')
+                            
+                            # 提取章节编号
+                            chapter_match = re.search(r'part_(\d+)\.md', write_file_path)
+                            if chapter_match:
+                                chapter_num = int(chapter_match.group(1))
+                                
+                                # 验证章节编号连续性
+                                if chapter_num != self._expected_next_chapter:
+                                    error_msg = f"章节编号错误：期望写第{self._expected_next_chapter}章，但调用了第{chapter_num}章。请按顺序写作，不要跳过章节。"
+                                    self.logger.error(f"[章节验证] {error_msg}")
+                                    tool_result = {
+                                        "success": False,
+                                        "error": error_msg,
+                                        "expected_chapter": self._expected_next_chapter,
+                                        "actual_chapter": chapter_num
+                                    }
+                                else:
+                                    # 章节编号正确，执行工具调用
+                                    tool_result = self.execute_tool_call(tool_call)
+                                    
+                                    # 如果成功，更新计数器并推送进度
+                                    if tool_result.get("success"):
+                                        self._written_chapters.add(chapter_num)
+                                        self._expected_next_chapter = chapter_num + 1
+                                        self.logger.info(f"[章节验证] 成功完成第{chapter_num}章，下一章应为第{self._expected_next_chapter}章")
+                                        
+                                        # 推送章节进度
+                                        self._crash_test_part_count += 1
+                                        try:
+                                            # 从 arguments 中提取章节标题
+                                            outline = ""
+                                            if isinstance(arguments, dict):
+                                                outline = arguments.get('current_chapter_outline', '')
+                                            elif isinstance(arguments, str):
+                                                args_dict = json.loads(arguments)
+                                                outline = args_dict.get('current_chapter_outline', '')
+                                            
+                                            # 提取第一行作为章节标题
+                                            if outline:
+                                                chapter_title = outline.split('\n')[0].strip()
+                                                chapter_title = chapter_title.replace('#', '').strip()[:50]
+                                                
+                                                _writing_prefix = '正在撰写: ' if getattr(self, '_is_chinese_query', True) else 'Writing: '
+                                                self._send_progress('writing_chapter', f'{_writing_prefix}{chapter_title}', {
+                                                    'chapter_title': chapter_title
+                                                })
+                                        except Exception as e:
+                                            # 静默失败，不影响主流程
+                                            self.logger.debug(f"Failed to send chapter progress: {e}")
+                            else:
+                                # 无法提取章节编号，正常执行
+                                tool_result = self.execute_tool_call(tool_call)
+                                
+                                # 推送进度（无章节编号的情况）
+                                if tool_result.get("success"):
+                                    self._crash_test_part_count += 1
+                                    try:
+                                        outline = ""
+                                        if isinstance(arguments, dict):
+                                            outline = arguments.get('current_chapter_outline', '')
+                                        elif isinstance(arguments, str):
+                                            args_dict = json.loads(arguments)
+                                            outline = args_dict.get('current_chapter_outline', '')
+                                        
+                                        if outline:
+                                            chapter_title = outline.split('\n')[0].strip()
+                                            chapter_title = chapter_title.replace('#', '').strip()[:50]
+                                            
+                                            _writing_prefix = '正在撰写: ' if getattr(self, '_is_chinese_query', True) else 'Writing: '
+                                            self._send_progress('writing_chapter', f'{_writing_prefix}{chapter_title}', {
+                                                'chapter_title': chapter_title
+                                            })
+                                    except Exception as e:
+                                        self.logger.debug(f"Failed to send chapter progress: {e}")
+                        elif tool_name == "concat_section_files":
+                            # 在合并前检查章节完整性
+                            if self._expected_next_chapter > 1:
+                                expected_chapters = set(range(1, self._expected_next_chapter))
+                                missing_chapters = expected_chapters - self._written_chapters
+                                
+                                if missing_chapters:
+                                    error_msg = f"章节不完整：缺少第{sorted(missing_chapters)}章。请先完成所有章节再合并。"
+                                    self.logger.error(f"[完整性检查] {error_msg}")
+                                    tool_result = {
+                                        "success": False,
+                                        "error": error_msg,
+                                        "missing_chapters": sorted(missing_chapters),
+                                        "written_chapters": sorted(self._written_chapters)
+                                    }
+                                else:
+                                    self.logger.info(f"[完整性检查] 所有{len(self._written_chapters)}个章节已完成，可以合并")
+                                    tool_result = self.execute_tool_call(tool_call)
+                            else:
+                                tool_result = self.execute_tool_call(tool_call)
                         else:
                             tool_result = self.execute_tool_call(tool_call)
-                            
-                            # 在工具执行成功后推送章节进度
-                            if tool_name == "section_writer" and tool_result.get("success"):
-                                self._crash_test_part_count += 1
-                                try:
-                                    # 从 arguments 中提取章节标题
-                                    outline = ""
-                                    if isinstance(arguments, dict):
-                                        outline = arguments.get('current_chapter_outline', '')
-                                    elif isinstance(arguments, str):
-                                        args_dict = json.loads(arguments)
-                                        outline = args_dict.get('current_chapter_outline', '')
-                                    
-                                    # 提取第一行作为章节标题
-                                    if outline:
-                                        chapter_title = outline.split('\n')[0].strip()
-                                        chapter_title = chapter_title.replace('#', '').strip()[:50]
-                                        
-                                        _writing_prefix = '正在撰写: ' if getattr(self, '_is_chinese_query', True) else 'Writing: '
-                                        self._send_progress('writing_chapter', f'{_writing_prefix}{chapter_title}', {
-                                            'chapter_title': chapter_title
-                                        })
-                                except Exception as e:
-                                    # 静默失败，不影响主流程
-                                    self.logger.debug(f"Failed to send chapter progress: {e}")
 
                         # Log the action using base class method
                         self.log_action(iteration, tool_name, arguments, tool_result)
@@ -711,7 +827,7 @@ For each function call, return a JSON object placed within the [unused11][unused
 
         except Exception as e:
             execution_time = time.time() - start_time if 'start_time' in locals() else 0
-            self.logger.error(f"Error in execute_react_loop: {e}")
+            self.logger.error(f"Error in execute_react_loop: {repr(e)}")
 
             return self.create_response(
                 success=False,

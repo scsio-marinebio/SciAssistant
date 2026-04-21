@@ -60,6 +60,24 @@
 
     <!-- 全局Markdown转HTML函数 -->
     <script>
+    // 引用标注点击跳转：查找并滚动到对应的参考来源
+    // 支持两种ID格式：search-source-N（聊天搜索来源）和 ref-*-N（报告参考文献锚点）
+    function scrollToCitation(num) {
+        var src = document.getElementById('search-source-' + num);
+        if (!src) {
+            var all = document.querySelectorAll('a[id^="ref-"]');
+            for (var i = 0; i < all.length; i++) {
+                if (all[i].id.endsWith('-' + num)) { src = all[i]; break; }
+            }
+        }
+        if (src) {
+            src.scrollIntoView({behavior: 'smooth', block: 'center'});
+            src.style.transition = 'background 0.3s';
+            src.style.background = '#fef3c7';
+            setTimeout(function() { src.style.background = ''; }, 2000);
+        }
+    }
+
     // Markdown解析函数: 解析 Markdown 格式的文本，转换为 HTML 格式
     // 该函数在 AI 聊天界面中用于渲染 AI 生成的回复内容
     function markdownToHtml(text) {
@@ -246,10 +264,20 @@
             return URL_PLACEHOLDER + (codeBlocks.length - 1) + '___';
         });
         
-        // 6.3 正文中的引用标注 [数字] -> 与文字同行显示，可点击跳转到搜索来源
+        // 6.3a 多引用标注 [数字, 数字, ...] -> 拆分为多个可点击上标引用
+        html = html.replace(/(?<=[^\n\[])(\[(\d+(?:\s*,\s*\d+)+)\])/g, function(match, full, nums) {
+            const parts = nums.split(/\s*,\s*/);
+            const rendered = parts.map(function(n) {
+                return `<sup><a class="citation-ref" data-ref="${n}" href="javascript:void(0)" style="text-decoration:none;cursor:pointer;color:#3b82f6;" onclick="event.preventDefault();scrollToCitation(${n});event.stopPropagation();">[${n}]</a></sup>`;
+            }).join('');
+            codeBlocks.push(rendered);
+            return URL_PLACEHOLDER + (codeBlocks.length - 1) + '___';
+        });
+
+        // 6.3b 正文中的引用标注 [数字] -> 与文字同行显示，可点击跳转到搜索来源
         // 匹配正文中的 [数字] 格式（非行首，前面是中文/英文/标点），转为行内链接
         html = html.replace(/(?<=[^\n\[])(\[(\d+)\])/g, function(match, full, num) {
-            const rendered = `<span class="citation-ref" data-ref="${num}" style="cursor:pointer;color:#3b82f6;font-size:1em;padding:0 1px;border-radius:2px;background:#eff6ff;font-weight:500;display:inline;" onclick="(function(e){var src=document.getElementById('search-source-'+${num});if(src){src.scrollIntoView({behavior:'smooth',block:'center'});src.style.transition='background 0.3s';src.style.background='#fef3c7';setTimeout(function(){src.style.background='';},2000);}e.stopPropagation();})(event)">[${num}]</span>`;
+            const rendered = `<sup><a class="citation-ref" data-ref="${num}" href="javascript:void(0)" style="text-decoration:none;cursor:pointer;color:#3b82f6;" onclick="event.preventDefault();scrollToCitation(${num});event.stopPropagation();">[${num}]</a></sup>`;
             codeBlocks.push(rendered);
             return URL_PLACEHOLDER + (codeBlocks.length - 1) + '___';
         });
@@ -3105,6 +3133,7 @@ function copyToClipboard(text, button) {
                 cancelButton.innerHTML = '<i class="fa fa-spinner fa-spin"></i>';
                 
                     // 【关键修复】立即标记会话为已取消（在POST发出之前！）
+                    // 当6个SSE占满localhost:8001连接时，取消POST会pending
                     // 必须在POST之前标记，否则pending期间切换会话会重新显示"正在规划"
                     window.cancelledSessions = window.cancelledSessions || {};
                     window.cancelledSessions[currentSessionId] = Date.now();
@@ -5252,8 +5281,17 @@ function copyToClipboard(text, button) {
                         })
                         .catch(error => {
                             console.error('加载会话消息失败：', error);
-                            addMessage('加载会话消息失败，请重试，错误信息：'+error, 'ai');
-                            saveResultToDB('加载会话消息失败，请重试，错误信息：'+error,sessionId,"ai");
+                            // 网络错误或加载失败时，只在界面显示临时提示，不写入数据库
+                            // 避免将错误信息污染会话历史
+                            const errorMsg = error.message === 'Failed to fetch' 
+                                ? '网络连接失败，无法加载会话历史。请检查网络连接后刷新页面重试。'
+                                : `加载会话消息失败：${error.message || error}`;
+                            
+                            // 只显示在界面，不保存到数据库
+                            addMessage(errorMsg, 'ai');
+                            
+                            // 可选：显示重试按钮
+                            console.warn('会话加载失败，用户可刷新页面重试');
                         });
                 } else {
                     // 新会话，显示初始提示

@@ -3920,6 +3920,13 @@ class MCPTools:
             else:
                 logger.warning(f"警告: 文件分析数据不存在: {file_analysis_path}")
 
+            # 【关键修复】规范化多引用格式 [53, 57] -> [53][57]
+            # AI模型有时会生成逗号分隔的多引用，导致后续提取和替换逻辑无法处理
+            def _split_multi_cite_merge(m):
+                nums = [n.strip() for n in m.group(1).split(",") if n.strip().isdigit()]
+                return "".join(f"[{n}]" for n in nums)
+            merged_content = re.sub(r'\[(\d+(?:\s*,\s*\d+)+)\]', _split_multi_cite_merge, merged_content)
+
             # 提取引用序号 - 匹配新格式 [数字]
             citation_pattern = r'\[(\d+)\]'
             citations_found = re.findall(citation_pattern, merged_content)
@@ -7457,6 +7464,12 @@ Strictly follow the following format for output:
 
             # Normalize [webpaeg22] or [webpage22] -> [22]
             content = re.sub(r"\[webp(?:aeg|age)(\d+)\]", r"[\1]", content)
+
+            # Normalize multi-citation [53, 57] -> [53][57]
+            def _split_multi_cite(m):
+                nums = [n.strip() for n in m.group(1).split(",") if n.strip().isdigit()]
+                return "".join(f"[{n}]" for n in nums)
+            content = re.sub(r"\[(\d+(?:\s*,\s*\d+)+)\]", _split_multi_cite, content)
         except Exception:
             # On regex errors, return original content to be safe
             return content
