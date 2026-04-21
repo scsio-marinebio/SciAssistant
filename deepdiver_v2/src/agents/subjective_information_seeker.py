@@ -124,58 +124,23 @@ class InformationSeekerAgent(BaseAgent):
             web_tools = [t for t in enabled_tools if any(p in t.lower() for p in ['web_search', 'batch_web'])]
             other_tools = [t for t in enabled_tools if t not in api_tools and t not in web_tools]
             
-            search_source_guidance = f"\n\n**📚 SEARCH STRATEGY (按优先级使用):**\n\n"
-            
-            # Priority 1: Specialized Academic APIs
+            # Build concise search source guidance
+            available_tools = []
             if api_tools:
-                search_source_guidance += f"**🥇 优先级 1 - 专有学术 API** (强烈推荐优先使用):\n"
-                for tool in api_tools:
-                    if 'arxiv' in tool.lower():
-                        search_source_guidance += f"  • **{tool}**: arXiv 预印本库（计算机科学、物理、数学等）\n"
-                        search_source_guidance += f"    ✅ 完整元数据 | ✅ 直接下载 PDF 全文 | ✅ 无访问限制 | ✅ 100% 学术内容\n"
-                    elif 'pubmed' in tool.lower():
-                        search_source_guidance += f"  • **{tool}**: PubMed 权威医学文献数据库\n"
-                        search_source_guidance += f"    ✅ MeSH 主题词标注 | ✅ 部分 PMC 全文 | ✅ 结构化元数据 | ✅ 医学权威来源\n"
-                    elif 'medrxiv' in tool.lower():
-                        search_source_guidance += f"  • **{tool}**: medRxiv 最新医学预印本\n"
-                        search_source_guidance += f"    ✅ 最新医学研究 | ✅ 直接下载 PDF | ✅ 按类别组织 | ✅ 快速发布\n"
-                    elif 'scholar' in tool.lower():
-                        search_source_guidance += f"  • **{tool}**: Google Scholar 全学科学术搜索\n"
-                        search_source_guidance += f"    ✅ 覆盖所有学科 | ✅ 引用数据 | ✅ 跨数据库搜索 | ✅ 可用 google_scholar_get_paper 获取论文内容\n"
-                    # elif 'springer' in tool.lower():
-                    #     search_source_guidance += f"  • **{tool}**: Springer Nature 期刊文章\n"
-                    #     search_source_guidance += f"    ✅ 高质量期刊 | ✅ 完整元数据 | ✅ DOI 标识\n"
-                search_source_guidance += f"\n"
-            
-            # Priority 2: Web Search
+                available_tools.extend(api_tools)
             if web_tools:
-                search_source_guidance += f"**🥈 优先级 2 - 网页搜索** (补充使用):\n"
-                for tool in web_tools:
-                    search_source_guidance += f"  • **{tool}**: 通用网页搜索（已配置学术网站定向）\n"
-                    search_source_guidance += f"    ✅ 覆盖面广 | ✅ 多领域内容 | ⚠️ 部分内容可能受访问限制（成功率 ~89%）\n"
-                    search_source_guidance += f"    💡 适用场景: 工业应用、技术博客、新闻报道、非学术内容\n"
-                search_source_guidance += f"\n"
+                available_tools.extend(web_tools)
             
-            # Recommended workflow
-            search_source_guidance += f"**💡 推荐工作流程**:\n"
-            if api_tools:
-                search_source_guidance += f"1. **首选**: 使用专有学术 API 获取核心学术文献\n"
-                search_source_guidance += f"   - 优势: 完整元数据、高成功率（99%+）、可直接下载 PDF 全文\n"
-                search_source_guidance += f"   - 示例: arxiv_search → arxiv_read_paper 获取完整论文\n"
-                search_source_guidance += f"   - 示例: google_scholar_search 搜索全学科论文，再用对应源工具获取全文\n"
-            if web_tools:
-                search_source_guidance += f"2. **补充**: 使用网页搜索获取其他来源内容\n"
-                search_source_guidance += f"   - 用途: 工业应用案例、技术博客、新闻动态、非学术资源\n"
-                search_source_guidance += f"   - 注意: 部分网站可能有反爬虫限制或订阅墙\n"
-            search_source_guidance += f"3. **深入**: 对重要论文使用 read_paper 工具获取完整全文\n"
-            search_source_guidance += f"   - arxiv_read_paper, get_pubmed_article, medrxiv_read_paper 等\n"
-            search_source_guidance += f"   - Google Scholar: google_scholar_search → google_scholar_get_paper 获取论文内容\n\n"
+            if available_tools:
+                search_source_guidance = f"\n**Available Search Tools**: {', '.join(available_tools)}\n"
+                search_source_guidance += "**Quick Guide**: Use academic APIs (arxiv_search, pubmed_search, etc.) for papers; use batch_web_search for general content.\n"
+            else:
+                search_source_guidance = ""
             
             if disabled_tools:
-                search_source_guidance += f"⚠️ **不可用工具**: {', '.join(disabled_tools)}\n"
-                search_source_guidance += f"如果尝试使用这些工具会收到错误，请使用上述可用工具。\n\n"
+                search_source_guidance += f"**Disabled**: {', '.join(disabled_tools)}\n"
         else:
-            search_source_guidance = f"\n\n**⚠️ WARNING: ALL SEARCH TOOLS DISABLED**\n"
+            search_source_guidance = "**WARNING: ALL SEARCH TOOLS DISABLED**\n"
             search_source_guidance += f"No external search tools are available in this session. You can only work with existing files in the workspace (user_uploads/, library_refs/, etc.).\n"
             search_source_guidance += f"Focus on analyzing existing documents and files using document_extract, document_qa, and file operations.\n"
         
@@ -185,7 +150,7 @@ class InformationSeekerAgent(BaseAgent):
         
         system_prompt_template = f"""You are an Information Seeker Agent that follows the ReAct pattern (Reasoning + Acting).
 
-## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+## CRITICAL: Response Language Rules (MUST FOLLOW)
 **Detect the language of the user's query/task and respond accordingly:**
 - **English query → Respond in English**
 - **Chinese query (中文) → Respond in Chinese (中文回复)**
@@ -206,62 +171,23 @@ When searching for recent information or papers, be aware that the current date 
         TOOL USAGE STRATEGY:
         Follow this optimized workflow for information gathering:
         
-        0. **MANDATORY FIRST STEP - Check Workspace for Existing Files:**
-           - Check `./user_uploads/` directory for user-uploaded files (HIGH PRIORITY)
-           - Check `./library_refs/` directory for user-selected library files (NORMAL PRIORITY)
-           - **CRITICAL REQUIREMENT:** When calling `document_extract`, you MUST include ALL document files from BOTH directories:
-             * Include ALL .pdf, .doc, .docx files (source documents)
-             * Include ALL .txt files that are NOT converted from other documents (e.g., research/*.txt)
-             * The system will automatically skip .pdf.txt, .doc.txt, .docx.txt if the source file exists
-           - **DO NOT FILTER FILES:** Do NOT make assumptions about file relevance based on filenames
-           - **DO NOT SELECT SUBSET:** Do NOT choose only "relevant-looking" files - analyze ALL files
-           - **MANDATORY:** If library_refs has 12 files, you MUST pass all 12 files to document_extract
-           - **CRITICAL:** Do NOT skip library_refs files even if user_uploads has files
-           - Only proceed to web search after analyzing existing files
-
+        0. **FIRST STEP - Check Workspace Files (Smart Detection):**
+           - Use `list_workspace` to quickly check if `./user_uploads/` or `./library_refs/` contain any files
+           - If files exist: Use `document_extract` to analyze ALL files (include ALL .pdf, .doc, .docx, .txt files)
+           - If no files: Skip this step and proceed directly to web search
         
         1. INITIAL RESEARCH:{search_source_guidance}
-           - Generate focused search queries (≤10): Limit to no more than 10 initial search queries to avoid increased failure rates from excessive decomposition.
-           - **RECOMMENDED TOOL SELECTION STRATEGY**:
-                a) **Prefer specialized academic APIs** when query matches their coverage:
-                   • Biology/Medical topics → "search_pubmed_key_words", "search_pubmed_advanced", "medrxiv_search"
-                   • Computer Science/Math/Physics topics → "arxiv_search"
-                   • Cross-discipline broad academic search → "google_scholar_search", "advanced_google_scholar_search"
-                   • Advantages: Complete metadata, direct PDF access, 99%+ success rate
-                b) **Use "batch_web_search"** for:
-                   • Topics outside specialized API coverage (engineering, social sciences, multi-disciplinary, etc.)
-                   • Industry applications, technical blogs, news, case studies
-                   • Supplementary content to complement academic sources
-                   • Non-English academic content
-                   • Note: Web search has academic site targeting enabled (academic sites including arXiv, Nature, IEEE, etc.)
-                c) **Use Google Scholar** for cross-discipline searches or when unsure which specialized API to use - results may link to arXiv, PubMed, etc.
-                d) **Combine all approaches** when appropriate - use specialized APIs for core academic papers, Google Scholar for broad discovery, and web search for broader context
-           - When calling web search, consider the language of the user's question (e.g., use Chinese for Chinese questions)
+           - Generate focused search queries (≤10) to avoid increased failure rates from excessive decomposition
+           - Use `batch_web_search` to find relevant URLs for your queries. When calling the search statement, consider the language of the user's question. For example, for a Chinese question, generate a part of the search statement in Chinese.
            - Analyze the search results (titles, snippets, URLs, paper metadata) to identify promising sources
         
         2. CONTENT EXTRACTION:  
-           - **CRITICAL: Special handling for academic paper URLs**:
-                • If a URL from "batch_web_search" is an arXiv paper (e.g., https://arxiv.org/abs/XXXX.XXXXX):
-                  → Extract the paper_id (e.g., "1206.3218" from "https://arxiv.org/abs/1206.3218")
-                  → Use "arxiv_read_paper" with the paper_id (NOT url_crawler or download_files)
-                  → This ensures you get the full paper content, not just the HTML abstract page
-                • Similarly for other academic sources: PubMed URLs → get_pubmed_article, etc.
-           - For important URLs searched by "batch_web_search", use `url_crawler` to:  
-                a) Extract full content from the webpage  
-                b) Save the content to a file in the workspace **under the relative path `./url_crawler_save_files/`**
-                c) **Exception**: Do NOT use url_crawler for arXiv/PubMed/medRxiv URLs - use their dedicated tools instead
-                d) For Google Scholar results: check if the URL points to arXiv/PubMed/medRxiv, and if so use the corresponding dedicated tool instead of url_crawler
-           - For important articles searched with pubmed, medrxiv, or arxiv, use the corresponding retrieval tools:
-                a) PubMed: "get_pubmed_article" (requires PMID from search results)
-                b) medRxiv: "medrxiv_read_paper" (requires paper_id from search results)
-                c) arXiv: "arxiv_read_paper" (requires paper_id from search results)
+           - Use `url_crawler` to extract content from URLs and save to `./url_crawler_save_files/`
+           - For known paper IDs, you can use dedicated tools (arxiv_read_paper, get_pubmed_article, medrxiv_read_paper, etc.)
            - Store results with meaningful file paths (e.g., `url_crawler_save_files/research/ai_trends_2024.txt`)
         
         3. CONTENT ANALYSIS:
-           - Use `document_qa` to ask specific questions about the saved files:
-                a) Formulate focused questions to extract key insights
-                b) Use answers to deepen your understanding
-           - You can ask multiple questions about the same file
+           - Use `document_qa` to ask focused questions about saved files
            - Use `document_extract` for multi-dimensional analysis of saved files:
                 a) Provides structured analysis across five key dimensions: doc time source authority, core content and task relevance
         
@@ -273,13 +199,10 @@ When searching for recent information or papers, be aware that the current date 
                 c) Avoid reading large files directly as it may exceed context limits
         
         5. TASK COMPLETION:
-           - When ready to report, call `info_seeker_subjective_task_done` with:
-                a) Comprehensive markdown summary of your process and findings
-                b) List of key files created with descriptions
+           - Call `info_seeker_subjective_task_done` with markdown summary and list of key files
         
-        ### Usage of Systematic Tool:
-            - `think` is a systematic tool. After receiving the response from the complex tool or before invoking any other tools, you must **first invoke the `think` tool**: to deeply reflect on the results of previous tool invocations (if any), and to thoroughly consider and plan the user's task. The `think` tool does not acquire new information; it only saves your thoughts into memory.
-            - `reflect` is a systematic tool. When encountering a failure in tool execution, it is necessary to invoke the reflect tool to conduct a review and revise the task plan. It does not acquire new information; it only saves your thoughts into memory.
+        ### Systematic Tools:
+        - `think` is a systematic tool. After receiving the response from the complex tool or before invoking any other tools, you must **first invoke the `think` tool**: to deeply reflect on the results of previous tool invocations (if any), and to thoroughly consider and plan the user's task. The `think` tool does not acquire new information; it only saves your thoughts into memory.
         
         Always provide clear reasoning for your actions and synthesize information effectively.
 
