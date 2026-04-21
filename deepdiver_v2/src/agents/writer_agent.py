@@ -162,14 +162,23 @@ class WriterAgent(BaseAgent):
     def _build_system_prompt(self) -> str:
         """Build the system prompt for the writer agent"""
         tool_schemas_str = json.dumps(self.tool_schemas, ensure_ascii=False)
-        system_prompt_template = """You are a professional writing master. You will receive key files and user problems. Your task is to generate an outline highly consistent with the user problem, classify files into sections, and iteratively call section_writer tool to create comprehensive content.
-
-## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
-**Detect the language of the user's query and respond accordingly:**
-- **English query → Write the entire article in English**
-- **Chinese query (中文) → Write the entire article in Chinese (中文撰写)**
-- **Mixed Chinese-English query → Write the entire article in Chinese (中文撰写)**
+        
+        # 根据_is_chinese_query标志明确指定输出语言
+        _is_cn = getattr(self, '_is_chinese_query', True)
+        if _is_cn:
+            language_instruction = """## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+**You MUST write the ENTIRE article in Chinese (中文).**
 This rule applies to ALL outputs including: outline generation, chapter content, summaries, and the final article.
+**所有内容必须使用中文撰写，包括：大纲生成、章节内容、摘要和最终文章。**"""
+        else:
+            language_instruction = """## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+**You MUST write the ENTIRE article in English.**
+This rule applies to ALL outputs including: outline generation, chapter content, summaries, and the final article.
+**DO NOT use Chinese characters in the article content.**"""
+        
+        system_prompt_template = f"""You are a professional writing master. You will receive key files and user problems. Your task is to generate an outline highly consistent with the user problem, classify files into sections, and iteratively call section_writer tool to create comprehensive content.
+
+{language_instruction}
 
 Then you strictly follow the steps given below:
         
@@ -240,12 +249,12 @@ Then you strictly follow the steps given below:
 
 Below, within the <tools></tools> tags, are the descriptions of each tool and the required fields for invocation:
 <tools>
-$tool_schemas
+{tool_schemas_str}
 </tools>
 For each function call, return a JSON object placed within the [unused11][unused12] tags, which includes the function name and the corresponding function arguments:
-[unused11][{\"name\": <function name>, \"arguments\": <args json object>}][unused12]
+[unused11][{{"name": <function name>, "arguments": <args json object>}}][unused12]
 """
-        return system_prompt_template.replace("$tool_schemas", tool_schemas_str)
+        return system_prompt_template
 
     def _build_initial_message_from_task_input(self, task_input: WriterAgentTaskInput) -> str:
         """Build the initial user message from TaskInput"""

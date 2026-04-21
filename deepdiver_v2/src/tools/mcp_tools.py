@@ -2624,7 +2624,7 @@ class MCPTools:
 
                 # Example implementation for content extractor (commented out):
                 crawler_url = f"{config.get('base_url', 'https://api.content-extractor.com')}/{url}"
-                response = requests.get(crawler_url, headers=headers, timeout=config.get('timeout', 30))
+                response = requests.get(crawler_url, headers=headers, timeout=config.get('timeout', 30), verify=False)
                 response.raise_for_status()
 
                 content = response.text
@@ -3803,7 +3803,7 @@ class MCPTools:
         # 如果没有提供unique_id，生成一个基于时间戳的唯一ID
         if unique_id is None:
             import time
-            unique_id = f"msg-{int(time.time() * 1000)}"
+            unique_id = f"msg_{int(time.time() * 1000)}"
         report_files = []
         for section_content in section_contents:
             # Handle both dict format (expected) and string format (fallback)
@@ -4377,7 +4377,7 @@ class MCPTools:
                 # 这允许 </sup>[5] 中的 [5] 被正确替换
                 merged_content = re.sub(
                     rf'\[{old_num}\](?!</a>)',
-                    f'<sup><a href="#ref-{unique_id}-{new_num}" style="color: #04B5BB; text-decoration: none;">[{new_num}]</a></sup>',
+                    f'<sup><a href="#ref-{unique_id}-{new_num}" style="text-decoration: none;">[{new_num}]</a></sup>',
                     merged_content
                 )
 
@@ -4560,7 +4560,7 @@ class MCPTools:
             # 读取section_files中的文件内容，并获取摘要和关键词
             # 生成基于时间戳的唯一ID，避免多轮对话中的锚点冲突
             import time
-            unique_id = f"msg-{int(time.time() * 1000)}"
+            unique_id = f"msg_{int(time.time() * 1000)}"
             abstract_keywords = self.merge_reports(section_files, final_file_path, unique_id)
 
             # 如果没有返回摘要和关键词，设置默认值

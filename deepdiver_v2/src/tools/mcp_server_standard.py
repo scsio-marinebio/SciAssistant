@@ -49,16 +49,35 @@ except ImportError:
 # Workspace knowledge manager disabled
 WORKSPACE_KNOWLEDGE_AVAILABLE = False
 
-# Configure structured logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('mcp_server.log')
-    ]
-)
+# Configure structured logging - write to logs directory like app.log
+# Create logs directory if it doesn't exist
+log_dir = Path(__file__).parent.parent.parent.parent / 'logs'
+log_dir.mkdir(parents=True, exist_ok=True)
+
+# Force configure root logger (basicConfig may be ignored if already configured)
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# Remove existing handlers to avoid duplicates
+for handler in root_logger.handlers[:]:
+    root_logger.removeHandler(handler)
+
+# Add console handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
+console_handler.setFormatter(console_formatter)
+root_logger.addHandler(console_handler)
+
+# Add file handler
+file_handler = logging.FileHandler(log_dir / 'mcp_server.log', encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
+file_handler.setFormatter(file_formatter)
+root_logger.addHandler(file_handler)
+
 logger = logging.getLogger(__name__)
+logger.info(f"MCP Server logging configured: {log_dir / 'mcp_server.log'}")
 
 # ================ CONFIGURATION ================
 
