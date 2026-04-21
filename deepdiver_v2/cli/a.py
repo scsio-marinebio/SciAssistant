@@ -652,13 +652,49 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
         
         return result_data
     except Exception as e:
+        logger.error(f"任务执行异常: {e}", exc_info=True)
         task_manager.update_task_status(task_id, TaskStatus.FAILED, error=str(e))
+        
         # 发送任务失败的SSE进度消息
         send_progress_update(task_id, {
             'type': 'error',
             'message': str(e),
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
         })
+        
+        # 【关键修复】将错误消息写入数据库，让前端轮询能感知任务失败
+        try:
+            if frontend_session_id:
+                # 检测用户查询语言，决定错误提示的语言
+                import re
+                query_zh_count = len(re.findall(r'[\u4e00-\u9fff]', query_text))
+                is_chinese = query_zh_count > len(query_text) * 0.3
+                
+                error_message = (
+                    f"抱歉，处理您的请求时遇到了问题：{str(e)}\n\n请尝试重新提问或简化您的问题。" 
+                    if is_chinese 
+                    else f"Sorry, an error occurred while processing your request: {str(e)}\n\nPlease try rephrasing or simplifying your question."
+                )
+                
+                store_url = "http://localhost:5000/api/chat/messages"
+                store_data = {
+                    "session_id": frontend_session_id,
+                    "from_who": "ai",
+                    "content": error_message,
+                    "round": 1,
+                    "uuid": session_id,
+                    "has_report": 0,
+                    "report_title": ""
+                }
+                
+                http_response = requests.post(store_url, json=store_data, timeout=30)
+                if http_response.status_code == 201:
+                    logger.info(f"成功存储错误消息到数据库: session_id={frontend_session_id}")
+                else:
+                    logger.error(f"存储错误消息失败: {http_response.status_code}, {http_response.text}")
+        except Exception as store_error:
+            logger.error(f"存储错误消息到数据库失败: {store_error}")
+        
         # 返回符合 QueryResponse 模型的字典结构
         return {
             'success': False,
@@ -939,7 +975,7 @@ async def handle_single_query(request: SingleQueryRequest):
             'report_path': None
         }
     
-    # 有空闲槽位，立即执行
+    # 有空闲槽位，提交到后台执行（不等待完成）
     task_manager.update_task_status(task_id, TaskStatus.RUNNING)
     loop = asyncio.get_event_loop()
     
@@ -947,12 +983,134 @@ async def handle_single_query(request: SingleQueryRequest):
     if executor is None:
         raise HTTPException(status_code=500, detail="Server executor not initialized")
 
+    # 提交任务到后台执行，不等待结果（去掉 await）
+    loop.run_in_executor(
+        executor,
+        lambda: process_single_query((request.query, 0, all_files_data, search_sources_dict), task_id=task_id, username=request.username,
+                                     skip_task_creation=True, frontend_session_id=request.frontend_session_id)
+    )
+    
+    # 立即返回任务已接受的响应，不等待任务完成
+    # 前端将通过 SSE 接收进度更新和最终结果
+    logger.info(f"[API] 任务已提交到后台执行: task_id={task_id}")
+    return {
+        'success': True,
+        'query': request.query,
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'session_id': '',
+        'task_id': task_id,
+        'planner_result': None,
+        'planner_error': None,
+        'planner_reasoning_trace': [],
+        'planner_iterations': 0,
+        'planner_execution_time': 0,
+        'planner_agent_name': 'TaskAccepted',
+        'section_writer_responses': [],
+        'final_report': None,
+        'report_path': None
+    }
+
+
+@app.post("/api/query/sync", response_model=QueryResponse, summary="处理单个查询（同步模式）")
+async def handle_single_query_sync(request: SingleQueryRequest):
+    """同步处理单个查询，等待任务完成后返回完整结果（适用于 Postman/脚本调用）"""
+    import time
+    request_received_time = time.time()
+
+    # 生成唯一任务ID
+    task_id = request.taskId
+    
+    logger.info(f"[API-SYNC] 收到同步任务请求: task_id={task_id}, timestamp={request_received_time}")
+    
+    # 【并发控制】检查当前运行中的query数量
+    running_count = task_manager.get_running_tasks_count()
+    
+    # 创建任务
+    task_created_time = time.time()
+    task_manager.create_task(task_id, request.query)
+    logger.info(f"[API-SYNC] 任务已创建: task_id={task_id}, 创建耗时={task_created_time - request_received_time:.3f}秒")
+
+    # 准备任务参数
+    user_files_data = []
+    if request.user_files and len(request.user_files) > 0:
+        for file in request.user_files:
+            user_files_data.append({
+                'file_id': file.file_id,
+                'filename': file.filename,
+                'type': 'mandatory'
+            })
+
+    reference_files_data = []
+    if request.reference_files and len(request.reference_files) > 0:
+        for file in request.reference_files:
+            reference_files_data.append({
+                'file_id': file.file_id,
+                'filename': file.filename,
+                'type': 'optional'
+            })
+
+    all_files_data = user_files_data + reference_files_data
+    
+    search_sources_dict = None
+    if request.search_sources:
+        search_sources_dict = {
+            'websearch': request.search_sources.websearch,
+            'pubmed': request.search_sources.pubmed,
+            'arxiv': request.search_sources.arxiv,
+            'google_scholar': request.search_sources.google_scholar,
+            'scihub': request.search_sources.scihub
+        }
+
+    # 判断是立即执行还是加入队列
+    if running_count >= MAX_CONCURRENT_TASKS:
+        # 超过并发限制，加入队列
+        task_manager.update_task_status(task_id, TaskStatus.QUEUED)
+        
+        task_manager.update_task_progress(task_id, {
+            'params': {
+                'query_data': (request.query, 0, all_files_data, search_sources_dict),
+                'username': request.username,
+                'frontend_session_id': request.frontend_session_id
+            }
+        })
+        
+        task_manager.update_queue_positions()
+        queue_position = task_manager.get_queue_position(task_id)
+        
+        logger.info(f"[API-SYNC] Task {task_id} queued at position {queue_position}")
+        
+        return {
+            'success': False,
+            'query': request.query,
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'session_id': '',
+            'task_id': task_id,
+            'planner_result': None,
+            'planner_error': f'任务已加入队列，当前排队位置: {queue_position}',
+            'planner_reasoning_trace': [],
+            'planner_iterations': 0,
+            'planner_execution_time': 0,
+            'planner_agent_name': 'QueueManager',
+            'section_writer_responses': [],
+            'final_report': None,
+            'report_path': None
+        }
+    
+    # 有空闲槽位，同步执行并等待完成
+    task_manager.update_task_status(task_id, TaskStatus.RUNNING)
+    loop = asyncio.get_event_loop()
+    
+    if executor is None:
+        raise HTTPException(status_code=500, detail="Server executor not initialized")
+
+    # 同步模式：等待任务完成
     result = await loop.run_in_executor(
         executor,
         lambda: process_single_query((request.query, 0, all_files_data, search_sources_dict), task_id=task_id, username=request.username,
                                      skip_task_creation=True, frontend_session_id=request.frontend_session_id)
     )
-    # 记录历史（可选）
+    
+    logger.info(f"[API-SYNC] 任务执行完成: task_id={task_id}")
     query_history.append({
         "task_id": task_id,
         "request_id": result['session_id'],
@@ -1167,7 +1325,8 @@ async def stream_task_progress(task_id: str):
         # 如果超时仍未找到任务，记录详细信息
         if task_wait_count >= max_wait_iterations:
             elapsed = time.time() - sse_start_time
-            logger.error(f"[SSE] 等待任务超时: task_id={task_id}, 总等待时长={elapsed:.2f}秒, 当前任务列表={list(task_manager.tasks.keys())}")
+            all_tasks = task_manager.get_all_tasks()
+            logger.error(f"[SSE] 等待任务超时: task_id={task_id}, 总等待时长={elapsed:.2f}秒, 当前任务数量={len(all_tasks)}")
         
         try:
             while True:

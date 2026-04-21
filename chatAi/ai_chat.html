@@ -2554,9 +2554,9 @@ function copyToClipboard(text, button) {
                             const messages = [
                                 { role: 'system', content: `你是一个智能助手。用户上传了附件文件，以下是附件中与用户问题相关的摘录内容：
 
-${contextText.trim()}
+                                ${contextText.trim()}
 
-请仔细阅读以上附件内容，并基于这些内容回答用户的问题。如果附件内容中包含相关信息，请优先使用附件中的信息进行回答。如果附件内容中没有相关信息，请明确告知用户。` },
+                                请仔细阅读以上附件内容，并基于这些内容回答用户的问题。如果附件内容中包含相关信息，请优先使用附件中的信息进行回答。如果附件内容中没有相关信息，请明确告知用户。` },
                                 { role: 'user', content: message }
                             ];
                             console.log('[Chat模式] 构建的messages:', { 
@@ -3454,11 +3454,8 @@ ${contextText.trim()}
                     username: currentUsername,  // 添加用户名字段
                     search_sources: selectedSources  // 添加搜索源选择
                 };
-                // 3. 先建立SSE连接（在发送任务请求之前），确保能接收所有进度消息
-                const sseStartTime = Date.now();
-                console.log('[DeepDiver] 步骤1: 建立SSE连接, taskId:', taskId, 'timestamp:', sseStartTime);
-                const eventSource = new EventSource(`/8000/api/query/stream/${taskId}`);
-                // 创建进度展示容器（替换静态的loadingDiv）
+                
+                // 3. 创建进度展示容器
                 loadingDiv.remove();
                 const progressContainer = document.createElement('div');
                 progressContainer.className = 'mb-6 flex justify-start message-animation';
@@ -3469,7 +3466,7 @@ ${contextText.trim()}
                         <div class="bg-ai-message text-gray-800 p-4 rounded-lg rounded-tr-none shadow-sm flex-1">
                             <div class="flex items-center mb-2 pb-2 border-b border-gray-200">
                                 <i class="fa fa-spinner fa-pulse mr-2 text-gray-500 text-sm"></i>
-                                <span class="text-sm text-gray-600">${/[\u4e00-\u9fff]/.test(message) ? '正在连接...' : 'Connecting...'}</span>
+                                <span class="text-sm text-gray-600">${/[\u4e00-\u9fff]/.test(message) ? '正在提交任务...' : 'Submitting task...'}</span>
                             </div>
                             <div class="progress-timeline space-y-1 text-xs" id="progress-timeline-${taskId}">
                             </div>
@@ -3478,25 +3475,24 @@ ${contextText.trim()}
                 `;
                 chatMessages.appendChild(progressContainer);
                 chatMessages.scrollTop = chatMessages.scrollHeight;
-                // 记录EventSource以便取消时关闭
-                window.sessionEventSources = window.sessionEventSources || {};
-                window.sessionEventSources[sessionId] = eventSource;
-                // 标记SSE连接状态
-                let sseConnected = false;
-                // SSE连接成功回调
-                eventSource.onopen = () => {
-                    const sseOpenTime = Date.now();
-                    const sseOpenDelay = sseOpenTime - sseStartTime;
-                    console.log('[DeepDiver] SSE连接已建立, 耗时:', sseOpenDelay, 'ms, timestamp:', sseOpenTime);
-                    sseConnected = true;
-                    const statusSpan = progressContainer.querySelector('.text-sm.text-gray-600');
-                    if (statusSpan) {
-                        statusSpan.textContent = /[\u4e00-\u9fff]/.test(message) ? 'SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟，请等待...' : 'SciAssistant is planning, researching, and generating the report. This may take about 20 minutes, please wait...';
-                    }
-                    // SSE连接建立后，立即发送任务请求
-                    console.log('[DeepDiver] 步骤2: SSE连接就绪，现在发送任务请求, timestamp:', Date.now());
-                    sendDeepDiverTask();
-                };
+                // 【修复】先POST再SSE：避免SSE长连接占满浏览器并发连接数（Chrome限制同域6个连接）
+                // 旧逻辑：先建SSE → onopen后POST → 多个tab时SSE占满连接槽导致POST无法发出
+                // 新逻辑：先POST（短暂请求，快速释放）→ 收到TaskAccepted后建SSE
+                const sseStartTime = Date.now();
+                let eventSource = null;
+                // 建立SSE连接的函数（在POST成功后调用）
+                const setupSSE = () => {
+                    console.log('[DeepDiver] 建立SSE连接, taskId:', taskId, 'timestamp:', Date.now());
+                    eventSource = new EventSource(`/8000/api/query/stream/${taskId}`);
+                    window.sessionEventSources = window.sessionEventSources || {};
+                    window.sessionEventSources[sessionId] = eventSource;
+                    eventSource.onopen = () => {
+                        console.log('[DeepDiver] SSE连接已建立, timestamp:', Date.now());
+                        const statusSpan = progressContainer.querySelector('.text-sm.text-gray-600');
+                        if (statusSpan) {
+                            statusSpan.textContent = /[\u4e00-\u9fff]/.test(message) ? 'SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟，请等待...' : 'SciAssistant is planning, researching, and generating the report. This may take about 20 minutes, please wait...';
+                        }
+                    };
                 // SSE消息处理
                 eventSource.onmessage = (event) => {
                     try {
@@ -3534,6 +3530,10 @@ ${contextText.trim()}
                             if (progressContainer && progressContainer.parentNode) {
                                 progressContainer.remove();
                             }
+                            // 重置UI状态
+                            submitButton.disabled = false;
+                            submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                            document.getElementById('cancel-button').classList.add('hidden');
                             loadSessionMessages(sessionId).catch(error => {
                                 console.error('[SSE] 加载消息失败:', error);
                             });
@@ -3545,6 +3545,10 @@ ${contextText.trim()}
                             if (timeline) timeline.appendChild(errorItem);
                             eventSource.close();
                             delete window.sessionEventSources[sessionId];
+                            // 重置UI状态
+                            submitButton.disabled = false;
+                            submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                            document.getElementById('cancel-button').classList.add('hidden');
                         } else if (data.type === 'cancelled') {
                             const timeline = document.getElementById(`progress-timeline-${taskId}`);
                             const cancelledItem = document.createElement('div');
@@ -3553,6 +3557,10 @@ ${contextText.trim()}
                             if (timeline) timeline.appendChild(cancelledItem);
                             eventSource.close();
                             delete window.sessionEventSources[sessionId];
+                            // 重置UI状态
+                            submitButton.disabled = false;
+                            submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                            document.getElementById('cancel-button').classList.add('hidden');
                         }
                     } catch (e) {
                         console.error('[SSE] 解析进度消息失败:', e, event.data);
@@ -3564,9 +3572,40 @@ ${contextText.trim()}
                     console.error('[SSE] 连接错误:', error, '发生时间:', errorDelay, 'ms后, timestamp:', errorTime, 'readyState:', eventSource.readyState);
                     eventSource.close();
                     delete window.sessionEventSources[sessionId];
+                    
+                    // 【关键修复】SSE连接断开时，显示错误消息并写入数据库
+                    if (window.currentSessionId === sessionId) {
+                        // 移除进度容器
+                        if (progressContainer && progressContainer.parentNode) {
+                            progressContainer.remove();
+                        }
+                        // 移除加载提示
+                        try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
+                        
+                        // 检测用户消息语言
+                        const _lastUserMsg = document.querySelector('.chat-messages .mb-6:last-child .text-gray-800');
+                        const _isCn = _lastUserMsg ? /[一-鿿]/.test(_lastUserMsg.textContent) : true;
+                        const errorMsg = _isCn 
+                            ? '抱歉，与后端服务的连接已断开。\n\n可能原因：\n1. 后端服务已停止\n2. 网络连接中断\n3. 服务器异常\n\n请检查后端服务状态后重试。'
+                            : 'Sorry, connection to backend service was lost.\n\nPossible reasons:\n1. Backend service stopped\n2. Network connection interrupted\n3. Server error\n\nPlease check backend service status and try again.';
+                        
+                        addMessage(errorMsg, 'ai');
+                        saveResultToDB(errorMsg, sessionId, "ai");
+                        
+                        // 重置UI状态
+                        submitButton.disabled = false;
+                        submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                        document.getElementById('cancel-button').classList.add('hidden');
+                        
+                        // 清理SessionList
+                        window.SessionList = window.SessionList || [];
+                        window.SessionList = window.SessionList.filter(item => item.id !== sessionId);
+                    }
                 };
-                // 4. 定义发送任务的函数（在SSE连接建立后调用）
+                }; // end of setupSSE
+                // 4. 先发送POST请求创建任务，成功后再建立SSE连接
                 const sendDeepDiverTask = () => {
+                    let taskStillRunning = false; // 标记任务是否仍在后台运行（队列或SSE）
                     const taskSendTime = Date.now();
                     const delaySinceSSEStart = taskSendTime - sseStartTime;
                     console.log('[DeepDiver] 步骤3: 发送任务到后端API, timestamp:', taskSendTime, 'SSE建立后延迟:', delaySinceSSEStart, 'ms');
@@ -3583,8 +3622,9 @@ ${contextText.trim()}
                     .then(data => {
                         // 检查是否为队列响应
                         if (data.planner_agent_name === 'QueueManager' && data.planner_error && data.planner_error.includes('排队位置')) {
-                            // 关闭SSE连接，改用队列轮询
-                            eventSource.close();
+                            taskStillRunning = true;
+                            // 关闭SSE连接（如果已建立），改用队列轮询
+                            if (eventSource) { eventSource.close(); }
                             delete window.sessionEventSources[sessionId];
                             if (progressContainer && progressContainer.parentNode) {
                                 progressContainer.remove();
@@ -3701,6 +3741,13 @@ ${contextText.trim()}
                             }, 3000);
                             return;
                         }
+                        // 检查是否为任务已接受响应（异步模式，POST立即返回）
+                        if (data.planner_agent_name === 'TaskAccepted') {
+                            console.log('[DeepDiver] 任务已接受，现在建立SSE连接监听进度');
+                            taskStillRunning = true;
+                            setupSSE();
+                            return;
+                        }
                         // 非队列响应，正常处理
                         window.SessionList.forEach((item,index)=>{
                             if(item.id==window.currentSessionId){
@@ -3790,22 +3837,36 @@ ${contextText.trim()}
                         if (progressContainer && progressContainer.parentNode) {
                             progressContainer.remove();
                         }
-                        if (window.currentSessionId === sessionId) {
-                            try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
-                            if (error.name !== 'AbortError') {
-                                addMessage('获取响应失败，请重试', 'ai');
-                            }
-                        }
+                        // 移除加载提示
+                        try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
+                        
+                        // 检测用户消息语言
+                        const _lastUserMsg = document.querySelector('.chat-messages .mb-6:last-child .text-gray-800');
+                        const _isCn = _lastUserMsg ? /[一-鿿]/.test(_lastUserMsg.textContent) : true;
+                        const errorMsg = _isCn 
+                            ? '抱歉，与后端服务的连接已断开。\n\n可能原因：\n1. 后端服务已停止\n2. 网络连接中断\n3. 服务器异常\n\n请检查后端服务状态后重试。'
+                            : 'Sorry, connection to backend service was lost.\n\nPossible reasons:\n1. Backend service stopped\n2. Network connection interrupted\n3. Server error\n\nPlease check backend service status and try again.';
+                        
+                        addMessage(errorMsg, 'ai');
+                        // 重置UI状态
+                        submitButton.disabled = false;
+                        submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                        document.getElementById('cancel-button').classList.add('hidden');
                     })
                     .finally(() => {
-                        if (window.sessionTasks[sessionId] !== taskId) {
+                        // 【关键修复】如果任务仍在后台运行（队列轮询或SSE监听），不重置UI
+                        if (taskStillRunning || (window.sessionEventSources && window.sessionEventSources[sessionId])) {
+                            console.log('[DeepDiver] 任务仍在后台运行，保持中断按钮可见');
                             return;
                         }
+                        // 任务已结束，重置UI状态
                         submitButton.disabled = false;
                         submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
                         document.getElementById('cancel-button').classList.add('hidden');
                     });
                 };
+                // 5. 立即发送POST请求（不等SSE连接）
+                sendDeepDiverTask();
             }
         }
         
@@ -4778,10 +4839,50 @@ ${contextText.trim()}
                                                     // 启动渐进式轮询：根据等待时间调整轮询间隔
                                                     let pollCount = 0;
                                                     const startTime = Date.now();
+                                                    const MAX_WAIT_TIME = 90 * 60 * 1000; // 90分钟超时限制（适应长时间报告生成）
+                                                    const PROGRESS_REMINDER_TIME = 45 * 60 * 1000; // 45分钟时提醒用户任务仍在进行
+                                                    let reminderShown = false;
                                                     
                                                     const doPoll = () => {
-                                                        const elapsedMinutes = (Date.now() - startTime) / 60000;
+                                                        const elapsedTime = Date.now() - startTime;
+                                                        const elapsedMinutes = elapsedTime / 60000;
                                                         console.log(`[轮询] 检查是否有新的 AI 回复... (已等待 ${elapsedMinutes.toFixed(1)} 分钟)`);
+                                                        
+                                                        // 【45分钟进度提醒】提醒用户任务仍在处理中
+                                                        if (!reminderShown && elapsedTime > PROGRESS_REMINDER_TIME) {
+                                                            reminderShown = true;
+                                                            console.log('[轮询] 已等待45分钟，显示进度提醒');
+                                                            const _lastUserMsg = document.querySelector('.chat-messages .mb-6:last-child .text-gray-800');
+                                                            const _isCn = _lastUserMsg ? /[\u4e00-\u9fff]/.test(_lastUserMsg.textContent) : true;
+                                                            const reminderMsg = _isCn 
+                                                                ? '您的任务仍在处理中（已等待45分钟）。复杂的研究报告可能需要40-90分钟，请耐心等待...'
+                                                                : 'Your task is still being processed (45 minutes elapsed). Complex research reports may take 40-90 minutes, please be patient...';
+                                                            // 在控制台显示提醒，不打断用户
+                                                            console.info(`[进度提醒] ${reminderMsg}`);
+                                                        }
+                                                        
+                                                        // 【关键修复】超时检测：90分钟无响应时停止轮询并显示错误
+                                                        if (elapsedTime > MAX_WAIT_TIME) {
+                                                            console.error('[轮询] 超时：已等待超过90分钟，停止轮询');
+                                                            if (window.pendingSessions[sessionId]?.pollTimeout) {
+                                                                clearTimeout(window.pendingSessions[sessionId].pollTimeout);
+                                                            }
+                                                            // 移除加载提示
+                                                            if (window.pendingSessions[sessionId]?.spinner) {
+                                                                window.pendingSessions[sessionId].spinner.remove();
+                                                            }
+                                                            delete window.pendingSessions[sessionId];
+                                                            
+                                                            // 显示超时错误消息
+                                                            const _lastUserMsg = document.querySelector('.chat-messages .mb-6:last-child .text-gray-800');
+                                                            const _isCn = _lastUserMsg ? /[\u4e00-\u9fff]/.test(_lastUserMsg.textContent) : true;
+                                                            const timeoutMsg = _isCn 
+                                                                ? '抱歉，处理您的请求超时（超过90分钟）。这可能是由于任务过于复杂或系统异常。\n\n建议：\n1. 检查后台服务是否正常运行\n2. 尝试简化您的问题\n3. 将复杂问题拆分为多个简单问题\n4. 联系技术支持'
+                                                                : 'Sorry, the request timed out (over 90 minutes). This may be due to task complexity or system issues.\n\nSuggestions:\n1. Check if backend services are running\n2. Try simplifying your question\n3. Break complex questions into smaller ones\n4. Contact technical support';
+                                                            addMessage(timeoutMsg, 'ai');
+                                                            saveResultToDB(timeoutMsg, sessionId, "ai");
+                                                            return;
+                                                        }
                                                         
                                                         fetch(`/5000/api/chat/messages/${sessionId}`, {
                                                             headers: {
@@ -4819,7 +4920,7 @@ ${contextText.trim()}
                                                         })
                                                         .catch(err => {
                                                             console.error('[轮询] 检查失败:', err);
-                                                            // 出错后30秒重试
+                                                            // 出错后30秒重试（但仍受总超时限制）
                                                             const pollTimeout = setTimeout(doPoll, 30000);
                                                             if (window.pendingSessions[sessionId]) {
                                                                 window.pendingSessions[sessionId].pollTimeout = pollTimeout;
