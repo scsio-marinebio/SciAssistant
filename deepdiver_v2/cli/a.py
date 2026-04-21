@@ -355,8 +355,14 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
     try:
         app_config = get_config()
         sub_agent_configs = {
-            "information_seeker": {"model": app_config.model_name},
-            "writer": {"model": app_config.model_name}
+            "information_seeker": {
+                "model": app_config.model_name,
+                **({"max_iterations": app_config.information_seeker_max_iterations} if app_config.information_seeker_max_iterations else {})
+            },
+            "writer": {
+                "model": app_config.model_name,
+                **({"max_iterations": app_config.writer_max_iterations} if app_config.writer_max_iterations else {})
+            }
         }
 
         # 设置环境变量，让 Agent 使用已创建的 workspace
@@ -527,19 +533,26 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
                     final_report_content = final_report_content_with_stats
                     logger.info(f"已在报告末尾添加统计信息")
                     
-                    # 重新生成PDF文件（包含统计信息）
-                    try:
-                        from src.tools.mcp_tools import generate_pdf_with_reportlab
-                        
-                        pdf_path = Path(final_report_path).parent.parent / "final_report.pdf"
-                        success = generate_pdf_with_reportlab(final_report_content_with_stats, pdf_path)
-                        
-                        if success:
-                            logger.info(f"成功重新生成PDF文件（包含统计信息）: {pdf_path}")
-                        else:
-                            logger.warning(f"PDF重新生成失败")
-                    except Exception as pdf_error:
-                        logger.warning(f"重新生成PDF失败: {pdf_error}")
+                    # 异步生成PDF文件（避免阻塞主流程）
+                    def generate_pdf_async():
+                        try:
+                            from src.tools.mcp_tools import generate_pdf_with_reportlab
+                            
+                            pdf_path = Path(final_report_path).parent.parent / "final_report.pdf"
+                            success = generate_pdf_with_reportlab(final_report_content_with_stats, pdf_path)
+                            
+                            if success:
+                                logger.info(f"[异步] 成功生成PDF文件（包含统计信息）: {pdf_path}")
+                            else:
+                                logger.warning(f"[异步] PDF生成失败")
+                        except Exception as pdf_error:
+                            logger.warning(f"[异步] 生成PDF失败: {pdf_error}")
+                    
+                    # 提交到线程池异步执行
+                    import threading
+                    pdf_thread = threading.Thread(target=generate_pdf_async, daemon=True)
+                    pdf_thread.start()
+                    logger.info(f"已提交PDF生成任务到后台线程")
                         
                 except Exception as e:
                     logger.warning(f"添加统计信息到报告失败: {e}")
@@ -589,24 +602,143 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
                     logger.error(f"自动存储报告到数据库失败: {store_error}")
             else:
                 logger.warning(f"最终报告文件不存在: {final_report_path}")
-                # 没有完整报告时，尝试保存 task_summary（简单问题的回复）
+                # 【降级兜底B】尝试从 part_*.md 文件自动合并生成 final_report.md
+                # 采用分级降级策略：根据章节数决定是否合并以及如何标注
                 try:
-                    if frontend_session_id and response.success and response.result:
-                        task_summary = response.result.get('task_summary', '')
-                        if task_summary:
-                            import re
-                            # 提取"完整答案"部分
-                            answer_match = re.search(r'## 完整答案[\s\S]*?(?=任务已圆满完成)', task_summary)
-                            if answer_match:
-                                content = answer_match.group(0).replace('## 完整答案\n', '').strip() + '\n\n任务已圆满完成'
-                            else:
-                                content = task_summary
-                            
+                    import re as _re_fallback
+                    report_dir = final_report_path.parent
+                    if report_dir.exists():
+                        part_files = sorted(
+                            report_dir.glob("part_*.md"),
+                            key=lambda p: int(_re_fallback.search(r'part_(\d+)', p.name).group(1))
+                            if _re_fallback.search(r'part_(\d+)', p.name) else 0
+                        )
+                        part_count = len(part_files)
+                        
+                        if part_count == 0:
+                            logger.warning("[降级兜底B] 无可用章节，跳过合并")
+                        elif part_count < 3:
+                            # 内容太少，标注为"草稿"并建议重试
+                            logger.warning(f"[降级兜底B] 仅 {part_count} 个章节，标注为草稿（建议用户重试）")
+                            merged = ""
+                            for pf in part_files:
+                                try:
+                                    merged += pf.read_text(encoding='utf-8') + "\n\n"
+                                except Exception:
+                                    pass
+                            if merged.strip():
+                                final_content = f"""# 研究草稿（未完成）
+
+⚠️ **系统提示**: 报告生成过程中出现异常，仅完成 {part_count} 个章节。建议重新提问以获取完整报告。
+
+---
+
+{merged.strip()}
+
+---
+
+💡 **建议**: 
+- 重新提交相同问题以获取完整报告
+"""
+                                final_report_path.write_text(final_content, encoding='utf-8')
+                                final_report_content = final_content
+                                report_relative_path = "report/final_report.md"
+                                logger.info(f"[降级兜底B] 已保存草稿 ({len(final_content)} 字符)")
+                        else:
+                            # >=3个章节，基本可用，添加警告说明
+                            logger.info(f"[降级兜底B] 成功合并 {part_count} 个章节（添加警告说明）")
+                            merged = ""
+                            for pf in part_files:
+                                try:
+                                    merged += pf.read_text(encoding='utf-8') + "\n\n"
+                                except Exception:
+                                    pass
+                            if merged.strip():
+                                final_content = f"""{merged.strip()}
+
+---
+
+⚠️ **编辑说明**: 本报告因系统异常未能完成最终审校和参考文献整理，内容仅供参考。如需完整报告，建议重新提问。
+"""
+                                final_report_path.write_text(final_content, encoding='utf-8')
+                                final_report_content = final_content
+                                report_relative_path = "report/final_report.md"
+                                logger.info(f"[降级兜底B] 成功合并为 final_report.md ({len(final_content)} 字符)")
+                except Exception as fallback_err:
+                    logger.warning(f"[降级兜底B] 自动合并 part_*.md 失败: {fallback_err}")
+                
+                # 如果降级兜底B成功合并了报告，自动存储到数据库
+                if final_report_content:
+                    try:
+                        if frontend_session_id:
+                            import re as _re_title
+                            report_title = "研究报告"
+                            title_match = _re_title.search(r'^#\s+(.+?)$', final_report_content, _re_title.MULTILINE)
+                            if title_match:
+                                report_title = title_match.group(1).strip()
+                            if len(report_title) > 50:
+                                report_title = report_title[:50] + '...'
                             store_url = "http://localhost:5000/api/chat/messages"
                             store_data = {
                                 "session_id": frontend_session_id,
                                 "from_who": "ai",
-                                "content": content,
+                                "content": final_report_content,
+                                "round": 1,
+                                "uuid": session_id,
+                                "has_report": 1,
+                                "report_title": report_title + "（降级恢复）"
+                            }
+                            http_response = requests.post(store_url, json=store_data, timeout=30)
+                            if http_response.status_code == 201:
+                                logger.info(f"[降级兜底B] 成功存储降级恢复报告到数据库")
+                            else:
+                                logger.error(f"[降级兜底B] 存储降级恢复报告失败: {http_response.status_code}")
+                    except Exception as store_err:
+                        logger.error(f"[降级兜底B] 存储降级恢复报告异常: {store_err}")
+
+                # 没有完整报告时，尝试保存 task_summary（简单问题的回复）或错误提示
+                if not final_report_content:
+                    try:
+                        content_to_store = None
+                        
+                        # 情况1: planner成功完成，有task_summary
+                        if frontend_session_id and response.success and response.result:
+                            task_summary = response.result.get('task_summary', '')
+                            if task_summary:
+                                import re
+                                # 提取"完整答案"部分
+                                answer_match = re.search(r'## 完整答案[\s\S]*?(?=任务已圆满完成)', task_summary)
+                                if answer_match:
+                                    content_to_store = answer_match.group(0).replace('## 完整答案\n', '').strip() + '\n\n任务已圆满完成'
+                                else:
+                                    content_to_store = task_summary
+                                
+                                # 清理task_summary中不适合展示的内容
+                                if content_to_store:
+                                    # 移除"文件存储位置"段落（从标题到下一个标题或末尾）
+                                    content_to_store = re.sub(
+                                        r'(?:#{1,4}\s*)?文件存储位置[\s\S]*?(?=(?:#{1,4}\s|\Z))',
+                                        '', content_to_store
+                                    ).strip()
+                                    # 替换"最终文章路径"相关内容为友好提示
+                                    content_to_store = re.sub(
+                                        r'最终文章路径[：:]\s*.+',
+                                        '⚠️ 由于写作阶段未完成，最终文章尚未生成。建议重新提问以获取完整报告。',
+                                        content_to_store
+                                    )
+                        
+                        # 情况2: planner未成功（如超时/超过最大迭代次数），存储错误提示
+                        if not content_to_store and frontend_session_id and not response.success:
+                            error_msg = response.error or '任务执行未完成'
+                            content_to_store = f"⚠️ 任务未能完成：{error_msg}\n\n信息收集阶段可能已部分完成，但由于处理步骤限制，未能生成最终报告。请尝试重新提问。"
+                            logger.warning(f"[降级兜底C] planner未成功完成 (success=False, error={error_msg})，存储错误提示到数据库")
+                        
+                        if content_to_store and frontend_session_id:
+                            store_url = "http://localhost:5000/api/chat/messages"
+                            store_data = {
+                                "session_id": frontend_session_id,
+                                "from_who": "ai",
+                                "content": content_to_store,
                                 "round": 1,
                                 "uuid": session_id,
                                 "has_report": 0,
@@ -615,9 +747,11 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
                             
                             http_response = requests.post(store_url, json=store_data, timeout=30)
                             if http_response.status_code != 201:
-                                logger.error(f"存储简单回复失败: {http_response.status_code}")
-                except Exception as e:
-                    logger.error(f"存储简单回复异常: {e}")
+                                logger.error(f"存储回复失败: {http_response.status_code}")
+                            else:
+                                logger.info(f"成功存储回复到数据库: session_id={frontend_session_id}")
+                    except Exception as e:
+                        logger.error(f"存储回复异常: {e}")
         except Exception as e:
             logger.error(f"读取最终报告失败: {e}")
 
@@ -652,7 +786,6 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
         
         return result_data
     except Exception as e:
-        logger.error(f"任务执行异常: {e}", exc_info=True)
         task_manager.update_task_status(task_id, TaskStatus.FAILED, error=str(e))
         
         # 发送任务失败的SSE进度消息

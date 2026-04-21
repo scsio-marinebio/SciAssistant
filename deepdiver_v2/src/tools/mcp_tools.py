@@ -830,6 +830,21 @@ def _process_inline_formatting(text: str) -> str:
     for sym in red_symbols:
         text = text.replace(sym, f'<font name="SymbolFont" color="red">{sym}</font>')
 
+    # 转义非HTML标签的裸尖括号（如 <S, A, P, R, γ>），避免ReportLab误解析
+    # 策略：保护合法HTML标签 → 转义剩余的 < > → 恢复合法标签
+    _valid_html_tags = re.compile(r'</?(?:a|font|b|i|sub|sup|br|para)\b[^>]*/?>', re.IGNORECASE)
+    _html_placeholders = []
+    def _protect_valid_tag(m):
+        placeholder = f"__VALID_HTML_{len(_html_placeholders)}__"
+        _html_placeholders.append(m.group(0))
+        return placeholder
+    text = _valid_html_tags.sub(_protect_valid_tag, text)
+    # 转义剩余的裸尖括号
+    text = text.replace('<', '&lt;').replace('>', '&gt;')
+    # 恢复合法HTML标签
+    for i, original in enumerate(_html_placeholders):
+        text = text.replace(f"__VALID_HTML_{i}__", original)
+
     # 平衡内联标签，修正缺失或多余的闭合
     tag_regex = re.compile(r'</?\s*(a|font|b|i|sub|sup)\b[^>]*>', re.IGNORECASE)
 
@@ -2607,7 +2622,7 @@ class MCPTools:
 
                 # Example implementation for content extractor (commented out):
                 crawler_url = f"{config.get('base_url', 'https://api.content-extractor.com')}/{url}"
-                response = requests.get(crawler_url, headers=headers, timeout=config.get('timeout', 30), verify=False)
+                response = requests.get(crawler_url, headers=headers, timeout=config.get('timeout', 30))
                 response.raise_for_status()
 
                 content = response.text
@@ -3786,7 +3801,7 @@ class MCPTools:
         # 如果没有提供unique_id，生成一个基于时间戳的唯一ID
         if unique_id is None:
             import time
-            unique_id = f"msg_{int(time.time() * 1000)}"
+            unique_id = f"msg-{int(time.time() * 1000)}"
         report_files = []
         for section_content in section_contents:
             # Handle both dict format (expected) and string format (fallback)
@@ -4524,7 +4539,7 @@ class MCPTools:
             # 读取section_files中的文件内容，并获取摘要和关键词
             # 生成基于时间戳的唯一ID，避免多轮对话中的锚点冲突
             import time
-            unique_id = f"msg_{int(time.time() * 1000)}"
+            unique_id = f"msg-{int(time.time() * 1000)}"
             abstract_keywords = self.merge_reports(section_files, final_file_path, unique_id)
 
             # 如果没有返回摘要和关键词，设置默认值
@@ -5314,11 +5329,20 @@ OUTLINE TO ORGANIZE CONTENT:
 """
 
             system_prompt = f"""You are a writing master. Next, you will receive web page information, user questions, and the structure of the current chapter. You need to integrate the user's questions with the provided web content and write the chapter based on its given structure, and plan out tables based on the content of the current chapter to make the content more comprehensive and intuitive. Additionally, an overall outline and summaries of previously completed chapters will be provided for reference to avoid repetition or contradictions and ensure logical consistency within the broader framework. Specific requirements will be detailed below.
+
+## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+**Detect the language of the user's query and write this chapter accordingly:**
+- **English query → Write this chapter in English**
+- **Chinese query (中文) → Write this chapter in Chinese (中文撰写)**
+- **Mixed Chinese-English query → Write this chapter in Chinese (中文撰写)**
+This rule applies to ALL chapter content including: headings, body text, tables, and citations.
+**IMPORTANT**: Maintain language consistency with other chapters. If previous chapters were written in Chinese, continue in Chinese. If in English, continue in English.
+
 {user_file_priority_note}When drafting the current chapter content, strictly comply with the following requirements:
 - ⚠️ **CRITICAL CITATION REQUIREMENT - CITE ALL FILES**: In the web page information I gave you, each result is in the format of [webpage X begin]...[webpage X end], where X represents the numerical index of each article. **YOU MUST cite ALL provided webpages at least once in your chapter**. This is NON-NEGOTIABLE. Please cite the context at the end of the sentence when appropriate. Please cite the context in the corresponding part of the answer in the format of the reference number [X]. If a sentence comes from multiple contexts, please list all relevant reference numbers, such as [3][5]. Remember not to collect the references at the end and return the reference numbers, but list them in the corresponding part of the answer. **MANDATORY VERIFICATION**: Before submitting your chapter, verify that you have cited EVERY webpage (1 through {len(key_files) if key_files else 0}) at least once. Count your citations: webpage 1 [✓/✗], webpage 2 [✓/✗], etc. If any webpage is not cited, GO BACK and find appropriate places to cite it. **SPECIAL EMPHASIS**: User-uploaded files (typically webpages 1-{user_file_count if has_user_files else 0}) MUST be cited multiple times (3-5 times each) when they contain relevant information.
 - You can only use the provided web page information for writing, don't make up any content, ensure the accuracy of the facts. Note that when there are contradictions between the facts described in the above search results, you should use your internal knowledge to reasonably identify the correct information. If identification is impossible, you may select the most factual result based on the authority of the web pages and a voting mechanism (e.g., the description consistent with the majority of web pages). If judgment remains impossible using these methods, you may appropriately list possible differing statements, but you must not conflate different claims—prioritize ensuring factual accuracy!
 - You are only permitted to write content strictly within the provided chapter framework. You are forbidden from creating additional subheadings or bullet points within the framework! However, there is a special exception: **You should proactively and actively use Markdown tables to present structured data**. When encountering data comparisons, technical parameters, multi-dimensional comparisons, statistical data, feature contrasts, timeline events, or any scenario where information can be organized in rows and columns, you MUST use tables instead of pure text narration. Tables greatly improve readability and information density. Furthermore, you are not allowed to use concise or summarizing language for narration! We must strictly ensure the information density of the writing and avoid excessive compression.
-- You cannot make any changes to the structure of the chapter you are currently writing, such as the title content and the bold symbols in the title, you are not allowed to make any changes. **Important Note:** When writing Chapter 1, if you find the chapter lacks article title, you must create one based on user query. However, this rule only applies to Chapter 1 - do not add any titles to any other chapters in the work. 
+- You cannot make any changes to the structure of the chapter you are currently writing, such as the title content and the bold symbols in the title, you are not allowed to make any changes. **CRITICAL: Sub-heading numbers MUST match the chapter number.** For example, if the current chapter is "## 1. Title", then sub-headings MUST be "1.1 ...", "1.2 ...", NOT "2.1 ...". If the current chapter is "## 3. Title", sub-headings must be "3.1 ...", "3.2 ...", etc. Always derive the sub-heading prefix from the chapter number in current_chapter_outline. **Important Note:** When writing Chapter 1, if you find the chapter lacks article title, you must create one based on user query. However, this rule only applies to Chapter 1 - do not add any titles to any other chapters in the work. 
 - Be careful to ensure that the narrative content is highly relevant and does not contain any common sense errors, note that although you are asked to ensure the richness of information when writing, you must ensure that the content you write is highly relevant and that the context is logically coherent and readable.
 - Proceeding to explain the roles of other specified fields:
     * user_query: The user query, ensure the drafted content is highly relevant to the user's inquiry.

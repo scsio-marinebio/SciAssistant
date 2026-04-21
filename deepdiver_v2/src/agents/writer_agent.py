@@ -34,6 +34,8 @@ class WriterAgent(BaseAgent):
         # Progress callback support
         self.task_id = task_id
         self.progress_callback = None
+        # Chapter progress tracking
+        self._crash_test_part_count = 0
 
     def set_cancellation_token(self, cancellation_token):
         """
@@ -189,10 +191,12 @@ Then you strictly follow the steps given below:
               * For Chinese: "## 1. 引言", "## 2. 核心概念"
               * Do NOT use Chinese numerals like "一、" or "Chapter 1".
             - Level 2 headings (Subsections) MUST be **PLAIN TEXT WITHOUT any markdown symbols** (no ###, no **, no *):
-              * For English: "2.1 Background", "2.2 Main Findings" (just number + space + title)
-              * For Chinese: "2.1 背景", "2.2 主要发现"
+              * Sub-heading numbers MUST match parent chapter number: Chapter 1 → 1.1, 1.2; Chapter 2 → 2.1, 2.2; Chapter 3 → 3.1, 3.2, etc.
+              * For English: "1.1 Background", "1.2 Main Findings" (for Chapter 1), "2.1 Methods" (for Chapter 2)
+              * For Chinese: "1.1 背景", "1.2 主要发现" (第1章), "2.1 方法" (第2章)
               * **WRONG FORMAT**: "### 2.1 Title" or "**### 2.1 Title**" (has markdown symbols)
-              * **CORRECT FORMAT**: "2.1 Title" (plain text, no markdown)
+              * **WRONG FORMAT**: "2.1 xxx" under "## 1. Title" (sub-heading number doesn't match chapter)
+              * **CORRECT FORMAT**: "1.1 Title" under "## 1. Title" (plain text, number matches chapter)
             - This structure is CRITICAL for the final PDF table of contents.
         - **Note3:** The number of chapters must not exceed 7, dynamic evaluation can be performed based on the collected content. For example, if there is a lot of content, more chapters can be generated, and vice versa. But each chapter should only include Level 1 and Level 2 headings. Also, please generate more Level 2 headings (suggest 4-8) to ensure the content is rich and detailed. However, if the first chapter is an abstract or introduction, do not generate subheadings (level-2 headings)—only include the main heading (level-1). Additionally, tailor the outline style based on the type of document. For example, in a research report, the first chapter should preferably be titled \"Abstract\" or \"Introduction.\"  
         
@@ -551,6 +555,7 @@ For each function call, return a JSON object placed within the [unused11][unused
                             
                             # 在工具执行成功后推送章节进度
                             if tool_name == "section_writer" and tool_result.get("success"):
+                                self._crash_test_part_count += 1
                                 try:
                                     # 从 arguments 中提取章节标题
                                     outline = ""
@@ -596,6 +601,80 @@ For each function call, return a JSON object placed within the [unused11][unused
                     error_msg = f"Error in writing iteration {iteration}: {e}"
                     self.log_error(iteration, error_msg)
                     break
+
+            # 【降级兜底A】writer agent 异常退出或超时时，尝试自动合并已有的 part_*.md
+            # 采用分级降级策略：根据章节数决定是否合并以及如何标注
+            if not task_completed:
+                try:
+                    workspace_path = os.environ.get('AGENT_WORKSPACE_PATH', '')
+                    if workspace_path:
+                        from pathlib import Path
+                        import re as _re
+                        report_dir = Path(workspace_path) / "report"
+                        final_report_path = report_dir / "final_report.md"
+                        if not final_report_path.exists() and report_dir.exists():
+                            part_files = sorted(
+                                report_dir.glob("part_*.md"),
+                                key=lambda p: int(_re.search(r'part_(\d+)', p.name).group(1))
+                                if _re.search(r'part_(\d+)', p.name) else 0
+                            )
+                            part_count = len(part_files)
+                            
+                            if part_count == 0:
+                                self.logger.warning("[降级兜底A] 无可用章节，跳过合并")
+                            elif part_count < 3:
+                                # 内容太少，标注为"草稿"并建议重试
+                                self.logger.warning(
+                                    f"[降级兜底A] 仅 {part_count} 个章节，标注为草稿（建议用户重试）"
+                                )
+                                merged = ""
+                                for pf in part_files:
+                                    try:
+                                        merged += pf.read_text(encoding='utf-8') + "\n\n"
+                                    except Exception:
+                                        pass
+                                if merged.strip():
+                                    final_content = f"""# 研究草稿（未完成）
+
+⚠️ **系统提示**: 报告生成过程中出现异常，仅完成 {part_count} 个章节。建议重新提问以获取完整报告。
+
+---
+
+{merged.strip()}
+
+---
+
+💡 **建议**: 
+- 重新提交相同问题以获取完整报告
+"""
+                                    final_report_path.write_text(final_content, encoding='utf-8')
+                                    self.logger.info(
+                                        f"[降级兜底A] 已保存草稿 ({len(final_content)} 字符)"
+                                    )
+                            else:
+                                # >=3个章节，基本可用，添加警告说明
+                                self.logger.info(
+                                    f"[降级兜底A] 成功合并 {part_count} 个章节（添加警告说明）"
+                                )
+                                merged = ""
+                                for pf in part_files:
+                                    try:
+                                        merged += pf.read_text(encoding='utf-8') + "\n\n"
+                                    except Exception:
+                                        pass
+                                if merged.strip():
+                                    final_content = f"""{merged.strip()}
+
+---
+
+⚠️ **编辑说明**: 本报告因系统异常未能完成最终审校和参考文献整理，内容仅供参考。如需完整报告，建议重新提问。
+"""
+                                    final_report_path.write_text(final_content, encoding='utf-8')
+                                    self.logger.info(
+                                        f"[降级兜底A] 成功合并为 final_report.md ({len(final_content)} 字符)"
+                                    )
+                except Exception as fallback_err:
+                    self.logger.warning(f"[降级兜底A] 自动合并 part_*.md 失败: {fallback_err}")
 
             execution_time = time.time() - start_time
             # Extract final result
