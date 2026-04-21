@@ -59,6 +59,7 @@ class InformationSeekerAgent(BaseAgent):
         use_websearch = os.environ.get('SEARCH_SOURCE_WEBSEARCH', 'True').lower() == 'true'
         use_pubmed = os.environ.get('SEARCH_SOURCE_PUBMED', 'True').lower() == 'true'
         use_arxiv = os.environ.get('SEARCH_SOURCE_ARXIV', 'True').lower() == 'true'
+        use_google_scholar = os.environ.get('SEARCH_SOURCE_GOOGLE_SCHOLAR', 'True').lower() == 'true'
         # use_springer = os.environ.get('SEARCH_SOURCE_SPRINGER', 'True').lower() == 'true'  # DISABLED
         
         # Get all available tools from MCP
@@ -76,6 +77,7 @@ class InformationSeekerAgent(BaseAgent):
             'websearch': ['batch_web_search', 'web_search'],
             'pubmed': ['pubmed', 'medrxiv'],
             'arxiv': ['arxiv'],
+            'google_scholar': ['google_scholar', 'scholar'],
             # 'springer': ['springer']  # DISABLED
         }
         
@@ -84,7 +86,7 @@ class InformationSeekerAgent(BaseAgent):
         disabled_tools = []
         
         # Log environment variable values for debugging
-        logger.info(f"[SEARCH_SOURCE_DEBUG] WebSearch={use_websearch}, PubMed={use_pubmed}, arXiv={use_arxiv}")
+        logger.info(f"[SEARCH_SOURCE_DEBUG] WebSearch={use_websearch}, PubMed={use_pubmed}, arXiv={use_arxiv}, GoogleScholar={use_google_scholar}")
         logger.info(f"[SEARCH_SOURCE_DEBUG] Available tools from MCP: {available_tools}")
         
         for tool_name in available_tools:
@@ -98,12 +100,14 @@ class InformationSeekerAgent(BaseAgent):
                 is_enabled = True
             elif use_arxiv and any(pattern in tool_lower for pattern in tool_category_patterns['arxiv']):
                 is_enabled = True
+            elif use_google_scholar and any(pattern in tool_lower for pattern in tool_category_patterns['google_scholar']):
+                is_enabled = True
             # elif use_springer and any(pattern in tool_lower for pattern in tool_category_patterns['springer']):
             #     is_enabled = True
             #     logger.info(f"[SEARCH_SOURCE_DEBUG] Tool '{tool_name}' matched Springer pattern and is_enabled={is_enabled}")
             
             # Categorize tool
-            if any(pattern in tool_lower for pattern in tool_category_patterns['websearch'] + tool_category_patterns['pubmed'] + tool_category_patterns['arxiv']):
+            if any(pattern in tool_lower for pattern in tool_category_patterns['websearch'] + tool_category_patterns['pubmed'] + tool_category_patterns['arxiv'] + tool_category_patterns['google_scholar']):
                 if is_enabled:
                     enabled_tools.append(tool_name)
                 else:
@@ -116,7 +120,7 @@ class InformationSeekerAgent(BaseAgent):
         search_source_guidance = ""
         if enabled_tools:
             # Categorize tools by type
-            api_tools = [t for t in enabled_tools if any(p in t.lower() for p in ['arxiv', 'pubmed', 'medrxiv'])]
+            api_tools = [t for t in enabled_tools if any(p in t.lower() for p in ['arxiv', 'pubmed', 'medrxiv', 'google_scholar', 'scholar'])]
             web_tools = [t for t in enabled_tools if any(p in t.lower() for p in ['web_search', 'batch_web'])]
             other_tools = [t for t in enabled_tools if t not in api_tools and t not in web_tools]
             
@@ -135,6 +139,9 @@ class InformationSeekerAgent(BaseAgent):
                     elif 'medrxiv' in tool.lower():
                         search_source_guidance += f"  • **{tool}**: medRxiv 最新医学预印本\n"
                         search_source_guidance += f"    ✅ 最新医学研究 | ✅ 直接下载 PDF | ✅ 按类别组织 | ✅ 快速发布\n"
+                    elif 'scholar' in tool.lower():
+                        search_source_guidance += f"  • **{tool}**: Google Scholar 全学科学术搜索\n"
+                        search_source_guidance += f"    ✅ 覆盖所有学科 | ✅ 引用数据 | ✅ 跨数据库搜索 | ✅ 可用 google_scholar_get_paper 获取论文内容\n"
                     # elif 'springer' in tool.lower():
                     #     search_source_guidance += f"  • **{tool}**: Springer Nature 期刊文章\n"
                     #     search_source_guidance += f"    ✅ 高质量期刊 | ✅ 完整元数据 | ✅ DOI 标识\n"
@@ -155,12 +162,14 @@ class InformationSeekerAgent(BaseAgent):
                 search_source_guidance += f"1. **首选**: 使用专有学术 API 获取核心学术文献\n"
                 search_source_guidance += f"   - 优势: 完整元数据、高成功率（99%+）、可直接下载 PDF 全文\n"
                 search_source_guidance += f"   - 示例: arxiv_search → arxiv_read_paper 获取完整论文\n"
+                search_source_guidance += f"   - 示例: google_scholar_search 搜索全学科论文，再用对应源工具获取全文\n"
             if web_tools:
                 search_source_guidance += f"2. **补充**: 使用网页搜索获取其他来源内容\n"
                 search_source_guidance += f"   - 用途: 工业应用案例、技术博客、新闻动态、非学术资源\n"
                 search_source_guidance += f"   - 注意: 部分网站可能有反爬虫限制或订阅墙\n"
             search_source_guidance += f"3. **深入**: 对重要论文使用 read_paper 工具获取完整全文\n"
-            search_source_guidance += f"   - arxiv_read_paper, get_pubmed_article, medrxiv_read_paper 等\n\n"
+            search_source_guidance += f"   - arxiv_read_paper, get_pubmed_article, medrxiv_read_paper 等\n"
+            search_source_guidance += f"   - Google Scholar: google_scholar_search → google_scholar_get_paper 获取论文内容\n\n"
             
             if disabled_tools:
                 search_source_guidance += f"⚠️ **不可用工具**: {', '.join(disabled_tools)}\n"
@@ -217,6 +226,7 @@ When searching for recent information or papers, be aware that the current date 
                 a) **Prefer specialized academic APIs** when query matches their coverage:
                    • Biology/Medical topics → "search_pubmed_key_words", "search_pubmed_advanced", "medrxiv_search"
                    • Computer Science/Math/Physics topics → "arxiv_search"
+                   • Cross-discipline broad academic search → "google_scholar_search", "advanced_google_scholar_search"
                    • Advantages: Complete metadata, direct PDF access, 99%+ success rate
                 b) **Use "batch_web_search"** for:
                    • Topics outside specialized API coverage (engineering, social sciences, multi-disciplinary, etc.)
@@ -224,7 +234,8 @@ When searching for recent information or papers, be aware that the current date 
                    • Supplementary content to complement academic sources
                    • Non-English academic content
                    • Note: Web search has academic site targeting enabled (academic sites including arXiv, Nature, IEEE, etc.)
-                c) **Combine both approaches** when appropriate - use specialized APIs for core academic papers and web search for broader context
+                c) **Use Google Scholar** for cross-discipline searches or when unsure which specialized API to use - results may link to arXiv, PubMed, etc.
+                d) **Combine all approaches** when appropriate - use specialized APIs for core academic papers, Google Scholar for broad discovery, and web search for broader context
            - When calling web search, consider the language of the user's question (e.g., use Chinese for Chinese questions)
            - Analyze the search results (titles, snippets, URLs, paper metadata) to identify promising sources
         
@@ -239,6 +250,7 @@ When searching for recent information or papers, be aware that the current date 
                 a) Extract full content from the webpage  
                 b) Save the content to a file in the workspace **under the relative path `./url_crawler_save_files/`**
                 c) **Exception**: Do NOT use url_crawler for arXiv/PubMed/medRxiv URLs - use their dedicated tools instead
+                d) For Google Scholar results: check if the URL points to arXiv/PubMed/medRxiv, and if so use the corresponding dedicated tool instead of url_crawler
            - For important articles searched with pubmed, medrxiv, or arxiv, use the corresponding retrieval tools:
                 a) PubMed: "get_pubmed_article" (requires PMID from search results)
                 b) medRxiv: "medrxiv_read_paper" (requires paper_id from search results)

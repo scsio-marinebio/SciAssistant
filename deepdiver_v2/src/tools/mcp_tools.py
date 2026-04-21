@@ -2607,7 +2607,7 @@ class MCPTools:
 
                 # Example implementation for content extractor (commented out):
                 crawler_url = f"{config.get('base_url', 'https://api.content-extractor.com')}/{url}"
-                response = requests.get(crawler_url, headers=headers, timeout=config.get('timeout', 30))
+                response = requests.get(crawler_url, headers=headers, timeout=config.get('timeout', 30), verify=False)
                 response.raise_for_status()
 
                 content = response.text
@@ -3786,7 +3786,7 @@ class MCPTools:
         # 如果没有提供unique_id，生成一个基于时间戳的唯一ID
         if unique_id is None:
             import time
-            unique_id = f"msg-{int(time.time() * 1000)}"
+            unique_id = f"msg_{int(time.time() * 1000)}"
         report_files = []
         for section_content in section_contents:
             # Handle both dict format (expected) and string format (fallback)
@@ -4524,7 +4524,7 @@ class MCPTools:
             # 读取section_files中的文件内容，并获取摘要和关键词
             # 生成基于时间戳的唯一ID，避免多轮对话中的锚点冲突
             import time
-            unique_id = f"msg-{int(time.time() * 1000)}"
+            unique_id = f"msg_{int(time.time() * 1000)}"
             abstract_keywords = self.merge_reports(section_files, final_file_path, unique_id)
 
             # 如果没有返回摘要和关键词，设置默认值
@@ -5111,8 +5111,16 @@ OUTLINE TO ORGANIZE CONTENT:
         Returns:
             Content with corrected title formats
         """
+        # Defensive: return content as-is if inputs are not valid strings
+        if not content or not isinstance(content, str):
+            return content or ""
+        if not overall_outline or not isinstance(overall_outline, str):
+            return content
+
         # Extract titles from overall_outline
         outline_titles = {}
+
+        outline_titles_no_number = {}
 
         for line in overall_outline.split('\n'):
             line = line.strip()
@@ -5129,6 +5137,11 @@ OUTLINE TO ORGANIZE CONTENT:
                 if core_content:
                     # Store mapping from core content to the formatted line from outline
                     outline_titles[core_content.lower()] = line
+
+                    # Also store a mapping with the number prefix removed
+                    text_without_number = re.sub(r'^\d+(?:\.\d+)*\.?\s+', '', core_content).strip()
+                    if text_without_number and text_without_number.lower() != core_content.lower():
+                        outline_titles_no_number[text_without_number.lower()] = line
 
         # Process content line by line
         content_lines = content.split('\n')
@@ -5162,10 +5175,40 @@ OUTLINE TO ORGANIZE CONTENT:
                         break
 
                 if not found_match:
-                    # If no exact match found, keep original line
+                    content_text_no_number = re.sub(r'^\d+(?:\.\d+)*\.?\s+', '', core_content).strip()
+                    content_text_no_number_lower = content_text_no_number.lower()
+
+                    for outline_text_no_num, outline_format in outline_titles_no_number.items():
+                        if outline_text_no_num == core_content_lower or outline_text_no_num == content_text_no_number_lower:
+                     
+                            corrected_lines.append(outline_format)
+                            found_match = True
+                            break
+
+                if not found_match:
+                    # If still no match found, keep original line
                     corrected_lines.append(original_line)
             else:
-                corrected_lines.append(original_line)
+                is_list_item = bool(re.match(r'^[\*\-]\s+', line_stripped))
+                is_reference = line_stripped.startswith('[')
+                if line_stripped and not is_list_item and not is_reference:
+               
+                    clean_text = re.sub(r'^\*\*(.+?)\*\*$', r'\1', line_stripped).strip()
+                    clean_text_lower = clean_text.lower()
+                    line_stripped_lower = line_stripped.lower()
+
+                    found_match = False
+                    for outline_text_no_num, outline_format in outline_titles_no_number.items():
+                        if outline_text_no_num == clean_text_lower or outline_text_no_num == line_stripped_lower:
+                     
+                            corrected_lines.append(outline_format)
+                            found_match = True
+                            break
+
+                    if not found_match:
+                        corrected_lines.append(original_line)
+                else:
+                    corrected_lines.append(original_line)
 
         return '\n'.join(corrected_lines)
 
@@ -9202,23 +9245,398 @@ Strictly follow the following format for output:
         except Exception as e:
             return MCPToolResult(success=False, error=f"获取arxiv论文内容失败!{e}")
 
-    # DISABLED: Springer API currently unavailable
-    # def springer_search(self, query: str, max_results: int = 10, subject: str = None, 
-    #                    start_year: int = None, end_year: int = None) -> MCPToolResult:
-    #     """
-    #     Search for papers on Springer Nature using their Open Access API.
-    #     
-    #     Args:
-    #         query: Search query string (keywords, title, etc.)
-    #         max_results: Maximum number of papers to return (default: 10)
-    #         subject: Filter by subject area (optional)
-    #         start_year: Filter by start year (optional)
-    #         end_year: Filter by end year (optional)
-    #         
-    #     Returns:
-    #         MCPToolResult with list of Paper objects
-    #     """
-    #     pass
+    def advanced_google_scholar_search(self, query: str, author: str = None, start_year: int = None, 
+                                       end_year: int = None, num_results: int = 5) -> MCPToolResult:
+        """
+        Search Google Scholar using advanced search filters (e.g., author, year range).
+
+        Args:
+            query: The search query (e.g., paper title or topic)
+            author: The author's name to filter the results (optional)
+            start_year: Start year to filter the results by publication year (optional)
+            end_year: End year to filter the results by publication year (optional)
+            num_results: The number of results to retrieve (default: 5)
+
+        Returns:
+            MCPToolResult: Standardized result format with search results
+        """
+        try:
+            search_url = "https://scholar.google.com/scholar?"
+
+            search_params = {'q': query.replace(' ', '+')}
+            if author:
+                search_params['as_auth'] = author
+            if start_year:
+                search_params['as_ylo'] = start_year
+            if end_year:
+                search_params['as_yhi'] = end_year
+
+            search_url += '&'.join([f"{key}={value}" for key, value in search_params.items()])
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            }
+
+            response = requests.get(search_url, headers=headers, proxies=proxy, timeout=5, verify=False)
+
+            if response.status_code != 200:
+                return MCPToolResult(
+                    success=False,
+                    error=f"Failed to fetch data. HTTP Status code: {response.status_code}"
+                )
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            results = []
+            count = 0
+
+            for item in soup.find_all('div', class_='gs_ri'):
+                if count >= num_results:
+                    break
+
+                title_tag = item.find('h3', class_='gs_rt')
+                title = title_tag.get_text() if title_tag else 'No title available'
+
+                link = title_tag.find('a')['href'] if title_tag and title_tag.find('a') else 'No link available'
+
+                authors_tag = item.find('div', class_='gs_a')
+                authors = authors_tag.get_text() if authors_tag else 'No authors available'
+
+                abstract_tag = item.find('div', class_='gs_rs')
+                abstract = abstract_tag.get_text() if abstract_tag else 'No abstract available'
+
+                result_data = {
+                    'Title': title,
+                    'Authors': authors,
+                    'Abstract': abstract,
+                    'URL': link
+                }
+                results.append(result_data)
+                count += 1
+
+            return MCPToolResult(
+                success=True,
+                data={
+                    "results": results,
+                    "total_results": len(results),
+                    "query": query
+                },
+                metadata={"tool_name": "advanced_google_scholar_search"}
+            )
+
+        except Exception as e:
+            logger.error(f"Advanced Google Scholar search failed: {e}")
+            return MCPToolResult(
+                success=False,
+                error=f"Search failed: {str(e)}"
+            )
+
+    def google_scholar_search(self, query: str, num_results: int = 5) -> MCPToolResult:
+        """
+        Search Google Scholar using a simple keyword query.
+
+        Args:
+            query: The search query (e.g., paper title or author)
+            num_results: The number of results to retrieve (default: 5)
+
+        Returns:
+            MCPToolResult: Standardized result format with search results
+        """
+        try:
+            search_url = f"https://scholar.google.com/scholar?q={query.replace(' ', '+')}"
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            }
+
+            response = requests.get(search_url, proxies=proxy, timeout=5, headers=headers, verify=False)
+
+            if response.status_code != 200:
+                return MCPToolResult(
+                    success=False,
+                    error=f"Failed to fetch data. HTTP Status code: {response.status_code}"
+                )
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            results = []
+            count = 0
+
+            for item in soup.find_all('div', class_='gs_ri'):
+                if count >= num_results:
+                    break
+
+                title_tag = item.find('h3', class_='gs_rt')
+                title = title_tag.get_text() if title_tag else 'No title available'
+
+                link = title_tag.find('a')['href'] if title_tag and title_tag.find('a') else 'No link available'
+
+                authors_tag = item.find('div', class_='gs_a')
+                authors = authors_tag.get_text() if authors_tag else 'No authors available'
+
+                abstract_tag = item.find('div', class_='gs_rs')
+                abstract = abstract_tag.get_text() if abstract_tag else 'No abstract available'
+
+                result_data = {
+                    'Title': title,
+                    'Authors': authors,
+                    'Abstract': abstract,
+                    'URL': link
+                }
+                results.append(result_data)
+                count += 1
+
+            return MCPToolResult(
+                success=True,
+                data={
+                    "results": results,
+                    "total_results": len(results),
+                    "query": query
+                },
+                metadata={"tool_name": "google_scholar_search"}
+            )
+
+        except Exception as e:
+            logger.error(f"Google Scholar search failed: {e}")
+            return MCPToolResult(
+                success=False,
+                error=f"Search failed: {str(e)}"
+            )
+
+    def google_scholar_get_paper(self, paper_url: str) -> MCPToolResult:
+        """
+        Download and analyze a paper from Google Scholar search results.
+        Similar to arxiv_read_paper and get_pubmed_article.
+        
+        Args:
+            paper_url: The paper URL from google_scholar_search results
+            
+        Returns:
+            MCPToolResult: Paper analysis result with file path
+        """
+        try:
+            # Generate file path for saving
+            import hashlib
+            url_hash = hashlib.md5(paper_url.encode()).hexdigest()[:8]
+            
+            # Check if URL points to a PDF file
+            is_pdf_url = paper_url.lower().endswith('.pdf') or '/pdf/' in paper_url.lower()
+            
+            if is_pdf_url:
+                # Direct PDF download
+                filename = f"google_scholar_{url_hash}.pdf"
+                file_path = self.workspace_path / "url_crawler_save_files" / filename
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                try:
+                    # Download PDF file directly
+                    import requests
+                    response = requests.get(paper_url, stream=True, timeout=30, verify=False)
+                    response.raise_for_status()
+                    
+                    # Save PDF file
+                    with open(file_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    
+                    saved_file_path = str(file_path.relative_to(self.workspace_path))
+                    paper_title = "Google Scholar Paper"
+                    
+                except Exception as e:
+                    logger.error(f"Failed to download PDF: {e}")
+                    return MCPToolResult(
+                        success=False,
+                        error=f"Failed to download PDF: {str(e)}"
+                    )
+                
+            else:
+                # Use url_crawler for web pages
+                filename = f"google_scholar_{url_hash}.txt"
+                file_path = f"url_crawler_save_files/{filename}"
+                
+                crawler_result = self.url_crawler(documents=[{
+                    "url": paper_url, 
+                    "title": "Google Scholar Paper",
+                    "file_path": file_path
+                }])
+                
+                if not crawler_result.success:
+                    return MCPToolResult(
+                        success=False,
+                        error=f"Failed to fetch paper: {crawler_result.error}"
+                    )
+                
+                # Extract content from crawler result
+                # url_crawler returns data as a list of result dicts directly
+                crawled_data = crawler_result.data if isinstance(crawler_result.data, list) else []
+                if not crawled_data:
+                    return MCPToolResult(
+                        success=False,
+                        error="No content retrieved from URL"
+                    )
+                
+                result_data = crawled_data[0]
+                
+                # Check if crawling was successful
+                if not result_data.get('success', False):
+                    return MCPToolResult(
+                        success=False,
+                        error=f"Failed to crawl URL: {result_data.get('error', 'Unknown error')}"
+                    )
+                
+                paper_title = result_data.get('title', 'Google Scholar Paper')
+                saved_file_path = result_data.get('file_path')
+                
+                if not saved_file_path:
+                    return MCPToolResult(
+                        success=False,
+                        error="File path not found in crawler result"
+                    )
+            
+            # Use document_extract to analyze the paper
+            extract_result = self.document_extract(
+                file_path=saved_file_path,
+                task_description="Analyze this academic paper from Google Scholar"
+            )
+            
+            if extract_result.success:
+                return MCPToolResult(
+                    success=True,
+                    data={
+                        "file_path": saved_file_path,
+                        "title": paper_title,
+                        "url": paper_url,
+                        "analysis": extract_result.data,
+                        "message": f"Successfully downloaded and analyzed paper from Google Scholar"
+                    },
+                    metadata={"tool_name": "google_scholar_get_paper"}
+                )
+            else:
+                # Even if analysis fails, the file is still saved
+                return MCPToolResult(
+                    success=True,
+                    data={
+                        "file_path": saved_file_path,
+                        "title": paper_title,
+                        "url": paper_url,
+                        "message": f"Paper downloaded but analysis failed: {extract_result.error}"
+                    },
+                    metadata={"tool_name": "google_scholar_get_paper"}
+                )
+                
+        except Exception as e:
+            logger.error(f"Google Scholar get paper failed: {e}")
+            return MCPToolResult(
+                success=False,
+                error=f"Failed to get paper: {str(e)}"
+            )
+
+    def springer_search(self, query: str, max_results: int = 10, subject: str = None, 
+                       start_year: int = None, end_year: int = None) -> MCPToolResult:
+        """
+        Search for papers on Springer Nature using their Open Access API.
+        
+        Args:
+            query: Search query string (keywords, title, etc.)
+            max_results: Maximum number of papers to return (default: 10)
+            subject: Filter by subject area (optional)
+            start_year: Filter by start year (optional)
+            end_year: Filter by end year (optional)
+            
+        Returns:
+            MCPToolResult with list of Paper objects
+        """
+        try:
+            BASE_URL = "https://api.springernature.com/openaccess/json"
+            
+            params = {
+                'q': query,
+                'p': max_results,
+                's': 1
+            }
+            
+            if subject:
+                params['q'] = f"{params['q']} subject:{subject}"
+            
+            if start_year and end_year:
+                params['q'] = f"{params['q']} year:{start_year}-{end_year}"
+            elif start_year:
+                params['q'] = f"{params['q']} year:{start_year}-{datetime.now().year}"
+            
+            response = requests.get(BASE_URL, params=params, verify=False, proxies=proxy, timeout=30)
+            
+            if response.status_code != 200:
+                return MCPToolResult(success=False, error=f"Springer API请求失败: HTTP {response.status_code}")
+            
+            data = response.json()
+            records = data.get('records', [])
+            
+            papers = []
+            for record in records:
+                try:
+                    pub_date_str = record.get('publicationDate', '')
+                    try:
+                        pub_date = datetime.strptime(pub_date_str, '%Y-%m-%d')
+                    except:
+                        try:
+                            pub_date = datetime.strptime(pub_date_str, '%Y-%m')
+                        except:
+                            pub_date = datetime.now()
+                    
+                    creators = record.get('creators', [])
+                    authors = [creator.get('creator', '') for creator in creators if isinstance(creator, dict)]
+                    
+                    doi = record.get('doi', '')
+                    paper_id = doi if doi else record.get('identifier', '')
+                    
+                    url = record.get('url', [])
+                    paper_url = url[0].get('value', '') if url and isinstance(url, list) and len(url) > 0 else f"https://doi.org/{doi}"
+                    
+                    pdf_url = ''
+                    for url_item in url:
+                        if isinstance(url_item, dict) and url_item.get('format', '') == 'pdf':
+                            pdf_url = url_item.get('value', '')
+                            break
+                    
+                    abstract = record.get('abstract', '')
+                    
+                    subjects = record.get('subjects', [])
+                    categories = [subj.get('subject', '') for subj in subjects if isinstance(subj, dict)]
+                    
+                    paper = Paper(
+                        paper_id=paper_id,
+                        title=record.get('title', ''),
+                        authors=authors,
+                        abstract=abstract,
+                        doi=doi,
+                        published_date=pub_date,
+                        pdf_url=pdf_url,
+                        url=paper_url,
+                        source='springer',
+                        categories=categories,
+                        keywords=[],
+                        extra={
+                            'publisher': record.get('publisher', ''),
+                            'publicationType': record.get('publicationType', ''),
+                            'issn': record.get('issn', ''),
+                            'isbn': record.get('isbn', ''),
+                            'volume': record.get('volume', ''),
+                            'number': record.get('number', ''),
+                            'startingPage': record.get('startingPage', ''),
+                            'endingPage': record.get('endingPage', '')
+                        }
+                    )
+                    papers.append(paper.to_dict())
+                    
+                except Exception as e:
+                    logger.warning(f"解析Springer论文记录失败: {e}")
+                    continue
+            
+            return MCPToolResult(success=True, data={"papers": papers, "total": len(papers)})
+            
+        except Exception as e:
+            logger.error(f"Springer搜索失败: {e}")
+            return MCPToolResult(success=False, error=f"Springer搜索失败: {e}")
 
     # DISABLED: Springer API currently unavailable
     # def springer_get_article(self, doi: str) -> MCPToolResult:
@@ -10491,6 +10909,68 @@ MCP_TOOL_SCHEMAS = {
 
             },
             "required": ["paper_id"]
+        }
+    },
+    "google_scholar_search": {
+        "name": "google_scholar_search",
+        "description": "Search Google Scholar for academic papers using a simple keyword query. Returns paper titles, authors, abstracts and URLs. Covers all academic disciplines. Use this for broad academic search across all fields.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query string (keywords, paper title, etc.), only supports english"
+                },
+                "num_results": {
+                    "type": "integer",
+                    "description": "Number of results to retrieve (default: 5)"
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    "advanced_google_scholar_search": {
+        "name": "advanced_google_scholar_search",
+        "description": "Search Google Scholar with advanced filters including author name and year range. Returns paper titles, authors, abstracts and URLs. Use this when you need to filter by specific author or publication year range.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query string (keywords, paper title, etc.), only supports english"
+                },
+                "author": {
+                    "type": "string",
+                    "description": "Author name to filter results (optional)"
+                },
+                "start_year": {
+                    "type": "integer",
+                    "description": "Start year to filter by publication year (optional)"
+                },
+                "end_year": {
+                    "type": "integer",
+                    "description": "End year to filter by publication year (optional)"
+                },
+                "num_results": {
+                    "type": "integer",
+                    "description": "Number of results to retrieve (default: 5)"
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    "google_scholar_get_paper": {
+        "name": "google_scholar_get_paper",
+        "description": "Download and analyze a paper from Google Scholar search results. Similar to arxiv_read_paper and get_pubmed_article. Use this after google_scholar_search to get full paper content for analysis. The paper will be downloaded, saved to workspace, and analyzed automatically.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "paper_url": {
+                    "type": "string",
+                    "description": "The paper URL from google_scholar_search results"
+                }
+            },
+            "required": ["paper_url"]
         }
     },
     # DISABLED: Springer API currently unavailable

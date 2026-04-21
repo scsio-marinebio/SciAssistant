@@ -1,5 +1,4 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
-# Copyright (c) 2026 South China Sea Institute of Oceanology, Chinese Academy of Sciences (SCSIO, CAS). All rights reserved.
 #!/usr/bin/env python3
 """
 MCP Client for Agent-to-Server Communication
@@ -492,6 +491,11 @@ class MCPClient:
                 'env_var': 'SEARCH_SOURCE_ARXIV',
                 'tools': ['arxiv_search', 'arxiv_read_paper']
             },
+            'GOOGLE_SCHOLAR': {
+                'name': 'Google Scholar',
+                'env_var': 'SEARCH_SOURCE_GOOGLE_SCHOLAR',
+                'tools': ['google_scholar_search', 'advanced_google_scholar_search', 'google_scholar_get_paper', 'url_crawler']
+            },
             'SPRINGER': {
                 'name': 'Springer Nature',
                 'env_var': 'SEARCH_SOURCE_SPRINGER',
@@ -500,20 +504,26 @@ class MCPClient:
         }
         
         # Build tool to source mapping from configuration
-        tool_to_source = {}
+        # A tool can belong to multiple sources; it's allowed if ANY source is enabled
+        tool_to_sources = {}
         for source_key, config in SEARCH_SOURCE_CONFIG.items():
             is_enabled = os.environ.get(config['env_var'], 'True').lower() == 'true'
             for tool in config['tools']:
-                tool_to_source[tool] = (config['name'], is_enabled)
+                if tool not in tool_to_sources:
+                    tool_to_sources[tool] = []
+                tool_to_sources[tool].append((config['name'], is_enabled))
         
         # Check if tool is a search tool and if it's disabled
-        if tool_name in tool_to_source:
-            source_name, is_enabled = tool_to_source[tool_name]
-            if not is_enabled:
-                return {
-                    "allowed": False,
-                    "reason": f"搜索源 '{source_name}' 未被用户启用。请使用已启用的搜索源，或要求用户在前端界面勾选该搜索源。当前工具 '{tool_name}' 已被禁用。"
-                }
+        if tool_name in tool_to_sources:
+            sources = tool_to_sources[tool_name]
+            # Tool is allowed if ANY of its associated sources is enabled
+            if any(is_enabled for _, is_enabled in sources):
+                return {"allowed": True, "reason": ""}
+            source_names = ', '.join(name for name, _ in sources)
+            return {
+                "allowed": False,
+                "reason": f"搜索源 '{source_names}' 未被用户启用。请使用已启用的搜索源，或要求用户在前端界面勾选该搜索源。当前工具 '{tool_name}' 已被禁用。"
+            }
         
         # Tool is allowed (either not a search tool, or is enabled)
         return {"allowed": True, "reason": ""}
@@ -791,6 +801,11 @@ INFORMATION_SEEKER_TOOLS = [
     # Academic search tools - medRxiv
     "medrxiv_search",
     "medrxiv_read_paper",
+    
+    # Academic search tools - Google Scholar
+    "google_scholar_search",
+    "advanced_google_scholar_search",
+    "google_scholar_get_paper",
     
     # Academic search tools - Springer Nature
     "springer_search",

@@ -243,10 +243,10 @@
             return URL_PLACEHOLDER + (codeBlocks.length - 1) + '___';
         });
         
-        // 6.3 正文中的引用标注 [数字] -> 上标小字体，可点击跳转到搜索来源
-        // 匹配正文中的 [数字] 格式（非行首，前面是中文/英文/标点），转为上标链接
+        // 6.3 正文中的引用标注 [数字] -> 与文字同行显示，可点击跳转到搜索来源
+        // 匹配正文中的 [数字] 格式（非行首，前面是中文/英文/标点），转为行内链接
         html = html.replace(/(?<=[^\n\[])(\[(\d+)\])/g, function(match, full, num) {
-            const rendered = `<sup class="citation-ref" data-ref="${num}" style="cursor:pointer;color:#3b82f6;font-size:0.7em;margin:0 1px;padding:1px 3px;border-radius:3px;background:#eff6ff;vertical-align:super;line-height:1;" onclick="(function(e){var src=document.getElementById('search-source-'+${num});if(src){src.scrollIntoView({behavior:'smooth',block:'center'});src.style.transition='background 0.3s';src.style.background='#fef3c7';setTimeout(function(){src.style.background='';},2000);}e.stopPropagation();})(event)">[${num}]</sup>`;
+            const rendered = `<span class="citation-ref" data-ref="${num}" style="cursor:pointer;color:#3b82f6;font-size:1em;padding:0 1px;border-radius:2px;background:#eff6ff;font-weight:500;display:inline;" onclick="(function(e){var src=document.getElementById('search-source-'+${num});if(src){src.scrollIntoView({behavior:'smooth',block:'center'});src.style.transition='background 0.3s';src.style.background='#fef3c7';setTimeout(function(){src.style.background='';},2000);}e.stopPropagation();})(event)">[${num}]</span>`;
             codeBlocks.push(rendered);
             return URL_PLACEHOLDER + (codeBlocks.length - 1) + '___';
         });
@@ -688,19 +688,21 @@
 
             /* 引用标记样式优化 */
             sup {
-                font-size: 0.85em; /* 相对于父元素85%大小，提高可读性 */
+                font-size: 0.85em !important; /* 增大字号提高可读性 */
                 line-height: 0;
                 position: relative;
                 vertical-align: baseline;
                 top: -0.35em; /* 稍微调整上标位置 */
+                margin: 0 !important; /* 强制去除外边距 */
             }
             sup a {
                 color: #3B82F6 !important; /* 使用主题蓝色 */
                 text-decoration: none !important;
                 font-weight: 500; /* 稍微加粗 */
-                padding: 1px 3px; /* 增加一点内边距 */
-                border-radius: 3px; /* 圆角 */
+                padding: 0 !important; /* 完全去除内边距消除间隔 */
+                border-radius: 2px; /* 圆角 */
                 transition: all 0.2s ease;
+                margin: 0 !important; /* 强制去除外边距 */
             }
             sup a:hover {
                 background-color: #EBF4FF; /* 悬停时的背景色 */
@@ -928,7 +930,7 @@
              <form id="chat-form" class="flex flex-wrap items-center gap-2">
                 <textarea 
                     id="user-input" 
-                    placeholder="输入研究问题 · 已适配PubMed/arXiv/medRxiv源，生成文献综述"
+                    placeholder="输入研究问题 · 已适配多学术源检索，生成文献综述"
                     class="flex-1 rounded-lg p-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/50 resize-none transition-all duration-200" 
                     style="min-width: 300px;"
                     rows="1"
@@ -965,6 +967,11 @@
                                 <input type="checkbox" value="pubmed" class="search-source-checkbox search-source-item" style="width: 16px; height: 16px; margin: 0;" checked>
                                 <i class="fa fa-heartbeat text-red-500" style="width: 16px; text-align: center;"></i>
                                 <span class="text-sm text-gray-700">PubMed/medRxiv</span>
+                            </label>
+                            <label class="cursor-pointer transition-colors hover:bg-gray-50" style="display: grid; grid-template-columns: 20px 20px 1fr; gap: 8px; align-items: center; padding: 8px 16px; min-height: 36px;">
+                                <input type="checkbox" value="google_scholar" class="search-source-checkbox search-source-item" style="width: 16px; height: 16px; margin: 0;" checked>
+                                <i class="fa fa-graduation-cap text-blue-600" style="width: 16px; text-align: center;"></i>
+                                <span class="text-sm text-gray-700">Google Scholar</span>
                             </label>
                         </div>
                     </div>
@@ -1941,7 +1948,7 @@ function copyToClipboard(text, button) {
             const searchSourcesContainer = document.getElementById('search-sources-container');
             
             if (tabName === 'deepdiver') {
-                userInput.placeholder = '输入研究问题 · 已适配PubMed/arXiv/medRxiv源，生成文献综述';
+                userInput.placeholder = '输入研究问题 · 已适配多学术源检索，生成文献综述';
                 // DeepDiver模式：隐藏"全文提示"开关
                 if (ragFullToggleLabel) {
                     ragFullToggleLabel.classList.add('hidden');
@@ -3432,7 +3439,8 @@ ${contextText.trim()}
                 const selectedSources = {
                     websearch: selectedValues.includes('websearch'),
                     pubmed: selectedValues.includes('pubmed'),
-                    arxiv: selectedValues.includes('arxiv')
+                    arxiv: selectedValues.includes('arxiv'),
+                    google_scholar: selectedValues.includes('google_scholar')
                 };
                 
                 const requestBody = {

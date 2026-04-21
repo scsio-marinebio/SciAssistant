@@ -511,6 +511,8 @@ For each function call, return a JSON object placed within the [unused11][unused
 
                     def extract_tool_calls(content):
                         import re
+                        if not content:
+                            return []
                         tool_call_str = re.findall(r"\[unused11\]([\s\S]*?)\[unused12\]", content)
                         if len(tool_call_str) > 0:
                             try:

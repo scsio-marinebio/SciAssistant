@@ -98,6 +98,7 @@ class SearchSources(BaseModel):
     websearch: bool = True
     pubmed: bool = True
     arxiv: bool = True
+    google_scholar: bool = True
 
 
 class SingleQueryRequest(BaseModel):
@@ -106,10 +107,10 @@ class SingleQueryRequest(BaseModel):
     frontend_session_id: Optional[str] = None  # 前端会话ID，用于存储消息到数据库
     user_files: Optional[List[UserFile]] = []  # 强制使用的文件列表（直接上传）
     reference_files: Optional[List[UserFile]] = []  # 可选参考的文件列表（从文档库选择）
-    use_web_search: bool = True  # 是否启用网络检索
+    use_web_search: bool = True  # [DEPRECATED] 已废弃，请使用 search_sources 参数控制搜索源
     prioritize_user_files: bool = True  # 是否优先使用用户文件
     username: Optional[str] = "用户"  # 用户名，用于生成报告署名
-    search_sources: Optional[SearchSources] = None  # 搜索源选择
+    search_sources: Optional[SearchSources] = None  # 搜索源选择（控制 websearch/pubmed/arxiv/google_scholar）
 
 
 class BatchQueryRequest(BaseModel):
@@ -367,10 +368,12 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
             os.environ['SEARCH_SOURCE_WEBSEARCH'] = str(search_sources_dict.get('websearch', False))
             os.environ['SEARCH_SOURCE_PUBMED'] = str(search_sources_dict.get('pubmed', False))
             os.environ['SEARCH_SOURCE_ARXIV'] = str(search_sources_dict.get('arxiv', False))
+            os.environ['SEARCH_SOURCE_GOOGLE_SCHOLAR'] = str(search_sources_dict.get('google_scholar', False))
             os.environ['SEARCH_SOURCE_SPRINGER'] = str(search_sources_dict.get('springer', False))
             logger.info(f"[SEARCH_SOURCES] WebSearch: {search_sources_dict.get('websearch', False)}, "
                        f"PubMed: {search_sources_dict.get('pubmed', False)}, "
                        f"arXiv: {search_sources_dict.get('arxiv', False)}, "
+                       f"GoogleScholar: {search_sources_dict.get('google_scholar', False)}, "
                        f"Springer: {search_sources_dict.get('springer', False)}")
 
         agent = create_planner_agent(
@@ -894,7 +897,8 @@ async def handle_single_query(request: SingleQueryRequest):
         search_sources_dict = {
             'websearch': request.search_sources.websearch,
             'pubmed': request.search_sources.pubmed,
-            'arxiv': request.search_sources.arxiv
+            'arxiv': request.search_sources.arxiv,
+            'google_scholar': request.search_sources.google_scholar
         }
 
     # 判断是立即执行还是加入队列

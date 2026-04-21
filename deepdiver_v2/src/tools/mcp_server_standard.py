@@ -1,5 +1,4 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
-# Copyright (c) 2026 South China Sea Institute of Oceanology, Chinese Academy of Sciences (SCSIO, CAS). All rights reserved.
 #!/usr/bin/env python3
 """
 Demo-Ready MCP Server - New Standard Implementation
@@ -337,6 +336,11 @@ def get_tool_function(tool_name: str):
         # Resource Library - medRxiv tools
         "medrxiv_search": lambda tools, **kwargs: tools.medrxiv_search(**kwargs),
         "medrxiv_read_paper": lambda tools, **kwargs: tools.medrxiv_read_paper(**kwargs),
+        
+        # Resource Library - Google Scholar tools
+        "google_scholar_search": lambda tools, **kwargs: tools.google_scholar_search(**kwargs),
+        "advanced_google_scholar_search": lambda tools, **kwargs: tools.advanced_google_scholar_search(**kwargs),
+        "google_scholar_get_paper": lambda tools, **kwargs: tools.google_scholar_get_paper(**kwargs),
         
         # Resource Library - Springer Nature tools
         "springer_search": lambda tools, **kwargs: tools.springer_search(**kwargs),
