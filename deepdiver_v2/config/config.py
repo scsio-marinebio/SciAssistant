@@ -50,7 +50,7 @@ class APIConfig:
     # Model Interaction Configuration
     model_temperature: float = 0.3
     model_max_tokens: int = 8192
-    model_request_timeout: int = 6000
+    model_request_timeout: int = 900
     
     # Tool Trajectory and Output Configuration  
     trajectory_storage_path: str = "./workspace"

@@ -1356,6 +1356,76 @@ For each function call, return a JSON object placed within the [unused11][unused
             _init_msg = '开始分析任务' if self._is_chinese_query else 'Analyzing task'
             self._send_progress('init', _init_msg, {'query': user_query[:100]})
 
+            # Human in the loop 阶段2：跳过搜索，直接使用已有结果调用 WriterAgent
+            human_in_loop_phase2 = os.environ.get('HUMAN_IN_LOOP_PHASE2', 'false').lower() == 'true'
+            if human_in_loop_phase2:
+                self.logger.info("Human in the loop Phase 2: 跳过搜索阶段，直接调用 WriterAgent")
+                
+                # 读取 workspace 中已有的 key_files
+                workspace_path = os.environ.get('AGENT_WORKSPACE_PATH', '')
+                key_files = []
+                # 优先使用调用方显式注入的大纲（避免并发任务下全局环境变量串扰）
+                user_outline = (getattr(self, "_hitl_user_outline", "") or "").strip()
+                if workspace_path:
+                    from pathlib import Path
+                    workspace_path_obj = Path(workspace_path)
+                    
+                    # 回退：未注入时再从 workspace 读取用户确认大纲
+                    if not user_outline:
+                        user_outline_file = workspace_path_obj / '.user_outline'
+                        if user_outline_file.exists():
+                            with open(user_outline_file, 'r', encoding='utf-8') as f:
+                                user_outline = f.read().strip()
+                
+                    self.logger.info(f"Human in the loop Phase 2: 读取用户确认大纲，长度 {len(user_outline)} 字符")
+                    
+                    # 读取已有的 key_files
+                    file_analysis_path = workspace_path_obj / "doc_analysis" / "file_analysis.jsonl"
+                    if file_analysis_path.exists():
+                        with open(file_analysis_path, 'r', encoding='utf-8') as f:
+                            for line in f:
+                                try:
+                                    file_info = json.loads(line.strip())
+                                    if file_info.get('file_path'):
+                                        key_files.append({
+                                            'file_path': file_info.get('file_path'),
+                                            'desc': file_info.get('core_content', '')[:200]
+                                        })
+                                except:
+                                    continue
+                        self.logger.info(f"Human in the loop Phase 2: 加载了 {len(key_files)} 个已有文件")
+                
+                # 构建包含用户大纲的任务内容，明确指示 WriterAgent 跳过大纲生成步骤
+                task_content = f"""【重要】这是 Human in the loop 阶段2，用户已确认大纲，请严格按照以下要求执行：
+
+1. 【跳过大纲生成】不要自己生成大纲，直接使用下面用户确认的大纲
+2. 【直接进行文件分类】调用 search_result_classifier 工具时，必须使用下面的用户确认大纲作为 outline 参数
+3. 【按大纲写作】严格按照用户确认的大纲章节结构进行写作
+
+用户确认的大纲：
+{user_outline}
+
+用户原始查询：{user_query}"""
+                
+                # 直接调用 WriterAgent
+                result = self.assign_subjective_task_to_writer(
+                    task_content=task_content,
+                    user_query=user_query,
+                    key_files=key_files
+                )
+                
+                execution_time = time.time() - start_time
+                
+                return AgentResponse(
+                    success=result.get("success", False),
+                    result=result.get("data"),
+                    error=result.get("error"),
+                    reasoning_trace=[],
+                    iterations=1,
+                    execution_time=execution_time,
+                    agent_name=self.config.agent_name
+                )
+
             # Execute the planning task using ReAct pattern
             result = self._execute_react_loop(
                 initial_message=user_query,

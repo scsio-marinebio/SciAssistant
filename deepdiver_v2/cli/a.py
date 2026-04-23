@@ -16,6 +16,7 @@ import time
 import json
 import uuid
 import signal
+import threading
 import multiprocessing as mp
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -79,6 +80,13 @@ import time
 query_history: List[Dict[str, Any]] = []  # 仅记录查询历史，无会话关联
 batch_results: Dict[str, Any] = {}
 executor = None  # 线程池将在lifespan中初始化
+
+# task_id 到 session_id 的映射（用于查找workspace）
+task_session_mapping: Dict[str, str] = {}
+
+# Human in the loop: 存储等待大纲确认的任务状态
+pending_outline_confirmations: Dict[str, Dict[str, Any]] = {}
+pending_outline_lock = threading.Lock()  # 线程锁保护
 progress_queues: Dict[str, queue.Queue] = {}  # 进度队列管理器：task_id -> Queue
 progress_history: Dict[str, List[dict]] = {}  # 历史进度消息存储：task_id -> List[progress_data]
 queue_executor = None  # 队列处理线程池
@@ -112,6 +120,7 @@ class SingleQueryRequest(BaseModel):
     prioritize_user_files: bool = True  # 是否优先使用用户文件
     username: Optional[str] = "用户"  # 用户名，用于生成报告署名
     search_sources: Optional[SearchSources] = None  # 搜索源选择（控制 websearch/pubmed/arxiv/google_scholar/scihub）
+    human_in_loop: bool = False  # Human in the loop 模式：大纲生成后等待用户确认
 
 
 class BatchQueryRequest(BaseModel):
@@ -159,6 +168,20 @@ class QueryResponse(BaseModel):
     # 最终报告内容
     final_report: Optional[str] = None  # Markdown格式的最终报告内容
     report_path: Optional[str] = None  # 报告文件路径（相对于workspace）
+    
+    # Human in the loop 相关字段
+    waiting_for_outline_confirm: bool = False  # 是否等待用户确认大纲
+    outline_content: Optional[str] = None  # 大纲内容（仅在 waiting_for_outline_confirm=True 时有值）
+    reasoning_content: Optional[str] = None  # reasoning内容（仅在 waiting_for_outline_confirm=True 时有值）
+
+
+# Human in the loop 大纲确认请求模型
+class OutlineConfirmRequest(BaseModel):
+    task_id: str  # 任务ID
+    session_id: str  # 会话ID
+    action: str  # "confirm" 或 "cancel"
+    outline: Optional[str] = None  # 用户修改后的大纲（如果有修改）
+    modified: bool = False  # 是否修改了大纲
 
 
 class BatchResponse(BaseModel):
@@ -342,7 +365,8 @@ def _build_enhanced_query(query_text: str, user_files_data: List[Dict[str, str]]
 
 
 def process_single_query(query_data, task_id: Optional[str] = None, username: str = "用户",
-                         skip_task_creation: bool = False, frontend_session_id: Optional[str] = None):
+                         skip_task_creation: bool = False, frontend_session_id: Optional[str] = None,
+                         human_in_loop: bool = False, user_outline: Optional[str] = None):
     """处理单个查询（独立进程，使用持久化工作区）"""
     query_text, query_index, user_files_data, search_sources_dict = query_data
     process_id = os.getpid()
@@ -380,6 +404,10 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
 
     logger.info(f"[WORKSPACE] session_id: {session_id}")
     logger.info(f"[WORKSPACE] workspace initialized at: {workspace_path.resolve()}")
+    
+    # 保存 task_id 到 session_id 的映射（用于查找workspace）
+    if task_id:
+        task_session_mapping[task_id] = session_id
 
     try:
         app_config = get_config()
@@ -397,6 +425,31 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
         # 设置环境变量，让 Agent 使用已创建的 workspace
         os.environ['AGENT_SESSION_ID'] = session_id
         os.environ['AGENT_WORKSPACE_PATH'] = str(workspace_path)
+        
+        # Human in the loop 模式：通过 workspace 文件传递状态
+        os.environ['HUMAN_IN_LOOP'] = 'true' if human_in_loop else 'false'
+        os.environ.pop('HUMAN_IN_LOOP_PHASE2', None)  # 阶段1 确保不设置 PHASE2 标志
+        
+        # 创建 .human_in_loop 标记文件，供 MCP 工具读取
+        human_in_loop_file = workspace_path / '.human_in_loop'
+        if human_in_loop:
+            with open(human_in_loop_file, 'w', encoding='utf-8') as f:
+                f.write('true')
+            logger.info(f"[HITL DEBUG] 已创建标记文件: {human_in_loop_file}")
+            logger.info(f"[HITL DEBUG] workspace_path={workspace_path}, session_id={session_id}")
+        else:
+            # 确保不存在旧的标记文件
+            if human_in_loop_file.exists():
+                human_in_loop_file.unlink()
+        
+        if user_outline:
+            # 如果有用户确认的大纲，写入文件供 Agent 使用
+            outline_file = workspace_path / '.user_outline'
+            with open(outline_file, 'w', encoding='utf-8') as f:
+                f.write(user_outline)
+            os.environ['USER_OUTLINE_PATH'] = str(outline_file)
+        else:
+            os.environ.pop('USER_OUTLINE_PATH', None)
         
         # 设置搜索源偏好
         if search_sources_dict:
@@ -470,6 +523,65 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
             logger.info(f"Task {task_id} was cancelled during or after execution")
             task_manager.update_task_status(task_id, TaskStatus.CANCELLED, error=getattr(response, 'error', 'Task cancelled'))
             raise HTTPException(status_code=499, detail="Task was cancelled by user")
+
+        # Human in the loop: 检查是否需要等待用户确认大纲
+        outline_pending_file = workspace_path / '.outline_pending'
+        if human_in_loop and outline_pending_file.exists():
+            logger.info(f"[HITL] 检测到 .outline_pending 文件，任务 {task_id} 等待用户确认大纲")
+            
+            # 读取大纲内容
+            outline_content = ""
+            outline_file = workspace_path / '.outline_content'
+            if outline_file.exists():
+                with open(outline_file, 'r', encoding='utf-8') as f:
+                    outline_content = f.read()
+            
+            # 读取 reasoning 内容
+            reasoning_content = ""
+            reasoning_file = workspace_path / '.reasoning_content'
+            if reasoning_file.exists():
+                with open(reasoning_file, 'r', encoding='utf-8') as f:
+                    reasoning_content = f.read()
+            
+            # 保存待确认状态（加锁保护）
+            with pending_outline_lock:
+                pending_outline_confirmations[task_id] = {
+                    'session_id': session_id,
+                    'workspace_path': str(workspace_path),
+                    'outline_content': outline_content,
+                    'reasoning_content': reasoning_content,
+                    'query_data': query_data,
+                    'username': username,
+                    'frontend_session_id': frontend_session_id,
+                    'task_id': task_id,
+                    'status': 'waiting_for_confirm',
+                    # HITL耗时拆分：Phase1（到大纲待确认为止）与确认等待时长
+                    'phase1_execution_time': execution_time,
+                    'outline_ready_at': time.time()
+                }
+            
+            # 更新任务进度，通知前端等待大纲确认
+            task_manager.update_task_progress(task_id, {
+                'status': 'waiting_for_outline_confirm',
+                'outline_content': outline_content,
+                'reasoning_content': reasoning_content,
+                'session_id': session_id
+            })
+            
+            # 通过 SSE 发送进度更新
+            send_progress_update(task_id, {
+                'type': 'outline_pending',
+                'message': '大纲已生成，等待用户确认',
+                'outline_content': outline_content,
+                'reasoning_content': reasoning_content,
+                'session_id': session_id
+            })
+            
+            logger.info(
+                f"[HITL] 任务 {task_id} 已暂停，等待用户确认大纲 "
+                f"(outline长度={len(outline_content)}, phase1耗时={execution_time:.2f}s)"
+            )
+            return  # 暂停执行，等待用户确认后通过 Phase 2 继续
 
         # 读取最终报告内容（在更新任务状态之前读取，以便保存到result中）
         final_report_content = None
@@ -824,7 +936,10 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
         send_progress_update(task_id, {
             'type': 'completed',
             'message': '任务完成',
-            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'session_id': session_id,
+            'report_path': report_relative_path,
+            'final_report': final_report_content
         })
         
         return result_data
@@ -908,7 +1023,9 @@ def process_batch_task(
     max_workers = max_workers or min(mp.cpu_count(), len(queries), 4)
     results = []
 
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    # 【HITL修复】使用 ThreadPoolExecutor 而不是 ProcessPoolExecutor
+    # 因为 pending_outline_confirmations 需要在所有任务间共享状态
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_query = {executor.submit(process_single_query, qd): qd for qd in query_data}
         for future in as_completed(future_to_query):
             try:
@@ -1040,7 +1157,8 @@ def execute_queued_task(task_id: str, params: Dict[str, Any]):
             task_id=task_id,
             username=params.get('username', '用户'),
             skip_task_creation=True,
-            frontend_session_id=params.get('frontend_session_id')
+            frontend_session_id=params.get('frontend_session_id'),
+            human_in_loop=params.get('human_in_loop', False)
         )
         
         # 【关键修复】任务完成后保存结果到TaskManager，以便前端轮询获取
@@ -1130,7 +1248,8 @@ async def handle_single_query(request: SingleQueryRequest):
             'params': {
                 'query_data': (request.query, 0, all_files_data, search_sources_dict),
                 'username': request.username,
-                'frontend_session_id': request.frontend_session_id
+                'frontend_session_id': request.frontend_session_id,
+                'human_in_loop': request.human_in_loop
             }
         })
         
@@ -1177,7 +1296,8 @@ async def handle_single_query(request: SingleQueryRequest):
     loop.run_in_executor(
         executor,
         lambda: process_single_query((request.query, 0, all_files_data, search_sources_dict), task_id=task_id, username=request.username,
-                                     skip_task_creation=True, frontend_session_id=request.frontend_session_id)
+                                     skip_task_creation=True, frontend_session_id=request.frontend_session_id,
+                                     human_in_loop=request.human_in_loop)
     )
     
     # 立即返回任务已接受的响应，不等待任务完成
@@ -1473,6 +1593,11 @@ def send_progress_update(task_id: str, progress_data: dict):
             logger.error(f"[SSE] 发送进度更新失败: {e}")
     else:
         logger.warning(f"[SSE] task_id={task_id} 不在 progress_queues 中，无法发送进度")
+        if progress_data.get('type') in ('completed', 'error', 'cancelled'):
+            logger.error(
+                f"[SSE] 终端事件可能未实时送达(无活跃SSE队列): task_id={task_id}, "
+                f"type={progress_data.get('type')}。历史已写入 progress_history，客户端可 GET /api/task 或刷新后重连。"
+            )
 
 
 @app.get("/api/query/stream/{task_id}", summary="SSE流式推送任务进度")
@@ -1555,10 +1680,15 @@ async def stream_task_progress(task_id: str):
             logger.error(f"[SSE] 流式推送异常: {e}", exc_info=True)
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
         finally:
-            # 清理队列
-            if task_id in progress_queues:
+            # 仅移除本连接注册的队列。新 SSE 会覆盖 progress_queues[task_id]，
+            # 若旧连接在 finally 里无条件 del，会误删新连接的队列，导致 Phase2 进度无法实时入队（仅写入 progress_history）。
+            if progress_queues.get(task_id) is progress_queue:
                 del progress_queues[task_id]
                 logger.info(f"[SSE] 清理进度队列: task_id={task_id}")
+            else:
+                logger.info(
+                    f"[SSE] 跳过清理进度队列（已被较新的SSE连接替换）: task_id={task_id}"
+                )
             
             # 如果任务已完成，清理历史进度消息
             task_info = task_manager.get_task(task_id)
@@ -1688,6 +1818,649 @@ async def cleanup_old_tasks(max_age_seconds: int = 3600):
         "success": True,
         "message": f"Cleaned up tasks older than {max_age_seconds} seconds"
     }
+
+
+# ========== 大纲状态查询相关 ==========
+@app.get("/api/task/{task_id}/outline", summary="获取任务的大纲生成状态")
+async def get_task_outline_status(task_id: str):
+    """
+    获取任务的大纲生成状态（用于Auto模式下前端轮询展示大纲）
+    
+    Args:
+        task_id: 任务ID
+        
+    Returns:
+        大纲生成状态和内容
+    """
+    task_info = task_manager.get_task(task_id)
+    
+    if task_info is None:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    
+    # 通过映射获取session_id
+    session_id = task_session_mapping.get(task_id)
+    
+    outline_content = None
+    outline_generated = False
+    
+    # 进度信息
+    progress_info = None
+    
+    if session_id:
+        # 查找workspace路径
+        current_file = Path(__file__).resolve()
+        project_root = None
+        for parent in [current_file.parent] + list(current_file.parents):
+            if (parent / "app.py").exists():
+                project_root = parent
+                break
+        if project_root is None:
+            project_root = Path.cwd()
+        
+        workspace_path = project_root / "workspaces" / session_id
+        outline_file = workspace_path / ".outline_generated"
+        progress_file = workspace_path / ".progress"
+        
+        if outline_file.exists():
+            try:
+                with open(outline_file, 'r', encoding='utf-8') as f:
+                    outline_content = f.read()
+                outline_generated = True
+            except Exception as e:
+                logger.warning(f"读取大纲文件失败: {e}")
+        
+        # 读取进度信息
+        if progress_file.exists():
+            try:
+                with open(progress_file, 'r', encoding='utf-8') as f:
+                    progress_info = json.load(f)
+            except Exception as e:
+                logger.warning(f"读取进度文件失败: {e}")
+    
+    return {
+        "task_id": task_id,
+        "status": task_info.status.value,
+        "outline_generated": outline_generated,
+        "outline_content": outline_content,
+        "task_completed": task_info.status.value in ["completed", "failed", "cancelled"],
+        "progress": progress_info
+    }
+
+
+# ========== Human in the loop 大纲确认相关 ==========
+
+@app.post("/api/outline/confirm", summary="确认或修改大纲")
+async def confirm_outline(request: OutlineConfirmRequest):
+    """
+    Human in the loop 模式：用户确认或修改大纲后继续执行
+    
+    Args:
+        request: 大纲确认请求，包含 task_id, session_id, action, outline, modified
+        
+    Returns:
+        确认结果
+    """
+    task_id = request.task_id
+    
+    # 【调试日志】检查 pending_outline_confirmations 状态
+    logger.info(f"[HITL DEBUG] confirm_outline 被调用: task_id={task_id}")
+    with pending_outline_lock:
+        logger.info(f"[HITL DEBUG] pending_outline_confirmations 键: {list(pending_outline_confirmations.keys())}")
+        if task_id not in pending_outline_confirmations:
+            logger.error(f"[HITL DEBUG] task_id={task_id} 不在 pending_outline_confirmations 中!")
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found or not waiting for outline confirmation")
+        
+        pending_task = pending_outline_confirmations[task_id]
+        logger.info(f"[HITL DEBUG] 找到任务: task_id={task_id}, status={pending_task.get('status')}")
+        
+        if request.action == "cancel":
+            # 用户取消，清理状态
+            del pending_outline_confirmations[task_id]
+            task_manager.cancel_task(task_id)
+            return {
+                "success": True,
+                "message": "Task cancelled by user",
+                "task_id": task_id
+            }
+        
+        elif request.action == "confirm":
+            # 用户确认大纲，设置确认标志
+            pending_task["confirmed"] = True
+            pending_task["user_outline"] = request.outline if request.modified else pending_task["outline_content"]
+            pending_task["modified"] = request.modified
+            
+            # 通知等待的协程继续执行
+            if "event" in pending_task and pending_task["event"]:
+                pending_task["event"].set()
+            
+            # 从 pending 中移除，但保留在内存中供 process_single_query 检查
+            if task_id in pending_outline_confirmations:
+                confirmed_task = pending_outline_confirmations.pop(task_id)
+                # 重新添加标记为已确认，让 process_single_query 可以获取
+                confirmed_task['status'] = 'confirmed'
+                pending_outline_confirmations[task_id] = confirmed_task
+            
+            logger.info(f"[HITL DEBUG] 大纲已确认: task_id={task_id}, modified={request.modified}")
+            
+            return {
+                "success": True,
+                "message": "Outline confirmed, continuing report generation",
+                "task_id": task_id,
+                "modified": request.modified
+            }
+        
+        else:
+            raise HTTPException(status_code=400, detail=f"Invalid action: {request.action}")
+
+
+@app.get("/api/outline/{task_id}", summary="获取等待确认的大纲")
+async def get_pending_outline(task_id: str):
+    """
+    获取等待用户确认的大纲内容
+    
+    Args:
+        task_id: 任务ID
+        
+    Returns:
+        大纲内容和状态
+    """
+    with pending_outline_lock:
+        if task_id not in pending_outline_confirmations:
+            return {
+                "success": False,
+                "waiting": False,
+                "message": f"Task {task_id} not found or not waiting for outline confirmation"
+            }
+        
+        pending_task = pending_outline_confirmations[task_id]
+        return {
+            "success": True,
+            "waiting": True,
+            "task_id": task_id,
+            "session_id": pending_task.get("session_id"),
+            "outline": pending_task.get("outline_content"),
+            "reasoning_content": pending_task.get("reasoning_content"),
+            "confirmed": pending_task.get("confirmed", False)
+        }
+
+
+@app.post("/api/outline/continue", summary="继续执行报告生成")
+async def continue_with_outline(request: OutlineConfirmRequest):
+    """
+    Human in the loop 模式：用户确认大纲后继续执行报告生成（异步提交到线程池）
+    """
+    task_id = request.task_id
+    
+    # 【调试】检查 task_manager
+    logger.info(f"[HITL DEBUG] continue_with_outline 被调用, task_id={task_id}")
+    logger.info(f"[HITL DEBUG] task_manager 类型: {type(task_manager)}, 值: {task_manager}")
+    
+    with pending_outline_lock:
+        if task_id not in pending_outline_confirmations:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found or not waiting for outline confirmation")
+        
+        pending_task = pending_outline_confirmations[task_id]
+        
+        if request.action == "cancel":
+            # 用户取消，清理状态
+            del pending_outline_confirmations[task_id]
+            task_manager.cancel_task(task_id)
+            
+            # 发送取消 SSE 通知
+            send_progress_update(task_id, {
+                'type': 'cancelled',
+                'message': '用户取消了大纲确认'
+            })
+            
+            return {
+                'success': False,
+                'query': pending_task.get('query_data', ('',))[0] if pending_task.get('query_data') else '',
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'session_id': pending_task.get('session_id', ''),
+                'task_id': task_id,
+                'planner_result': None,
+                'planner_error': 'Task cancelled by user',
+                'planner_reasoning_trace': [],
+                'planner_iterations': 0,
+                'planner_execution_time': 0,
+                'planner_agent_name': 'QueueManager',
+                'section_writer_responses': [],
+                'final_report': None,
+                'report_path': None,
+                'waiting_for_outline_confirm': False,
+                'outline_content': None,
+                'reasoning_content': None
+            }
+        
+        # 用户确认大纲，继续执行
+        # 优先使用请求中传入的非空 outline，避免 modified 标志异常时回退到旧大纲
+        request_outline = (request.outline or "").strip() if request.outline is not None else ""
+        user_outline = request_outline if request_outline else (pending_task.get("outline_content") or "")
+        query_data = pending_task["query_data"]
+        username = pending_task["username"]
+        workspace_path = pending_task["workspace_path"]
+        session_id = pending_task["session_id"]
+        frontend_session_id = pending_task.get("frontend_session_id")
+        phase1_execution_time = float(pending_task.get("phase1_execution_time", 0.0) or 0.0)
+        outline_ready_at = float(pending_task.get("outline_ready_at", 0.0) or 0.0)
+        outline_confirm_wait_time = max(0.0, time.time() - outline_ready_at) if outline_ready_at > 0 else 0.0
+        
+        # 清理 pending 状态
+        del pending_outline_confirmations[task_id]
+    
+    # 更新任务状态
+    task_manager.update_task_status(task_id, TaskStatus.RUNNING)
+    
+    # 发送 SSE 通知：大纲已确认，开始写作
+    send_progress_update(task_id, {
+        'type': 'outline_confirmed',
+        'message': '大纲已确认，开始生成报告...'
+    })
+    
+    loop = asyncio.get_event_loop()
+    
+    # 使用线程池异步执行 Phase 2
+    if executor is None:
+        raise HTTPException(status_code=500, detail="Server executor not initialized")
+    
+    loop.run_in_executor(
+        executor,
+        lambda: process_single_query_phase2(
+            query_data=query_data,
+            task_id=task_id,
+            username=username,
+            workspace_path=workspace_path,
+            session_id=session_id,
+            user_outline=user_outline,
+            frontend_session_id=frontend_session_id,
+            phase1_execution_time=phase1_execution_time,
+            outline_confirm_wait_time=outline_confirm_wait_time
+        )
+    )
+    
+    logger.info(f"[HITL] Phase 2 已提交到后台执行: task_id={task_id}")
+    return {
+        'success': True,
+        'query': query_data[0] if query_data else '',
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'session_id': session_id,
+        'task_id': task_id,
+        'planner_result': None,
+        'planner_error': None,
+        'planner_reasoning_trace': [],
+        'planner_iterations': 0,
+        'planner_execution_time': 0,
+        'planner_agent_name': 'TaskAccepted',
+        'section_writer_responses': [],
+        'final_report': None,
+        'report_path': None,
+        'waiting_for_outline_confirm': False,
+        'outline_content': None,
+        'reasoning_content': None
+    }
+
+
+def process_single_query_phase2(query_data, task_id: str, username: str, 
+                                 workspace_path: str, session_id: str, user_outline: str,
+                                 frontend_session_id: Optional[str] = None,
+                                 phase1_execution_time: float = 0.0,
+                                 outline_confirm_wait_time: float = 0.0):
+    """Human in the loop 阶段2：使用用户确认的大纲继续生成报告"""
+    query_text, query_index, user_files_data, search_sources_dict = query_data
+    workspace_path = Path(workspace_path)
+    
+    try:
+        app_config = get_config()
+        sub_agent_configs = {
+            "information_seeker": {
+                "model": app_config.model_name,
+                **({"max_iterations": app_config.information_seeker_max_iterations} if app_config.information_seeker_max_iterations else {})
+            },
+            "writer": {
+                "model": app_config.model_name,
+                **({"max_iterations": app_config.writer_max_iterations} if app_config.writer_max_iterations else {})
+            }
+        }
+        
+        # 设置环境变量
+        os.environ['AGENT_SESSION_ID'] = session_id
+        os.environ['AGENT_WORKSPACE_PATH'] = str(workspace_path)
+        os.environ['HUMAN_IN_LOOP'] = 'true'
+        os.environ['HUMAN_IN_LOOP_PHASE2'] = 'true'  # 标记为阶段2，跳过搜索直接写作
+        
+        # 设置搜索源偏好
+        if search_sources_dict:
+            os.environ['SEARCH_SOURCE_WEBSEARCH'] = str(search_sources_dict.get('websearch', False))
+            os.environ['SEARCH_SOURCE_PUBMED'] = str(search_sources_dict.get('pubmed', False))
+            os.environ['SEARCH_SOURCE_ARXIV'] = str(search_sources_dict.get('arxiv', False))
+            os.environ['SEARCH_SOURCE_GOOGLE_SCHOLAR'] = str(search_sources_dict.get('google_scholar', False))
+            os.environ['SEARCH_SOURCE_SPRINGER'] = str(search_sources_dict.get('springer', False))
+        
+        # 确保 .human_in_loop 标记文件存在（供 MCP 工具读取）
+        human_in_loop_file = workspace_path / '.human_in_loop'
+        with open(human_in_loop_file, 'w', encoding='utf-8') as f:
+            f.write('true')
+        
+        # 写入用户确认的大纲
+        outline_file = workspace_path / '.user_outline'
+        with open(outline_file, 'w', encoding='utf-8') as f:
+            f.write(user_outline)
+        os.environ['USER_OUTLINE_PATH'] = str(outline_file)
+        logger.info(f"Human in the loop Phase 2: 用户大纲已写入 {outline_file}")
+        
+        # 删除 .outline_pending 文件，表示大纲已确认
+        outline_pending_path = workspace_path / ".outline_pending"
+        if outline_pending_path.exists():
+            outline_pending_path.unlink()
+        
+        agent = create_planner_agent(
+            agent_name=f"PlannerAgent",
+            model=app_config.model_name,
+            max_iterations=app_config.planner_max_iterations or 40,
+            sub_agent_configs=sub_agent_configs,
+            task_id=task_id
+        )
+        # 直接注入确认后的大纲，避免在并发场景下依赖全局环境变量读取错误工作区文件
+        try:
+            setattr(agent, "_hitl_user_outline", user_outline or "")
+        except Exception:
+            pass
+        
+        # 设置取消令牌
+        cancellation_token = task_manager.get_cancellation_token(task_id)
+        if cancellation_token:
+            agent.set_cancellation_token(cancellation_token)
+        
+        if hasattr(agent, 'set_progress_callback'):
+            agent.set_progress_callback(send_progress_update)
+        
+        # 构建增强的查询文本
+        enhanced_query = _build_enhanced_query(query_text, user_files_data)
+        
+        start_time = time.time()
+        response = agent.execute_task(enhanced_query + " /no_think")
+        execution_time = time.time() - start_time
+        phase2_execution_time = execution_time
+        total_generation_time = max(0.0, phase1_execution_time) + phase2_execution_time
+        
+        # 检查是否被取消
+        if (task_manager.is_task_cancelled(task_id) or
+            (hasattr(response, 'error') and response.error and "cancelled" in str(response.error).lower())):
+            task_manager.update_task_status(task_id, TaskStatus.CANCELLED, error=getattr(response, 'error', 'Task cancelled'))
+            send_progress_update(task_id, {
+                'type': 'cancelled',
+                'message': '任务已取消'
+            })
+            return
+        
+        # 读取最终报告内容
+        final_report_content = None
+        report_relative_path = None
+        try:
+            final_report_path = workspace_path / "report" / "final_report.md"
+            if final_report_path.exists():
+                with open(final_report_path, 'r', encoding='utf-8') as f:
+                    final_report_content = f.read()
+                report_relative_path = "report/final_report.md"
+                logger.info(f"[HITL Phase2] 成功读取最终报告: {final_report_path} (大小: {len(final_report_content)} 字符)")
+                
+                # 计算报告字数
+                word_count = 0
+                try:
+                    import re
+                    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', final_report_content))
+                    english_words = len(re.findall(r'\b[a-zA-Z]+\b', final_report_content))
+                    word_count = chinese_chars + english_words
+                except Exception:
+                    pass
+                
+                # 统计检索次数
+                total_search_count = 0
+                try:
+                    tool_call_logs_dir = workspace_path / "tool_call_logs"
+                    if tool_call_logs_dir.is_dir():
+                        for log_file in tool_call_logs_dir.glob("tool_calls_*.jsonl"):
+                            try:
+                                with open(log_file, 'r', encoding='utf-8') as lf:
+                                    for line in lf:
+                                        line = line.strip()
+                                        if not line:
+                                            continue
+                                        try:
+                                            rec = json.loads(line)
+                                        except Exception:
+                                            continue
+                                        tool_name = rec.get('tool_name')
+                                        if tool_name == 'batch_web_search':
+                                            input_args = rec.get('input_args') or {}
+                                            queries = input_args.get('queries') or []
+                                            if isinstance(queries, list):
+                                                total_search_count += len(queries)
+                                        elif tool_name == 'url_crawler':
+                                            input_args = rec.get('input_args') or {}
+                                            documents = input_args.get('documents') or []
+                                            if isinstance(documents, list):
+                                                total_search_count += len(documents)
+                                        elif tool_name in ['arxiv_search', 'search_pubmed_key_words', 'search_pubmed_advanced',
+                                                          'medrxiv_search', 'springer_search', 'get_pubmed_article',
+                                                          'arxiv_read_paper', 'medrxiv_read_paper', 'springer_get_article']:
+                                            total_search_count += 1
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                
+                # 添加统计信息
+                try:
+                    import re
+                    query_zh_count = len(re.findall(r'[\u4e00-\u9fff]', query_text))
+                    query_total_chars = len(query_text.strip())
+                    is_chinese_query = (query_zh_count / max(query_total_chars, 1)) > 0.3
+                    
+                    if is_chinese_query:
+                        stats_section = f"\n\n<div style=\"page-break-before: always;\"></div>\n\n## 报告统计信息\n\n"
+                        stats_section += f"- 报告字数: {word_count:,} 字\n"
+                        stats_section += f"- 生成耗时(总计): {total_generation_time:.2f} 秒 ({total_generation_time/60:.1f} 分钟)\n"
+                        stats_section += f"- 生成耗时(Phase1-大纲): {phase1_execution_time:.2f} 秒 ({phase1_execution_time/60:.1f} 分钟)\n"
+                        stats_section += f"- 生成耗时(Phase2-写作): {phase2_execution_time:.2f} 秒 ({phase2_execution_time/60:.1f} 分钟)\n"
+                        if outline_confirm_wait_time > 0:
+                            stats_section += f"- 用户确认等待: {outline_confirm_wait_time:.2f} 秒 ({outline_confirm_wait_time/60:.1f} 分钟)\n"
+                        stats_section += f"- 网站检索: {total_search_count:,} 次\n"
+                    else:
+                        stats_section = f"\n\n<div style=\"page-break-before: always;\"></div>\n\n## Report Statistics\n\n"
+                        stats_section += f"- Word Count: {word_count:,} words\n"
+                        stats_section += f"- Generation Time (Total): {total_generation_time:.2f} seconds ({total_generation_time/60:.1f} minutes)\n"
+                        stats_section += f"- Generation Time (Phase 1 - Outline): {phase1_execution_time:.2f} seconds ({phase1_execution_time/60:.1f} minutes)\n"
+                        stats_section += f"- Generation Time (Phase 2 - Writing): {phase2_execution_time:.2f} seconds ({phase2_execution_time/60:.1f} minutes)\n"
+                        if outline_confirm_wait_time > 0:
+                            stats_section += f"- User Confirmation Wait: {outline_confirm_wait_time:.2f} seconds ({outline_confirm_wait_time/60:.1f} minutes)\n"
+                        stats_section += f"- Web Searches: {total_search_count:,} times\n"
+                    
+                    final_report_content_with_stats = final_report_content + stats_section
+                    
+                    with open(final_report_path, 'w', encoding='utf-8') as f:
+                        f.write(final_report_content_with_stats)
+                    
+                    final_report_content = final_report_content_with_stats
+                    logger.info(f"[HITL Phase2] 已在报告末尾添加统计信息")
+                    
+                    # 异步生成PDF
+                    def generate_pdf_async():
+                        try:
+                            from src.tools.mcp_tools import generate_pdf_with_reportlab
+                            pdf_path = Path(final_report_path).parent.parent / "final_report.pdf"
+                            success = generate_pdf_with_reportlab(final_report_content_with_stats, pdf_path)
+                            if success:
+                                logger.info(f"[HITL Phase2][异步] 成功生成PDF文件: {pdf_path}")
+                        except Exception as pdf_error:
+                            logger.warning(f"[HITL Phase2][异步] 生成PDF失败: {pdf_error}")
+                    
+                    import threading
+                    pdf_thread = threading.Thread(target=generate_pdf_async, daemon=True)
+                    pdf_thread.start()
+                except Exception:
+                    pass
+                
+                # 存储报告到数据库
+                try:
+                    if frontend_session_id:
+                        import re
+                        report_title = "研究报告"
+                        title_match = re.search(r'^#\s+(.+?)$', final_report_content, re.MULTILINE)
+                        if title_match:
+                            report_title = title_match.group(1).strip()
+                        if len(report_title) > 50:
+                            report_title = report_title[:50] + '...'
+                        
+                        store_url = "http://localhost:5000/api/chat/messages"
+                        store_data = {
+                            "session_id": frontend_session_id,
+                            "from_who": "ai",
+                            "content": final_report_content,
+                            "round": 1,
+                            "uuid": session_id,
+                            "has_report": 1,
+                            "report_title": report_title
+                        }
+                        http_response = requests.post(store_url, json=store_data, timeout=30)
+                        if http_response.status_code == 201:
+                            logger.info(f"[HITL Phase2] 成功存储报告到数据库")
+                        else:
+                            logger.error(f"[HITL Phase2] 存储报告失败: {http_response.status_code}")
+                except Exception as store_error:
+                    logger.error(f"[HITL Phase2] 自动存储报告到数据库失败: {store_error}")
+            else:
+                logger.warning(f"[HITL Phase2] 最终报告文件不存在: {final_report_path}")
+        except Exception as e:
+            logger.error(f"[HITL Phase2] 读取最终报告失败: {e}")
+        
+        planner_success = bool(getattr(response, 'success', False))
+        planner_error = (getattr(response, 'error', None) or '').strip()
+        has_final_report = bool(final_report_content and str(final_report_content).strip())
+
+        def _phase2_store_error_message_to_db(content: str) -> None:
+            if not frontend_session_id:
+                return
+            try:
+                store_url = "http://localhost:5000/api/chat/messages"
+                store_data = {
+                    "session_id": frontend_session_id,
+                    "from_who": "ai",
+                    "content": content,
+                    "round": 1,
+                    "uuid": session_id,
+                    "has_report": 0,
+                    "report_title": ""
+                }
+                http_response = requests.post(store_url, json=store_data, timeout=30)
+                if http_response.status_code != 201:
+                    logger.error(f"[HITL Phase2] 存储错误提示到数据库失败: {http_response.status_code}")
+                else:
+                    logger.info("[HITL Phase2] 已存储错误提示到数据库")
+            except Exception as db_err:
+                logger.error(f"[HITL Phase2] 存储错误提示异常: {db_err}")
+
+        if not has_final_report:
+            detail = planner_error if not planner_success else '工作区未生成可读最终报告（report/final_report.md）'
+            user_msg = (
+                "⚠️ HITL 阶段2 未能生成最终报告。\n\n"
+                + (f"原因：{detail}\n\n" if detail else "")
+                + "请稍后重试，或适当缩短/简化大纲与要点后再次提交。"
+            )
+            fail_result = {
+                'session_id': session_id,
+                'final_report': None,
+                'report_path': None,
+                'execution_time': execution_time,
+                'phase1_execution_time': phase1_execution_time,
+                'phase2_execution_time': phase2_execution_time,
+                'total_generation_time': total_generation_time,
+                'outline_confirm_wait_time': outline_confirm_wait_time,
+                'planner_success': planner_success,
+                'planner_error': planner_error or None,
+            }
+            task_manager.update_task_status(
+                task_id, TaskStatus.FAILED,
+                result=fail_result,
+                error=(user_msg[:4000] if user_msg else 'Phase2: no final report'),
+            )
+            send_progress_update(task_id, {
+                'type': 'error',
+                'message': user_msg,
+                'session_id': session_id,
+            })
+            _phase2_store_error_message_to_db(user_msg)
+            logger.warning(
+                f"[HITL Phase2] 无有效最终报告，已标记 FAILED: task_id={task_id}, "
+                f"planner_success={planner_success}, planner_error={planner_error!r}"
+            )
+            return
+
+        if not planner_success:
+            logger.warning(
+                f"[HITL Phase2] Planner 标记失败但已存在 final_report（可能为兜底合并），仍按完成交付: {planner_error!r}"
+            )
+
+        # 更新任务状态为完成
+        task_manager.update_task_status(task_id, TaskStatus.COMPLETED, result={
+            'session_id': session_id,
+            'final_report': final_report_content,
+            'report_path': report_relative_path,
+            'execution_time': execution_time,
+            'phase1_execution_time': phase1_execution_time,
+            'phase2_execution_time': phase2_execution_time,
+            'total_generation_time': total_generation_time,
+            'outline_confirm_wait_time': outline_confirm_wait_time,
+            'planner_success': planner_success,
+            'planner_error': planner_error or None,
+        })
+        
+        # 发送完成 SSE 通知
+        send_progress_update(task_id, {
+            'type': 'completed',
+            'message': '报告生成完成',
+            'session_id': session_id,
+            'report_path': report_relative_path,
+            'final_report': final_report_content
+        })
+        
+        logger.info(
+            f"[HITL Phase2] 任务 {task_id} 完成, "
+            f"phase1={phase1_execution_time:.2f}s, phase2={phase2_execution_time:.2f}s, "
+            f"总计={total_generation_time:.2f}s, 用户确认等待={outline_confirm_wait_time:.2f}s"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[HITL Phase2] 任务 {task_id} 执行失败: {e}", exc_info=True)
+        task_manager.update_task_status(task_id, TaskStatus.FAILED, error=str(e))
+        
+        # 发送失败 SSE 通知
+        send_progress_update(task_id, {
+            'type': 'error',
+            'message': f'报告生成失败: {str(e)}'
+        })
+        
+        # 存储错误信息到数据库
+        if frontend_session_id:
+            try:
+                store_url = "http://localhost:5000/api/chat/messages"
+                store_data = {
+                    "session_id": frontend_session_id,
+                    "from_who": "ai",
+                    "content": f"⚠️ 报告生成失败：{str(e)}\n\n请尝试重新提问。",
+                    "round": 1,
+                    "uuid": session_id,
+                    "has_report": 0,
+                    "report_title": ""
+                }
+                requests.post(store_url, json=store_data, timeout=30)
+            except Exception:
+                pass
+    finally:
+        # 清理阶段2 环境变量
+        os.environ.pop('HUMAN_IN_LOOP_PHASE2', None)
 
 
 if __name__ == "__main__":

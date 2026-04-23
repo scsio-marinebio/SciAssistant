@@ -1192,6 +1192,11 @@ async def _call_session_tool_async(session: Session, tool_name: str, tool_args: 
             # Define the synchronous tool execution function
             def execute_tool_sync():
                 """Synchronous tool execution to be run in thread pool"""
+                # CRITICAL FIX: For sync tools, set session context inside the thread
+                # to ensure workspace_path is correctly updated before tool execution
+                if hasattr(mcp_tools, 'set_session_context'):
+                    mcp_tools.set_session_context(session.id, str(session.workspace_path))
+                    logger.debug(f"[HITL DEBUG] Sync tool {tool_name}: set session context, workspace={session.workspace_path}")
                 return tool_method(**tool_args)
             
             # Execute tool asynchronously in thread pool for true non-blocking execution

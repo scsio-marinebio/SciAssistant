@@ -834,6 +834,186 @@
             font-family: 'Arial Black', 'Arial Bold', sans-serif !important;
             text-shadow: 0.5px 0.5px 0px rgba(0,0,0,0.3) !important;
         }
+
+        /* 右侧大纲视窗样式 */
+        #outline-sidebar {
+            position: fixed;
+            top: 0;
+            right: -400px;
+            width: 400px;
+            min-width: 280px;
+            max-width: 50vw;
+            height: 100vh;
+            background: white;
+            box-shadow: -2px 0 10px rgba(0, 0, 0, 0.1);
+            transition: right 0.3s ease-in-out;
+            z-index: 40;
+            display: flex;
+            flex-direction: column;
+        }
+        #outline-sidebar.open {
+            right: 0;
+        }
+        #outline-sidebar.dragging {
+            transition: none;
+        }
+        /* 主体内容区域随视窗收缩 */
+        #main-content.sidebar-open {
+            margin-right: 400px;
+            transition: margin-right 0.3s ease-in-out;
+        }
+        #main-content.sidebar-dragging {
+            transition: none;
+        }
+        /* 拖拽手柄样式 */
+        #outline-sidebar-resizer {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 6px;
+            height: 100%;
+            cursor: ew-resize;
+            background: transparent;
+            z-index: 41;
+        }
+        #outline-sidebar-resizer:hover,
+        #outline-sidebar-resizer.active {
+            background: linear-gradient(90deg, #3B82F6 0%, transparent 100%);
+        }
+        /* 遮罩层已禁用，主内容区和右侧视窗在同一层面 */
+        #outline-sidebar-overlay {
+            display: none;
+        }
+        /* 查看大纲按钮样式 */
+        .view-outline-btn {
+            display: inline-flex;
+            align-items: center;
+            padding: 8px 16px;
+            background: linear-gradient(135deg, #3B82F6 0%, #2563EB 100%);
+            color: white;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            border: none;
+            box-shadow: 0 2px 4px rgba(59, 130, 246, 0.3);
+        }
+        .view-outline-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 8px rgba(59, 130, 246, 0.4);
+        }
+        .view-outline-btn i {
+            margin-right: 6px;
+        }
+        /* 大纲视窗内容样式 */
+        .outline-sidebar-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid #E5E7EB;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: linear-gradient(135deg, #F8FAFC 0%, #F1F5F9 100%);
+            position: relative;
+            z-index: 42;
+        }
+        .outline-sidebar-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: #1F2937;
+            display: flex;
+            align-items: center;
+        }
+        .outline-sidebar-title i {
+            margin-right: 8px;
+            color: #3B82F6;
+        }
+        .outline-sidebar-close {
+            width: 32px;
+            height: 32px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: background 0.2s;
+            color: #6B7280;
+            position: relative;
+            z-index: 43;
+            pointer-events: auto;
+        }
+        .outline-sidebar-close:hover {
+            background: #E5E7EB;
+            color: #1F2937;
+        }
+        .outline-sidebar-close:active {
+            background: #D1D5DB;
+        }
+        .outline-sidebar-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+        }
+        /* 大纲章节项样式 */
+        .outline-chapter-item {
+            display: flex;
+            align-items: flex-start;
+            padding: 12px 16px;
+            margin-bottom: 8px;
+            background: #F9FAFB;
+            border-radius: 8px;
+            border-left: 3px solid #3B82F6;
+            transition: all 0.2s;
+        }
+        .outline-chapter-item:hover {
+            background: #F3F4F6;
+        }
+        .outline-chapter-checkbox {
+            width: 18px;
+            height: 18px;
+            margin-right: 12px;
+            margin-top: 2px;
+            accent-color: #3B82F6;
+        }
+        .outline-chapter-content {
+            flex: 1;
+        }
+        .outline-chapter-title {
+            font-weight: 500;
+            color: #1F2937;
+            margin-bottom: 4px;
+        }
+        .outline-chapter-desc {
+            font-size: 13px;
+            color: #6B7280;
+            line-height: 1.5;
+        }
+        /* 进度流中“正在撰写章节”特殊标识样式 */
+        .progress-writing-chapter {
+            color: #2563EB;
+            font-weight: 500;
+        }
+        .progress-writing-chapter-marker {
+            margin-right: 6px;
+            color: #2563EB;
+            animation: progressBreathing 1.3s ease-in-out infinite;
+            transform-origin: center;
+            display: inline-block;
+        }
+        @keyframes progressBreathing {
+            0% {
+                opacity: 0.35;
+                transform: scale(0.96);
+            }
+            50% {
+                opacity: 1;
+                transform: scale(1.08);
+            }
+            100% {
+                opacity: 0.35;
+                transform: scale(0.96);
+            }
+        }
     </style>
 </head>
 <!-- font-sans：使用配置的 sans-serif 字体栈，text-gray-800：主要文字颜色 (#1F2937)-->
@@ -994,18 +1174,6 @@
         </div>
         
         <div class="w-full max-w-3xl bg-white rounded-xl shadow-md p-4 flex flex-col">
-            <!-- 功能标签按钮区域 -->
-            <div class="flex space-x-2 mb-3">
-                <button id="deepdiver-btn" type="button" class="px-3 py-1.5 rounded-lg text-sm bg-primary text-white transition-colors duration-200">
-                    DeepDiver
-                </button>
-                <button id="chat-btn" type="button" class="px-3 py-1.5 rounded-lg text-sm text-gray-600 hover:bg-gray-100 transition-colors duration-200">
-                    Chat
-                </button>
-                <button id="reasoner-btn" type="button" class="px-3 py-1.5 rounded-lg text-sm text-gray-600 hover:bg-gray-100 transition-colors duration-200">
-                    Reasoner
-                </button>
-            </div>
             <!-- 附件展示区（显示已上传的文件预览卡片） -->
              <div id="attachments-bar" class="mb-3 flex flex-wrap gap-2 max-h-32 overflow-y-auto scrollbar-thumb-rounded hidden"></div>
              
@@ -1089,6 +1257,49 @@
                     <i class="fa fa-times"></i>
                 </button>
             </form>
+
+            <!-- 功能标签按钮区域（放在输入框下方） -->
+            <div class="flex items-center space-x-2 mt-3">
+                <button id="deepdiver-btn" type="button" class="px-3 py-1.5 rounded-lg text-sm bg-primary text-white transition-colors duration-200">
+                    DeepDiver
+                </button>
+                <button id="chat-btn" type="button" class="px-3 py-1.5 rounded-lg text-sm text-gray-600 hover:bg-gray-100 transition-colors duration-200">
+                    Chat
+                </button>
+                <button id="reasoner-btn" type="button" class="px-3 py-1.5 rounded-lg text-sm text-gray-600 hover:bg-gray-100 transition-colors duration-200">
+                    Reasoner
+                </button>
+                <!-- DeepDiver 工具箱：Human in the loop / Auto 模式选择 -->
+                <div id="deepdiver-toolbox" class="relative ml-auto hidden">
+                    <button id="toolbox-btn" type="button" class="px-3 py-1.5 rounded-lg text-sm text-gray-600 hover:bg-gray-100 transition-colors duration-200 flex items-center" title="工具箱设置">
+                        <i class="fa fa-cog mr-1"></i>
+                        <span id="toolbox-mode-label">Auto</span>
+                        <i class="fa fa-caret-down ml-1"></i>
+                    </button>
+                    <div id="toolbox-dropdown" class="absolute right-0 bottom-full mb-1 bg-white border border-gray-200 rounded-lg shadow-lg z-50 hidden min-w-[180px]">
+                        <div class="p-2">
+                            <div class="text-xs text-gray-500 px-2 py-1 font-medium">执行模式</div>
+                            <button type="button" class="toolbox-option w-full text-left px-3 py-2 rounded hover:bg-gray-100 flex items-center" data-mode="auto">
+                                <i class="fa fa-bolt mr-2 text-primary"></i>
+                                <div>
+                                    <div class="text-sm font-medium">Auto</div>
+                                    <div class="text-xs text-gray-500">自动执行完整流程</div>
+                                </div>
+                                <i class="fa fa-check ml-auto text-primary toolbox-check"></i>
+                            </button>
+                            <button type="button" class="toolbox-option w-full text-left px-3 py-2 rounded hover:bg-gray-100 flex items-center" data-mode="human_in_loop">
+                                <i class="fa fa-hand-paper-o mr-2 text-orange-500"></i>
+                                <div>
+                                    <div class="text-sm font-medium">Human in the loop</div>
+                                    <div class="text-xs text-gray-500">大纲生成后等待确认</div>
+                                </div>
+                                <i class="fa fa-check ml-auto text-primary toolbox-check hidden"></i>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
         </div>
     </div>
 </div>
@@ -1151,6 +1362,78 @@
                 <button id="session-delete-confirm-btn" class="px-6 py-2 bg-red-500 hover:bg-red-600 text-white rounded-lg transition-colors font-medium">
                     确认删除
                 </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Human in the loop 大纲确认模态框 -->
+    <div id="outline-confirm-modal" class="fixed inset-0 bg-black bg-opacity-60 z-50 hidden flex items-center justify-center backdrop-blur-sm">
+        <div class="bg-white rounded-2xl shadow-2xl w-11/12 max-w-3xl flex flex-col max-h-[90vh] border border-orange-200">
+            <!-- 模态窗口标题 -->
+            <div class="flex items-center justify-between p-4 border-b">
+                <h2 class="text-xl font-bold text-gray-800 flex items-center">
+                    <i class="fa fa-list-alt mr-3 text-orange-500"></i>
+                    大纲确认
+                </h2>
+                <div class="flex items-center text-sm text-gray-500">
+                    <i class="fa fa-hand-paper-o mr-1 text-orange-500"></i>
+                    Human in the loop 模式
+                </div>
+            </div>
+            
+            <!-- 提示信息 -->
+            <div class="px-4 py-3 bg-gradient-to-r from-orange-50 to-amber-50 border-b border-orange-200">
+                <p class="text-sm text-orange-800 font-medium">
+                    <i class="fa fa-info-circle mr-2 text-orange-600"></i>
+                    系统已生成以下大纲，请确认是否使用此大纲生成报告，或修改后提交。
+                </p>
+            </div>
+            
+            <!-- 大纲内容区域 -->
+            <div class="flex-1 overflow-y-auto p-4">
+                <div id="outline-display" class="bg-gradient-to-br from-slate-50 to-gray-100 rounded-xl p-5 mb-4 prose prose-sm max-w-none border border-gray-200 shadow-inner">
+                    <!-- 大纲内容将动态填充 -->
+                    <p class="text-gray-500 text-center py-8">
+                        <i class="fa fa-spinner fa-spin mr-2"></i>正在生成大纲...
+                    </p>
+                </div>
+                
+                <!-- 大纲编辑区域（默认隐藏） -->
+                <div id="outline-edit-area" class="hidden">
+                    <div class="flex items-center justify-between mb-2">
+                        <label class="text-sm font-semibold text-gray-800">编辑大纲内容：</label>
+                        <button id="outline-reset-btn" type="button" class="text-sm text-orange-600 hover:text-orange-800 font-medium transition-colors">
+                            <i class="fa fa-undo mr-1"></i>恢复原始大纲
+                        </button>
+                    </div>
+                    <textarea 
+                        id="outline-edit-input" 
+                        class="w-full h-64 p-4 border-2 border-gray-200 rounded-xl focus:outline-none focus:border-orange-400 focus:ring-2 focus:ring-orange-100 resize-none font-mono text-sm bg-white shadow-inner transition-all"
+                        placeholder="在此编辑大纲内容..."
+                    ></textarea>
+                    <p class="text-xs text-gray-500 mt-2 flex items-center">
+                        <i class="fa fa-lightbulb-o mr-1 text-yellow-500"></i>
+                        提示：请保持大纲格式（使用 # 表示章节标题），系统将按照您修改后的大纲生成报告。
+                    </p>
+                </div>
+            </div>
+            
+            <!-- 底部操作按钮 -->
+            <div class="p-5 border-t bg-gradient-to-r from-gray-50 to-slate-50">
+                <div class="flex space-x-3">
+                    <button id="outline-confirm-btn" class="flex-1 bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700 text-white px-6 py-3 rounded-xl transition-all font-semibold shadow-md hover:shadow-lg transform hover:-translate-y-0.5">
+                        <i class="fa fa-check mr-2"></i>确认使用当前大纲
+                    </button>
+                    <button id="outline-edit-btn" class="flex-1 bg-gradient-to-r from-orange-500 to-amber-600 hover:from-orange-600 hover:to-amber-700 text-white px-6 py-3 rounded-xl transition-all font-semibold shadow-md hover:shadow-lg transform hover:-translate-y-0.5">
+                        <i class="fa fa-edit mr-2"></i>我要修改大纲
+                    </button>
+                </div>
+                <!-- 提交修改后的大纲按钮（编辑模式下显示） -->
+                <div id="outline-submit-area" class="hidden mt-3">
+                    <button id="outline-submit-btn" class="w-full bg-primary hover:bg-primary/90 text-white px-6 py-3 rounded-lg transition-colors font-medium">
+                        <i class="fa fa-paper-plane mr-2"></i>提交修改后的大纲
+                    </button>
+                </div>
             </div>
         </div>
     </div>
@@ -1625,6 +1908,13 @@ function copyToClipboard(text, button) {
                 })
                 .then(data => {
                     console.log('获取数据：', data);
+                    // 防止后端偶发重复返回相同 session_id，前端渲染前先去重
+                    const uniqueData = Array.isArray(data)
+                        ? data.filter((item, index, arr) =>
+                            item && item.session_id &&
+                            arr.findIndex(s => s && s.session_id === item.session_id) === index
+                        )
+                        : [];
                      // 更新会话列表
                     const sessions = document.querySelectorAll('.chat-session');
                     sessions.forEach(session => {
@@ -1638,10 +1928,10 @@ function copyToClipboard(text, button) {
                     
                     let pendingSessionElement = null; // 用于存储有 pending 任务的会话元素
                     
-                    if(data && data.length>0){
+                    if(uniqueData && uniqueData.length>0){
                         
                         // 添加新会话到列表顶部
-                        data.forEach(item=>{
+                        uniqueData.forEach(item=>{
                             const newSession = document.createElement('div');
                             // 默认状态不选中：移除选中样式，保留悬浮高亮
                             newSession.className = 'chat-session p-1 rounded-lg cursor-pointer mb-px flex items-center transition-all duration-200 hover:bg-gray-100';
@@ -1852,8 +2142,8 @@ function copyToClipboard(text, button) {
                              }
                              
                              // 只检查最新的1个会话（默认按 update_time 排序）
-                             if (data.length > 0) {
-                                 const latestSession = data[0];
+                            if (uniqueData.length > 0) {
+                                const latestSession = uniqueData[0];
                                  console.log(`[页面加载] 检查最新会话: ${latestSession.session_id}`);
                                  
                                  try {
@@ -2082,11 +2372,238 @@ function copyToClipboard(text, button) {
         // 侧边栏收起/展开状态
         let sidebarCollapsed = false;
         
+        // ========== Human in the loop 大纲确认模态框逻辑 ==========
+        window.outlineConfirmState = {
+            taskId: null,
+            sessionId: null,
+            originalOutline: '',
+            isEditing: false,
+            resolveCallback: null
+        };
+        
+        function initOutlineConfirmModal() {
+            const outlineDisplay = document.getElementById('outline-display');
+            const outlineEditArea = document.getElementById('outline-edit-area');
+            const outlineEditInput = document.getElementById('outline-edit-input');
+            const outlineConfirmBtn = document.getElementById('outline-confirm-btn');
+            const outlineEditBtn = document.getElementById('outline-edit-btn');
+            const outlineResetBtn = document.getElementById('outline-reset-btn');
+            const outlineSubmitArea = document.getElementById('outline-submit-area');
+            const outlineSubmitBtn = document.getElementById('outline-submit-btn');
+            
+            outlineConfirmBtn.addEventListener('click', function() {
+                const state = window.outlineConfirmState;
+                const resolveCallback = state.resolveCallback;
+                const originalOutline = state.originalOutline;
+                closeOutlineModal();
+                if (resolveCallback) {
+                    resolveCallback({ action: 'confirm', outline: originalOutline, modified: false });
+                }
+            });
+            
+            outlineEditBtn.addEventListener('click', function() {
+                window.outlineConfirmState.isEditing = true;
+                outlineDisplay.classList.add('hidden');
+                outlineEditArea.classList.remove('hidden');
+                outlineEditInput.value = window.outlineConfirmState.originalOutline;
+                outlineConfirmBtn.classList.add('hidden');
+                outlineEditBtn.classList.add('hidden');
+                outlineSubmitArea.classList.remove('hidden');
+            });
+            
+            outlineResetBtn.addEventListener('click', function() {
+                outlineEditInput.value = window.outlineConfirmState.originalOutline;
+            });
+            
+            outlineSubmitBtn.addEventListener('click', function() {
+                const modifiedOutline = outlineEditInput.value.trim();
+                if (!modifiedOutline) {
+                    showToast('大纲内容不能为空', 'warning');
+                    return;
+                }
+                const resolveCallback = window.outlineConfirmState.resolveCallback;
+                closeOutlineModal();
+                if (resolveCallback) {
+                    resolveCallback({ action: 'confirm', outline: modifiedOutline, modified: true });
+                }
+            });
+        }
+        
+        function showOutlineConfirmModal(outline, taskId, sessionId) {
+            return new Promise((resolve) => {
+                const modal = document.getElementById('outline-confirm-modal');
+                const outlineDisplay = document.getElementById('outline-display');
+                const outlineEditArea = document.getElementById('outline-edit-area');
+                const outlineConfirmBtn = document.getElementById('outline-confirm-btn');
+                const outlineEditBtn = document.getElementById('outline-edit-btn');
+                const outlineSubmitArea = document.getElementById('outline-submit-area');
+                
+                window.outlineConfirmState = {
+                    taskId: taskId,
+                    sessionId: sessionId,
+                    originalOutline: outline,
+                    isEditing: false,
+                    resolveCallback: resolve
+                };
+                
+                outlineDisplay.classList.remove('hidden');
+                outlineEditArea.classList.add('hidden');
+                outlineConfirmBtn.classList.remove('hidden');
+                outlineEditBtn.classList.remove('hidden');
+                outlineSubmitArea.classList.add('hidden');
+                outlineDisplay.innerHTML = markdownToHtml(outline);
+                modal.classList.remove('hidden');
+            });
+        }
+        
+        function closeOutlineModal() {
+            document.getElementById('outline-confirm-modal').classList.add('hidden');
+            window.outlineConfirmState = { taskId: null, sessionId: null, originalOutline: '', isEditing: false, resolveCallback: null };
+        }
+
+        // 兼容新旧格式，提取纯大纲内容（去掉前置reasoning）
+        function extractPureOutline(fullContent) {
+            if (!fullContent || typeof fullContent !== 'string') return '';
+            let pureOutline = fullContent;
+            const OUTLINE_SEPARATOR = '---OUTLINE_START---';
+            if (fullContent.includes(OUTLINE_SEPARATOR)) {
+                const separatorIndex = fullContent.indexOf(OUTLINE_SEPARATOR);
+                pureOutline = fullContent.substring(separatorIndex + OUTLINE_SEPARATOR.length).trim();
+            } else {
+                const outlineStartMatch = fullContent.match(/(^|\n)(#{1,2}\s)/);
+                if (outlineStartMatch) {
+                    const rawIndex = outlineStartMatch.index || 0;
+                    const startsWithNewline = outlineStartMatch[0].startsWith('\n');
+                    const outlineStartIndex = startsWithNewline ? rawIndex + 1 : rawIndex;
+                    pureOutline = fullContent.substring(outlineStartIndex).trim();
+                }
+            }
+            return pureOutline || fullContent.trim();
+        }
+
+        // 将“正在撰写: 章节名”转换为“章节名”，用于已完成章节展示
+        function extractChapterTitleFromWritingMessage(message) {
+            if (!message || typeof message !== 'string') return '';
+            return message
+                .replace(/^正在撰写\s*[:：]\s*/i, '')
+                .replace(/^writing\s+chapter\s*[:：]\s*/i, '')
+                .replace(/^writing\s*[:：]\s*/i, '')
+                .trim();
+        }
+
+        // 当新章节开始撰写时，将之前“正在撰写”条目降级为普通章节标题显示
+        function finalizePreviousWritingChapterItems(timeline) {
+            if (!timeline) return;
+            const previousWritingItems = timeline.querySelectorAll('.progress-chapter-writing-item');
+            previousWritingItems.forEach(item => {
+                const row = item.querySelector('.progress-chapter-writing-row');
+                const marker = item.querySelector('.progress-chapter-writing-marker');
+                const text = item.querySelector('.progress-chapter-writing-text');
+                if (text) {
+                    text.textContent = extractChapterTitleFromWritingMessage(text.textContent);
+                    text.classList.remove('progress-chapter-writing-text');
+                }
+                if (row) {
+                    row.classList.remove('progress-writing-chapter', 'progress-chapter-writing-row');
+                    row.classList.add('text-gray-600');
+                }
+                if (marker) {
+                    marker.textContent = '•';
+                    marker.classList.remove('progress-writing-chapter-marker', 'progress-chapter-writing-marker');
+                    marker.classList.add('mr-2', 'text-gray-400');
+                }
+                item.classList.remove('progress-chapter-writing-item');
+            });
+        }
+        
+        initOutlineConfirmModal();
+        
+        // 初始化工具箱
+        function initToolbox() {
+            // 默认执行模式：页面刷新后始终重置为 Auto
+            // 需求：刷新页面时不保留 Human in the loop 选择
+            window.deepdiverExecutionMode = 'auto';
+            localStorage.setItem('deepdiverExecutionMode', 'auto');
+            
+            const toolboxBtn = document.getElementById('toolbox-btn');
+            const toolboxDropdown = document.getElementById('toolbox-dropdown');
+            const toolboxModeLabel = document.getElementById('toolbox-mode-label');
+            const toolboxOptions = document.querySelectorAll('.toolbox-option');
+            const deepdiverToolbox = document.getElementById('deepdiver-toolbox');
+
+            function syncToolboxModeUI(mode) {
+                toolboxModeLabel.textContent = mode === 'auto' ? 'Auto' : 'Human in the loop';
+                toolboxOptions.forEach(opt => {
+                    const check = opt.querySelector('.toolbox-check');
+                    if (opt.dataset.mode === mode) {
+                        check.classList.remove('hidden');
+                    } else {
+                        check.classList.add('hidden');
+                    }
+                });
+            }
+            
+            // 点击工具箱按钮切换下拉菜单
+            toolboxBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                toolboxDropdown.classList.toggle('hidden');
+            });
+            
+            // 点击选项切换模式
+            toolboxOptions.forEach(option => {
+                option.addEventListener('click', function(e) {
+                    e.stopPropagation();
+                    const mode = this.dataset.mode;
+                    window.deepdiverExecutionMode = mode;
+                    localStorage.setItem('deepdiverExecutionMode', mode);
+                    
+                    // 更新显示文本和选中状态
+                    syncToolboxModeUI(mode);
+                    
+                    // 关闭下拉菜单
+                    toolboxDropdown.classList.add('hidden');
+                    
+                    // 显示提示
+                    if (mode === 'human_in_loop') {
+                        showToast('已切换到 Human in the loop 模式，大纲生成后将等待您确认', 'info');
+                    } else {
+                        showToast('已切换到 Auto 模式，将自动执行完整流程', 'info');
+                    }
+                });
+            });
+            
+            // 点击页面其他地方关闭下拉菜单
+            document.addEventListener('click', function(e) {
+                if (!toolboxBtn.contains(e.target) && !toolboxDropdown.contains(e.target)) {
+                    toolboxDropdown.classList.add('hidden');
+                }
+            });
+            
+            // 根据当前模式显示/隐藏工具箱
+            function updateToolboxVisibility() {
+                if (window.selectedTab === 'deepdiver') {
+                    deepdiverToolbox.classList.remove('hidden');
+                } else {
+                    deepdiverToolbox.classList.add('hidden');
+                }
+            }
+            
+            // 初始化时更新可见性
+            updateToolboxVisibility();
+            syncToolboxModeUI(window.deepdiverExecutionMode);
+            
+            // 暴露更新函数供 switchTab 调用
+            window.updateToolboxVisibility = updateToolboxVisibility;
+        }
+        
         // 初始化功能标签
         function initFeatureTabs() {
             const deepdiverBtn = document.getElementById('deepdiver-btn');
             const chatBtn = document.getElementById('chat-btn');
             const reasonerBtn = document.getElementById('reasoner-btn');
+            
+            // 初始化工具箱
+            initToolbox();
             
             // 设置初始选中状态
             const ragFullToggleLabel = document.getElementById('rag-full-toggle-label');
@@ -2308,6 +2825,11 @@ function copyToClipboard(text, button) {
                     searchSourcesContainer.classList.add('hidden');
                 }
             }
+            
+            // 更新工具箱可见性
+            if (window.updateToolboxVisibility) {
+                window.updateToolboxVisibility();
+            }
         }
         
         // 登录按钮跳转
@@ -2500,7 +3022,7 @@ function copyToClipboard(text, button) {
             // 按下Enter键且没有按下Shift键
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault(); // 阻止默认换行行为
-                if (this.value.trim() !== '') {
+                if (!window.isCreatingSessionForFirstMessage && this.value.trim() !== '') {
                     chatForm.dispatchEvent(new Event('submit')); // 触发表单提交
                 }
             }
@@ -2526,7 +3048,12 @@ function copyToClipboard(text, button) {
 
             // 如果没有选中会话，先创建新会话
             if (!window.currentSessionId) {
+                // 防止首条消息创建会话时重复提交（如连续按 Enter）
+                if (window.isCreatingSessionForFirstMessage) {
+                    return;
+                }
                 try {
+                    window.isCreatingSessionForFirstMessage = true;
                     // 禁用发送按钮防止重复提交
                     submitButton.disabled = true;
                     submitButton.innerHTML = '<i class="fa fa-spinner fa-spin"></i>';
@@ -2547,6 +3074,8 @@ function copyToClipboard(text, button) {
                     showToast('创建会话失败，无法发送消息', 'error');
                     // 恢复按钮状态
                     submitButton.disabled = false;
+                } finally {
+                    window.isCreatingSessionForFirstMessage = false;
                 }
                 return;
             }
@@ -3170,6 +3699,8 @@ function copyToClipboard(text, button) {
                                             }
                                         }
                                     }
+                                    // 继续读取后续流式数据块，直到 done=true
+                                    processChatStream();
                                 }).catch(error => {
                                     console.error('[Chat流式] 处理错误:', error);
                                     
@@ -3850,12 +4381,110 @@ function copyToClipboard(text, button) {
                     use_web_search: true,  // 是否启用网络检索（可选）
                     prioritize_user_files: true,  // 优先使用用户文件
                     username: currentUsername,  // 添加用户名字段
-                    search_sources: selectedSources  // 添加搜索源选择
+                    search_sources: selectedSources,  // 添加搜索源选择
+                    human_in_loop: window.deepdiverExecutionMode === 'human_in_loop'  // Human in the loop 模式
                 };
+                
+                // HITL模式：启动轮询检查大纲生成状态
+                const isHITLMode = window.deepdiverExecutionMode === 'human_in_loop';
+                let outlinePollingInterval = null;
+                let outlineCheckCompleted = false;
+                
+                if (isHITLMode) {
+                    // 启动轮询（每3秒检查一次大纲状态）
+                    outlinePollingInterval = setInterval(async () => {
+                        if (outlineCheckCompleted) {
+                            clearInterval(outlinePollingInterval);
+                            return;
+                        }
+                        try {
+                            const outlineRes = await fetch(`/8000/api/outline/${taskId}`);
+                            if (outlineRes.ok) {
+                                const outlineData = await outlineRes.json();
+                                console.log('[HITL] 轮询响应:', outlineData);
+                                // 检查是否正在等待用户确认大纲
+                                if (outlineData.waiting && outlineData.outline && !outlineCheckCompleted) {
+                                    outlineCheckCompleted = true;
+                                    clearInterval(outlinePollingInterval);
+                                    
+                                    // 移除进度容器
+                                    if (progressContainer && progressContainer.parentNode) {
+                                        progressContainer.remove();
+                                    }
+                                    
+                                    const pureOutline = extractPureOutline(outlineData.outline);
+                                    
+                                    // 【关键修复】缓存大纲内容到内存，供后续右侧大纲视窗使用
+                                    window.pendingSessions = window.pendingSessions || {};
+                                    window.pendingSessions[sessionId] = window.pendingSessions[sessionId] || {};
+                                    window.pendingSessions[sessionId].outlineContent = pureOutline;
+                                    console.log('[HITL] 大纲内容已缓存到内存');
+                                    
+                                    // 显示大纲确认弹窗
+                                    const userChoice = await showOutlineConfirmModal(pureOutline, taskId, sessionId);
+                                    
+                                    if (userChoice.action === 'confirm') {
+                                        // 发送大纲确认请求到 continue 端点，真正启动 Phase 2
+                                        const confirmRes = await fetch('/8000/api/outline/continue', {
+                                            method: 'POST',
+                                            headers: { 'Content-Type': 'application/json' },
+                                            body: JSON.stringify({
+                                                task_id: taskId,
+                                                session_id: sessionId,
+                                                action: 'confirm',
+                                                outline: userChoice.outline,
+                                                modified: userChoice.modified
+                                            })
+                                        });
+                                        
+                                        if (confirmRes.ok) {
+                                            showToast(userChoice.modified ? '已提交修改后的大纲，继续生成报告...' : '已确认大纲，继续生成报告...', 'success');
+                                            console.log('[HITL] 大纲确认成功，准备重建进度容器和SSE连接');
+                                            
+                                            // 【关键修复】重建进度容器（之前在显示大纲弹窗时被移除了）
+                                            const _isCnMsg2 = /[\u4e00-\u9fff]/.test(message);
+                                            document.querySelectorAll(`[data-progress-container="${taskId}"]`).forEach(el => el.remove());
+                                            progressContainer = document.createElement('div');
+                                            progressContainer.className = 'mb-6 flex justify-start message-animation';
+                                            progressContainer.setAttribute('data-progress-container', taskId);
+                                            progressContainer.innerHTML = `
+                                                <div class="flex items-start max-w-[80%] w-full">
+                                                    <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover" onerror="this.onerror=null; this.src='./images/user.png';">
+                                                    <div class="bg-ai-message text-gray-800 p-4 rounded-lg rounded-tr-none shadow-sm flex-1">
+                                                        <div class="flex items-center mb-2 pb-2 border-b border-gray-200">
+                                                            <i class="fa fa-spinner fa-pulse mr-2 text-gray-500 text-sm"></i>
+                                                            <span class="text-sm text-gray-600">${_isCnMsg2 ? '大纲已确认，正在生成报告...' : 'Outline confirmed, generating report...'}</span>
+                                                        </div>
+                                                        <div class="progress-timeline space-y-1 text-xs" id="progress-timeline-${taskId}">
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            `;
+                                            chatMessages.appendChild(progressContainer);
+                                            chatMessages.scrollTop = chatMessages.scrollHeight;
+                                            
+                                            // 重新建立SSE连接继续接收进度
+                                            setupSSE();
+                                        } else {
+                                            const errorText = await confirmRes.text();
+                                            console.error('[HITL] 大纲确认失败:', confirmRes.status, errorText);
+                                            showToast('大纲确认失败: ' + (confirmRes.status === 404 ? '任务未找到' : '服务器错误'), 'error');
+                                            submitButton.disabled = false;
+                                            submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                                            document.getElementById('cancel-button').classList.add('hidden');
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (error) {
+                            console.error('[HITL] 轮询大纲状态失败:', error);
+                        }
+                    }, 3000);
+                }
                 
                 // 3. 创建进度展示容器
                 loadingDiv.remove();
-                const progressContainer = document.createElement('div');
+                let progressContainer = document.createElement('div');
                 progressContainer.className = 'mb-6 flex justify-start message-animation';
                 progressContainer.setAttribute('data-progress-container', taskId);
                 progressContainer.innerHTML = `
@@ -3878,17 +4507,48 @@ function copyToClipboard(text, button) {
                 // 新逻辑：先POST（短暂请求，快速释放）→ 收到TaskAccepted后建SSE
                 const sseStartTime = Date.now();
                 let eventSource = null;
+                // 确保同一会话只保留一个SSE连接，避免HITL确认后重复回调
+                const closeCurrentEventSource = () => {
+                    if (eventSource) {
+                        try {
+                            eventSource.close();
+                        } catch (e) {
+                            console.warn('[DeepDiver] 关闭旧SSE连接失败:', e);
+                        }
+                        eventSource = null;
+                    }
+                    if (window.sessionEventSources && window.sessionEventSources[sessionId]) {
+                        delete window.sessionEventSources[sessionId];
+                    }
+                };
                 // 建立SSE连接的函数（在POST成功后调用）
                 const setupSSE = () => {
+                    const prevEs = eventSource;
                     console.log('[DeepDiver] 建立SSE连接, taskId:', taskId, 'timestamp:', Date.now());
-                    eventSource = new EventSource(`/8000/api/query/stream/${taskId}`);
-                    window.sessionEventSources = window.sessionEventSources || {};
-                    window.sessionEventSources[sessionId] = eventSource;
-                    eventSource.onopen = () => {
+                    const nextEs = new EventSource(`/8000/api/query/stream/${taskId}`);
+                    nextEs.onopen = () => {
+                        if (prevEs && prevEs !== nextEs) {
+                            try {
+                                prevEs.onerror = null;
+                                prevEs.onmessage = null;
+                                prevEs.onopen = null;
+                                prevEs.close();
+                            } catch (e) {
+                                console.warn('[DeepDiver] 关闭旧SSE连接失败:', e);
+                            }
+                        }
+                        eventSource = nextEs;
+                        window.sessionEventSources = window.sessionEventSources || {};
+                        window.sessionEventSources[sessionId] = nextEs;
                         console.log('[DeepDiver] SSE连接已建立, timestamp:', Date.now());
                         // 检查任务是否已被取消，如果已取消则不显示等待消息
                         if (!window.sessionEventSources || !window.sessionEventSources[sessionId]) {
                             console.log('[DeepDiver] SSE连接已建立但任务已取消，跳过显示等待消息');
+                            return;
+                        }
+                        // 【修复】检查 progressContainer 是否还存在
+                        if (!progressContainer || !progressContainer.parentNode) {
+                            console.log('[DeepDiver] 进度容器已不存在，跳过更新状态');
                             return;
                         }
                         const statusSpan = progressContainer.querySelector('.text-sm.text-gray-600');
@@ -3901,7 +4561,7 @@ function copyToClipboard(text, button) {
                         }
                     };
                 // SSE消息处理
-                eventSource.onmessage = (event) => {
+                nextEs.onmessage = (event) => {
                     try {
                         const data = JSON.parse(event.data);
                         console.log('[SSE] 接收到进度消息:', data);
@@ -3934,13 +4594,25 @@ function copyToClipboard(text, button) {
                                     detailsHtml = '';
                                 }
                             }
-                            progressItem.innerHTML = `<div class="flex-1"><div class="flex items-center text-gray-600"><span class="mr-2 text-gray-400">•</span><span>${data.message}${detailsHtml}</span></div>${subtaskListHtml}</div>`;
+                            const isWritingChapter = data.stage === 'writing_chapter';
+                            if (isWritingChapter) {
+                                finalizePreviousWritingChapterItems(timeline);
+                            }
+                            const stageRowClass = isWritingChapter ? 'progress-writing-chapter' : 'text-gray-600';
+                            const markerClass = isWritingChapter ? 'progress-writing-chapter-marker' : 'mr-2 text-gray-400';
+                            const markerText = isWritingChapter ? '⏳' : '•';
+                            const chapterItemClass = isWritingChapter ? ' progress-chapter-writing-item' : '';
+                            const chapterRowClass = isWritingChapter ? ' progress-chapter-writing-row' : '';
+                            const chapterMarkerClass = isWritingChapter ? ' progress-chapter-writing-marker' : '';
+                            const chapterTextClass = isWritingChapter ? 'progress-chapter-writing-text' : '';
+                            progressItem.innerHTML = `<div class="flex-1${chapterItemClass}"><div class="flex items-center ${stageRowClass}${chapterRowClass}"><span class="${markerClass}${chapterMarkerClass}">${markerText}</span><span class="${chapterTextClass}">${data.message}${detailsHtml}</span></div>${subtaskListHtml}</div>`;
                             timeline.appendChild(progressItem);
                             chatMessages.scrollTop = chatMessages.scrollHeight;
                         } else if (data.type === 'completed') {
                             console.log('[SSE] 任务完成');
-                            eventSource.close();
-                            delete window.sessionEventSources[sessionId];
+                            try { nextEs.close(); } catch (e) {}
+                            if (window.sessionEventSources[sessionId] === nextEs) delete window.sessionEventSources[sessionId];
+                            eventSource = null;
                             // 【关键修复】清理SessionList和sessionTasks，防止切换会话时误判任务仍在运行
                             window.SessionList = (window.SessionList || []).filter(item => item.id !== sessionId);
                             if (window.sessionTasks) delete window.sessionTasks[sessionId];
@@ -3952,13 +4624,18 @@ function copyToClipboard(text, button) {
                                 submitButton.disabled = false;
                                 submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
                                 document.getElementById('cancel-button').classList.add('hidden');
-                                loadSessionMessages(sessionId).catch(error => {
-                                    console.error('[SSE] 加载消息失败:', error);
+                                renderCompletedTaskResult(taskId, sessionId).then(rendered => {
+                                    if (!rendered) {
+                                        loadSessionMessages(sessionId).catch(error => {
+                                            console.error('[SSE] 加载消息失败:', error);
+                                        });
+                                    }
                                 });
                             }
                         } else if (data.type === 'error') {
-                            eventSource.close();
-                            delete window.sessionEventSources[sessionId];
+                            try { nextEs.close(); } catch (e) {}
+                            if (window.sessionEventSources[sessionId] === nextEs) delete window.sessionEventSources[sessionId];
+                            eventSource = null;
                             // 【关键修复】只有当前显示的会话才更新UI
                             if (window.currentSessionId === sessionId) {
                                 const timeline = document.getElementById(`progress-timeline-${taskId}`);
@@ -3971,8 +4648,9 @@ function copyToClipboard(text, button) {
                                 document.getElementById('cancel-button').classList.add('hidden');
                             }
                         } else if (data.type === 'cancelled') {
-                            eventSource.close();
-                            delete window.sessionEventSources[sessionId];
+                            try { nextEs.close(); } catch (e) {}
+                            if (window.sessionEventSources[sessionId] === nextEs) delete window.sessionEventSources[sessionId];
+                            eventSource = null;
                             // 【关键修复】清理SessionList和sessionTasks
                             window.SessionList = (window.SessionList || []).filter(item => item.id !== sessionId);
                             if (window.sessionTasks) delete window.sessionTasks[sessionId];
@@ -3987,17 +4665,24 @@ function copyToClipboard(text, button) {
                                 submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
                                 document.getElementById('cancel-button').classList.add('hidden');
                             }
+                        } else if (data.type === 'outline_confirmed') {
+                            // 大纲已确认，打开右侧大纲视窗
+                            console.log('[SSE] 大纲已确认，打开大纲视窗');
+                            if (window.currentSessionId === sessionId) {
+                                openOutlineSidebar(sessionId);
+                            }
                         }
                     } catch (e) {
                         console.error('[SSE] 解析进度消息失败:', e, event.data);
                     }
                 };
-                eventSource.onerror = (error) => {
+                nextEs.onerror = (error) => {
                     const errorTime = Date.now();
                     const errorDelay = errorTime - sseStartTime;
-                    console.error('[SSE] 连接错误:', error, '发生时间:', errorDelay, 'ms后, timestamp:', errorTime, 'readyState:', eventSource.readyState);
-                    eventSource.close();
-                    delete window.sessionEventSources[sessionId];
+                    console.error('[SSE] 连接错误:', error, '发生时间:', errorDelay, 'ms后, timestamp:', errorTime, 'readyState:', nextEs.readyState);
+                    try { nextEs.close(); } catch (e) {}
+                    if (window.sessionEventSources[sessionId] === nextEs) delete window.sessionEventSources[sessionId];
+                    eventSource = null;
                     
                     // 【关键修复】如果会话已被用户主动取消，跳过错误处理
                     // 用户取消时会关闭SSE连接，触发onerror，但这不是真正的错误
@@ -4255,6 +4940,40 @@ function copyToClipboard(text, button) {
             });
         }
 
+        async function renderCompletedTaskResult(taskId, sessionId) {
+            try {
+                const response = await fetch(`/8000/api/task/${taskId}`);
+                if (!response.ok) {
+                    throw new Error(`获取任务结果失败: ${response.status}`);
+                }
+
+                const taskData = await response.json();
+                const status = taskData.status || '';
+                const result = taskData.result || {};
+                const finalReport = typeof result.final_report === 'string' ? result.final_report : '';
+
+                if (window.currentSessionId !== sessionId) {
+                    return false;
+                }
+
+                if (status === 'failed') {
+                    const msg = taskData.error || '任务执行失败';
+                    addMessage(msg, 'ai', result.session_id || '', 0);
+                    return true;
+                }
+
+                if (finalReport) {
+                    console.log('[完成态] 直接从任务结果渲染报告，长度:', finalReport.length);
+                    addMessage(finalReport, 'ai', result.session_id || '', 1);
+                    return true;
+                }
+            } catch (error) {
+                console.warn('[完成态] 读取任务结果失败，回退到消息列表刷新:', error);
+            }
+
+            return false;
+        }
+
         // 添加消息到聊天区域
         function addMessage(text, sender, sessionId = '', hasReport = 0, thinkMsg = '') {
             const messageDiv = document.createElement('div');
@@ -4392,7 +5111,8 @@ function copyToClipboard(text, button) {
                     // 从报告内容末尾提取统计信息（支持中英文格式）
                     // 中文格式匹配
                     let wordCountMatch = rawText.match(/报告字数[：:]\s*([\d,]+)\s*字/);
-                    let executionTimeMatch = rawText.match(/生成耗时[：:]\s*([\d.]+)\s*秒/);
+                    // HITL 等模式使用「生成耗时(总计):」；自动模式为「生成耗时:」
+                    let executionTimeMatch = rawText.match(/生成耗时(?:\(总计\))?[：:]\s*([\d.]+)\s*秒/);
                     let webSearchMatch = rawText.match(/网站检索[：:]\s*([\d,]+)\s*次/);
                     
                     // 英文格式匹配（如果中文匹配失败）
@@ -4400,7 +5120,8 @@ function copyToClipboard(text, button) {
                         wordCountMatch = rawText.match(/Word Count[：:]\s*([\d,]+)\s*words/);
                     }
                     if (!executionTimeMatch) {
-                        executionTimeMatch = rawText.match(/Generation Time[：:]\s*([\d.]+)\s*seconds/);
+                        // HITL: Generation Time (Total): ... ; Auto: Generation Time: ...
+                        executionTimeMatch = rawText.match(/Generation Time(?:\s+\(Total\))?[：:]\s*([\d.]+)\s*seconds/);
                     }
                     if (!webSearchMatch) {
                         webSearchMatch = rawText.match(/Web Searches[：:]\s*([\d,]+)\s*times/);
@@ -4412,7 +5133,7 @@ function copyToClipboard(text, button) {
                         
                         // 检测是否为英文报告（通过是否匹配到英文格式判断）
                         const isEnglish = rawText.match(/Word Count[：:]\s*([\d,]+)\s*words/) || 
-                                         rawText.match(/Generation Time[：:]\s*([\d.]+)\s*seconds/) || 
+                                         rawText.match(/Generation Time(?:\s+\(Total\))?[：:]\s*([\d.]+)\s*seconds/) || 
                                          rawText.match(/Web Searches[：:]\s*([\d,]+)\s*times/);
                         
                         if (wordCountMatch) {
@@ -5254,7 +5975,7 @@ function copyToClipboard(text, button) {
                                     // 当所有消息都加载完成后，强制滚动到底部
                                     if (messagesLoaded === totalMessages) {
                                         // 使用setTimeout确保DOM已更新
-                                        setTimeout(() => {
+                                        setTimeout(async () => {
                                             // 【关键修复】setTimeout中再次检查会话是否已切换
                                             if (window.currentSessionId !== sessionId) {
                                                 console.log('[切换会话] setTimeout执行时会话已切换，跳过. 请求会话:', sessionId, '当前会话:', window.currentSessionId);
@@ -5287,6 +6008,9 @@ function copyToClipboard(text, button) {
                                                     const queryModel = data.pending_mode || 'chat';
                                                     // 【关键修复】使用sessionTasks而不是全局taskId，避免误判任务状态
                                                     const currentTaskId = (window.sessionTasks && window.sessionTasks[sessionId]) || window.taskId;
+                                                    if (currentTaskId) {
+                                                        window.taskId = currentTaskId;
+                                                    }
 
                                                     // 【关键修复】优先检查该会话是否在排队中（不论是否有currentTaskId）
                                                     if (window.sessionQueueStatus && window.sessionQueueStatus[sessionId] && window.sessionQueueStatus[sessionId].queued) {
@@ -5298,18 +6022,61 @@ function copyToClipboard(text, button) {
                                                         }
                                                     }
 
+                                                    // 页面恢复场景：若任务仍处于HITL大纲待确认阶段，优先恢复弹窗而不是走AUTO等待提示
+                                                    if (queryModel === 'deepdiver' && currentTaskId) {
+                                                        try {
+                                                            const outlineRes = await fetch(`/8000/api/outline/${currentTaskId}`);
+                                                            if (outlineRes.ok) {
+                                                                const outlineData = await outlineRes.json();
+                                                                if (outlineData.waiting && outlineData.outline) {
+                                                                    console.log('[页面恢复-HITL] 检测到待确认大纲，恢复确认弹窗');
+                                                                    const pureOutline = extractPureOutline(outlineData.outline);
+                                                                    window.pendingSessions = window.pendingSessions || {};
+                                                                    window.pendingSessions[sessionId] = window.pendingSessions[sessionId] || {};
+                                                                    window.pendingSessions[sessionId].outlineContent = pureOutline;
+
+                                                                    const userChoice = await showOutlineConfirmModal(pureOutline, currentTaskId, sessionId);
+                                                                    if (userChoice.action === 'confirm') {
+                                                                        const confirmRes = await fetch('/8000/api/outline/continue', {
+                                                                            method: 'POST',
+                                                                            headers: { 'Content-Type': 'application/json' },
+                                                                            body: JSON.stringify({
+                                                                                task_id: currentTaskId,
+                                                                                session_id: sessionId,
+                                                                                action: 'confirm',
+                                                                                outline: userChoice.outline,
+                                                                                modified: userChoice.modified
+                                                                            })
+                                                                        });
+                                                                        if (confirmRes.ok) {
+                                                                            showToast(userChoice.modified ? '已提交修改后的大纲，继续生成报告...' : '已确认大纲，继续生成报告...', 'success');
+                                                                            reconnectSSE(currentTaskId, sessionId);
+                                                                        } else {
+                                                                            const errorText = await confirmRes.text();
+                                                                            console.error('[页面恢复-HITL] 大纲确认失败:', confirmRes.status, errorText);
+                                                                            showToast('恢复HITL失败：大纲确认请求失败', 'error');
+                                                                        }
+                                                                    }
+                                                                    return;
+                                                                }
+                                                            }
+                                                        } catch (outlineRecoverError) {
+                                                            console.warn('[页面恢复-HITL] 检查大纲待确认状态失败，回退到常规恢复流程:', outlineRecoverError);
+                                                        }
+                                                    }
+
                                                     // 如果有 taskID 且是 DeepDiver 模式，直接使用 SSE，跳过静态提示和轮询
-                                                    if (window.taskId && queryModel === 'deepdiver') {
+                                                    if (currentTaskId && queryModel === 'deepdiver') {
                                                         // 检查是否需要重连SSE（切换会话时设置的标志）
                                                         if (window.needReconnectSSE) {
                                                             console.log('[切换会话] 历史消息加载完成，现在重连SSE');
-                                                            reconnectSSE(window.taskId, sessionId);
+                                                            reconnectSSE(currentTaskId, sessionId);
                                                             window.needReconnectSSE = false;
                                                             return;
                                                         }
                                                         // 页面刷新恢复场景
                                                         console.log('[页面恢复] 检测到 taskId，直接使用 SSE 恢复进度显示');
-                                                        reconnectSSE(window.taskId, sessionId);
+                                                        reconnectSSE(currentTaskId, sessionId);
                                                         return; // 跳过后续的静态提示和轮询逻辑
                                                     }
                                                     // 否则，显示静态提示并启动轮询
@@ -7529,10 +8296,18 @@ function copyToClipboard(text, button) {
                 return;
             }
 
-            // 先关闭该会话已有的SSE连接，避免重复
+            // 先关闭该会话已有的SSE连接，避免重复（清空 handler 避免 close 触发误报 onerror）
             if (window.sessionEventSources && window.sessionEventSources[sessionId]) {
                 console.log('[SSE恢复] 关闭已有的SSE连接:', sessionId);
-                window.sessionEventSources[sessionId].close();
+                const _oldEs = window.sessionEventSources[sessionId];
+                try {
+                    _oldEs.onerror = null;
+                    _oldEs.onmessage = null;
+                    _oldEs.onopen = null;
+                    _oldEs.close();
+                } catch (e) {
+                    console.warn('[SSE恢复] 关闭旧连接失败:', e);
+                }
                 delete window.sessionEventSources[sessionId];
             }
             // 显示取消按钮
@@ -7666,7 +8441,18 @@ function copyToClipboard(text, button) {
                         }
                         // 创建临时元素以获取文本内容用于去重
                         const tempDiv = document.createElement('div');
-                        tempDiv.innerHTML = `<div class="flex-1"><div class="flex items-center text-gray-600"><span class="mr-2 text-gray-400">•</span><span>${data.message}${detailsHtml}</span></div>${subtaskListHtml}</div>`;
+                        const isWritingChapter = data.stage === 'writing_chapter';
+                        if (isWritingChapter) {
+                            finalizePreviousWritingChapterItems(timeline);
+                        }
+                        const stageRowClass = isWritingChapter ? 'progress-writing-chapter' : 'text-gray-600';
+                        const markerClass = isWritingChapter ? 'progress-writing-chapter-marker' : 'mr-2 text-gray-400';
+                        const markerText = isWritingChapter ? '⏳' : '•';
+                        const chapterItemClass = isWritingChapter ? ' progress-chapter-writing-item' : '';
+                        const chapterRowClass = isWritingChapter ? ' progress-chapter-writing-row' : '';
+                        const chapterMarkerClass = isWritingChapter ? ' progress-chapter-writing-marker' : '';
+                        const chapterTextClass = isWritingChapter ? 'progress-chapter-writing-text' : '';
+                        tempDiv.innerHTML = `<div class="flex-1${chapterItemClass}"><div class="flex items-center ${stageRowClass}${chapterRowClass}"><span class="${markerClass}${chapterMarkerClass}">${markerText}</span><span class="${chapterTextClass}">${data.message}${detailsHtml}</span></div>${subtaskListHtml}</div>`;
                         const messageText = tempDiv.textContent.trim();
                         // 检查是否已显示过此消息
                         if (window.displayedProgressMessages[taskId] && window.displayedProgressMessages[taskId].has(messageText)) {
@@ -7706,7 +8492,11 @@ function copyToClipboard(text, button) {
                             if (progressContainer && progressContainer.parentNode) {
                                 progressContainer.remove();
                             }
-                            loadSessionMessages(sessionId).catch(err => console.error('[SSE恢复] 加载消息失败:', err));
+                            renderCompletedTaskResult(taskId, sessionId).then(rendered => {
+                                if (!rendered) {
+                                    loadSessionMessages(sessionId).catch(err => console.error('[SSE恢复] 加载消息失败:', err));
+                                }
+                            });
                         }
                     } else if (data.type === 'error') {
                         eventSource.close();
@@ -7798,6 +8588,241 @@ function copyToClipboard(text, button) {
                 }
             };
         }
+
+        // 打开大纲视窗
+        async function openOutlineSidebar(sessionId) {
+            const sidebar = document.getElementById('outline-sidebar');
+            const overlay = document.getElementById('outline-sidebar-overlay');
+            const content = document.getElementById('outline-sidebar-content');
+            
+            // 获取大纲内容（优先从内存，否则从后端API获取）
+            let outlineContent = '';
+            if (window.pendingSessions && window.pendingSessions[sessionId]) {
+                outlineContent = window.pendingSessions[sessionId].outlineContent || '';
+            }
+            
+            // 如果内存中没有，尝试从后端获取
+            if (!outlineContent) {
+                content.innerHTML = '<p class="text-gray-500 text-center py-8"><i class="fa fa-spinner fa-spin mr-2"></i>加载中...</p>';
+                
+                // 显示视窗（先显示加载状态，不显示遮罩层）
+                sidebar.classList.add('open');
+                
+                try {
+                    // 方法1：从conversation_detail表的think_msg字段获取大纲
+                    const msgRes = await fetch(`/5000/api/chat/messages/${sessionId}`);
+                    if (msgRes.ok) {
+                        const msgData = await msgRes.json();
+                        if (msgData.success && msgData.messages) {
+                            // 查找包含大纲内容的消息（think_msg不为空且content包含"查看完整大纲"）
+                            for (const msg of msgData.messages) {
+                                if (msg.think_msg && msg.content && msg.content.includes('[点击查看完整大纲]')) {
+                                    outlineContent = msg.think_msg;
+                                    // 缓存到内存
+                                    window.pendingSessions = window.pendingSessions || {};
+                                    window.pendingSessions[sessionId] = window.pendingSessions[sessionId] || {};
+                                    window.pendingSessions[sessionId].outlineContent = outlineContent;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // 方法2：如果数据库中没有，尝试从任务API获取（兼容旧数据）
+                    if (!outlineContent) {
+                        let taskId = null;
+                        if (window.SessionList) {
+                            const sessionItem = window.SessionList.find(item => item.id === sessionId);
+                            if (sessionItem) taskId = sessionItem.taskID;
+                        }
+                        
+                        if (taskId) {
+                            const res = await fetch(`/8000/api/task/${taskId}/outline`);
+                            if (res.ok) {
+                                const data = await res.json();
+                                if (data.outline_content) {
+                                    // 分离reasoning和大纲内容（使用明确分隔符）
+                                    const fullContent = data.outline_content;
+                                    let pureOutline = fullContent;
+                                    const OUTLINE_SEPARATOR = '---OUTLINE_START---';
+                                    if (fullContent.includes(OUTLINE_SEPARATOR)) {
+                                        const separatorIndex = fullContent.indexOf(OUTLINE_SEPARATOR);
+                                        pureOutline = fullContent.substring(separatorIndex + OUTLINE_SEPARATOR.length).trim();
+                                    } else {
+                                        // 兼容旧格式：既支持首行直接是标题，也支持标题前有换行
+                                        const outlineStartMatch = fullContent.match(/(^|\n)(#{1,2}\s)/);
+                                        if (outlineStartMatch) {
+                                            const rawIndex = outlineStartMatch.index || 0;
+                                            const startsWithNewline = outlineStartMatch[0].startsWith('\n');
+                                            const outlineStartIndex = startsWithNewline ? rawIndex + 1 : rawIndex;
+                                            pureOutline = fullContent.substring(outlineStartIndex).trim();
+                                        }
+                                    }
+                                    outlineContent = pureOutline;
+                                    
+                                    // 缓存到内存
+                                    window.pendingSessions = window.pendingSessions || {};
+                                    window.pendingSessions[sessionId] = window.pendingSessions[sessionId] || {};
+                                    window.pendingSessions[sessionId].outlineContent = pureOutline;
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.warn('获取大纲失败:', e);
+                }
+            }
+            
+            if (!outlineContent) {
+                content.innerHTML = '<p class="text-gray-500 text-center py-8">暂无大纲内容</p>';
+            } else {
+                // 解析大纲内容并生成章节列表
+                content.innerHTML = parseOutlineToHTML(outlineContent);
+            }
+            
+            // 显示视窗（不显示遮罩层，主内容区和视窗在同一层面）
+            sidebar.classList.add('open');
+            
+            // 主体内容收缩
+            const mainContent = document.getElementById('main-content');
+            if (mainContent) {
+                mainContent.classList.add('sidebar-open');
+                mainContent.style.marginRight = sidebar.offsetWidth + 'px';
+            }
+        }
+        
+        // 关闭大纲视窗
+        function closeOutlineSidebar() {
+            const sidebar = document.getElementById('outline-sidebar');
+            const mainContent = document.getElementById('main-content');
+            
+            if (!sidebar) return;
+            
+            sidebar.classList.remove('open');
+            sidebar.classList.remove('dragging');
+            
+            // 清除所有内联样式，让CSS控制位置（right: -400px）
+            sidebar.style.width = '';
+            sidebar.style.right = '';
+            
+            // 主体内容恢复
+            if (mainContent) {
+                mainContent.classList.remove('sidebar-open');
+                mainContent.classList.remove('sidebar-dragging');
+                mainContent.style.marginRight = '';
+            }
+        }
+        
+        // 解析大纲内容为HTML格式
+        function parseOutlineToHTML(outlineContent) {
+            // 不显示reasoning，只显示纯大纲内容
+            let outlinePart = outlineContent;
+            
+            // 如果内容不是以#开头，尝试找到第一个#标题
+            const firstHashIndex = outlineContent.indexOf('\n#');
+            if (firstHashIndex > 0) {
+                outlinePart = outlineContent.substring(firstHashIndex + 1).trim();
+            } else if (!outlineContent.startsWith('#')) {
+                // 如果完全没有#标题，尝试找到"第"字开头的章节
+                const chapterMatch = outlineContent.match(/\n(第[一二三四五六七八九十]+章)/);
+                if (chapterMatch) {
+                    const chapterIndex = outlineContent.indexOf(chapterMatch[0]);
+                    outlinePart = outlineContent.substring(chapterIndex + 1).trim();
+                }
+            }
+            
+            // 使用markdownToHtml渲染，添加大纲专用样式
+            let html = `<div class="outline-content prose prose-sm max-w-none">${markdownToHtml(outlinePart)}</div>`;
+            
+            return html;
+        }
+        
+        // 绑定视窗关闭事件和拖拽功能
+        document.addEventListener('DOMContentLoaded', function() {
+            const closeBtn = document.getElementById('outline-sidebar-close');
+            if (closeBtn) {
+                closeBtn.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    closeOutlineSidebar();
+                });
+            }
+            
+            // 拖拽调整宽度功能
+            const sidebar = document.getElementById('outline-sidebar');
+            const resizer = document.getElementById('outline-sidebar-resizer');
+            const mainContent = document.getElementById('main-content');
+            
+            if (resizer && sidebar) {
+                let isResizing = false;
+                let startX = 0;
+                let startWidth = 0;
+                
+                resizer.addEventListener('mousedown', function(e) {
+                    isResizing = true;
+                    startX = e.clientX;
+                    startWidth = sidebar.offsetWidth;
+                    sidebar.classList.add('dragging');
+                    resizer.classList.add('active');
+                    if (mainContent) {
+                        mainContent.classList.add('sidebar-dragging');
+                    }
+                    document.body.style.cursor = 'ew-resize';
+                    document.body.style.userSelect = 'none';
+                    e.preventDefault();
+                });
+                
+                document.addEventListener('mousemove', function(e) {
+                    if (!isResizing) return;
+                    const deltaX = startX - e.clientX;
+                    let newWidth = startWidth + deltaX;
+                    const minWidth = 280;
+                    const maxWidth = window.innerWidth * 0.5;
+                    newWidth = Math.max(minWidth, Math.min(maxWidth, newWidth));
+                    sidebar.style.width = newWidth + 'px';
+                    sidebar.style.right = '0';
+                    // 同步调整主体内容区域
+                    if (mainContent && sidebar.classList.contains('open')) {
+                        mainContent.style.marginRight = newWidth + 'px';
+                    }
+                });
+                
+                document.addEventListener('mouseup', function() {
+                    if (isResizing) {
+                        isResizing = false;
+                        sidebar.classList.remove('dragging');
+                        resizer.classList.remove('active');
+                        if (mainContent) {
+                            mainContent.classList.remove('sidebar-dragging');
+                        }
+                        document.body.style.cursor = '';
+                        document.body.style.userSelect = '';
+                    }
+                });
+            }
+        });
     </script>
+    <!-- 大纲视窗遮罩层 -->
+    <div id="outline-sidebar-overlay"></div>
+    
+    <!-- 右侧大纲视窗 -->
+    <div id="outline-sidebar">
+        <!-- 拖拽手柄 -->
+        <div id="outline-sidebar-resizer"></div>
+        <div class="outline-sidebar-header">
+            <div class="outline-sidebar-title">
+                <i class="fa fa-list-alt"></i>
+                SciAssistant 的视窗
+            </div>
+            <div class="outline-sidebar-close" id="outline-sidebar-close" onclick="closeOutlineSidebar()">
+                <i class="fa fa-times"></i>
+            </div>
+        </div>
+        <div class="outline-sidebar-content" id="outline-sidebar-content">
+            <!-- 大纲内容将动态填充 -->
+            <p class="text-gray-500 text-center py-8">暂无大纲内容</p>
+        </div>
+    </div>
+
 </body>
 </html>

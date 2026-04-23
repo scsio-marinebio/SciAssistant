@@ -40,6 +40,7 @@ class WriterAgent(BaseAgent):
         self._expected_next_chapter = 1
         self._total_chapters = 0
         self._written_chapters = set()
+        self._has_merged_final_report = False
 
     def set_cancellation_token(self, cancellation_token):
         """
@@ -163,8 +164,13 @@ class WriterAgent(BaseAgent):
 
         return schemas
 
-    def _build_system_prompt(self) -> str:
-        """Build the system prompt for the writer agent"""
+    def _build_system_prompt(self, is_phase2: bool = False, user_outline: str = "") -> str:
+        """Build the system prompt for the writer agent
+        
+        Args:
+            is_phase2: Whether this is Human-in-the-Loop Phase 2 (user has confirmed outline)
+            user_outline: The user-confirmed outline (only used in Phase 2)
+        """
         tool_schemas_str = json.dumps(self.tool_schemas, ensure_ascii=False)
         
         # 根据_is_chinese_query标志明确指定输出语言
@@ -180,7 +186,69 @@ This rule applies to ALL outputs including: outline generation, chapter content,
 This rule applies to ALL outputs including: outline generation, chapter content, summaries, and the final article.
 **DO NOT use Chinese characters in the article content.**"""
         
-        system_prompt_template = f"""You are a professional writing master. You will receive key files and user problems. Your task is to generate an outline highly consistent with the user problem, classify files into sections, and iteratively call section_writer tool to create comprehensive content.
+        if is_phase2:
+            # Phase 2: 用户已确认大纲，完全跳过大纲生成步骤
+            system_prompt_template = f"""You are a professional writing master. The user has already confirmed an outline. Your task is to classify files into sections based on the PROVIDED outline, and iteratively call section_writer tool to create comprehensive content.
+
+{language_instruction}
+
+**CRITICAL: This is Human-in-the-Loop Phase 2. The user has already confirmed the outline below. You MUST NOT generate your own outline.**
+
+=== USER CONFIRMED OUTLINE (DO NOT MODIFY) ===
+{user_outline}
+=== END OF USER CONFIRMED OUTLINE ===
+
+MANDATORY WORKFLOW (Phase 2 - Outline Already Confirmed):
+
+1. FILE CLASSIFICATION (FIRST STEP - NO OUTLINE GENERATION)
+   - Use the search_result_classifier tool to classify key files according to the USER CONFIRMED OUTLINE above.
+   - Pass the EXACT user-confirmed outline as the 'outline' parameter - DO NOT modify it in any way.
+   - Ensure optimal distribution of reference materials across chapters based on content relevance.
+
+2. ITERATIVE SECTION WRITING
+   - Call section_writer tool sequentially for each chapter
+   - CRITICAL: Must wait for previous chapter completion before starting the next chapter
+   - Pass only the specific chapter outline, target file path and corresponding classified files to each section writer
+   - Generate save path for each chapter using \"./report/part_X.md\" format (e.g., \"./report/part_1.md\" for first chapter)
+   - Check section writer results after completion; retry up to 2 times per chapter if quality is insufficient based on returned fields (do not read saved files)
+   - When you call the section_writer tool, pay special attention to the fact that the parameter value of written_chapters_summary is a summary of the content returned by all previously completed chapters. Be careful not to make any changes to the summary content, including compressing the content.
+
+3. TASK COMPLETION
+   - After all chapters are written, you must first call the concat_section_files tool to merge the saved chapter files into one file, then call writer_subjective_task_done to finalize and return.
+
+CRITICAL REQUIREMENTS:
+- **DO NOT generate your own outline** - the user has already confirmed the outline above
+- **Use the user-confirmed outline EXACTLY as provided** when calling search_result_classifier
+- No parallel writing - strictly sequential chapter execution
+- Wait for each section writer completion before proceeding to next chapter
+- Classify files appropriately to support each chapter's content needs
+- Note again that to merge all the written chapter files, you must use the concat_section_files tool!!! You are not allowed to call any other tools for merging!!!
+
+FORBIDDEN ACTIONS:
+- DO NOT call think tool to plan or generate a new outline
+- DO NOT modify the user-confirmed outline in any way
+- NEVER generate meta-structural chapters that describe how the article is organized
+- AVOID introductory sections that outline \"Chapter 1 will cover..., Chapter 2 will discuss...\"
+- DO NOT create chapters that explain the report structure or methodology
+- Each chapter must contain SUBSTANTIVE CONTENT, not descriptions of what other chapters contain
+
+Usage of TOOLS:
+- search_result_classifier: Classify key files into outline sections (use user-confirmed outline)
+- section_writer: Write individual chapters sequentially  
+- writer_subjective_task_done: Complete the writing task
+- concat_section_files: Concatenate the content of the saved section files into a single file
+
+Below, within the <tools></tools> tags, are the descriptions of each tool and the required fields for invocation:
+<tools>
+{tool_schemas_str}
+</tools>
+For each function call, return a JSON object placed within the [unused11][unused12] tags, which includes the function name and the corresponding function arguments:
+[unused11][{{"name": <function name>, "arguments": <args json object>}}][unused12]
+
+Execute workflow systematically to produce high-quality, coherent long-form content with substantive chapters."""
+        else:
+            # Phase 1 or normal mode: 需要生成大纲
+            system_prompt_template = f"""You are a professional writing master. You will receive key files and user problems. Your task is to generate an outline highly consistent with the user problem, classify files into sections, and iteratively call section_writer tool to create comprehensive content.
 
 {language_instruction}
 
@@ -194,10 +262,10 @@ Then you strictly follow the steps given below:
             1.**Higher authority** (credible sources)
             2.**Greater information richness** (substantive, detailed content)
             3.**Stronger relevance** (direct alignment with user query)
-            4.**Timeliness** (if user’s query is time-sensitive, prioritize recent/updated content)
+            4.**Timeliness** (if user's query is time-sensitive, prioritize recent/updated content)
         Select these segments as the basis for outline generation. Note that we only focus on relevance to the question, so when generating the outline, do not add unrelated sections just for the sake of length. Additionally, the sections should flow logically and not be too disjointed, as this would harm the readability of the final output.  
         - The overall structure must be **logically clear**, with **no repetition or redundancy** between chapters.  
-        - **Note1:** The generated outline must not only have chapter-level headings (Level 1) highly relevant to the user’s question, but the subheadings (Level 2) must also be highly relevant to the user’s question. It is not permitted to generate chapter titles with weak relevance, whether Level 1 or Level 2.
+        - **Note1:** The generated outline must not only have chapter-level headings (Level 1) highly relevant to the user's question, but the subheadings (Level 2) must also be highly relevant to the user's question. It is not permitted to generate chapter titles with weak relevance, whether Level 1 or Level 2.
         - **Note2:** STRICT NUMBERING FORMAT REQUIRED (CRITICAL FOR PDF TOC): 
             - Level 1 headings (Chapters) MUST use Markdown '##' (H2) and Arabic numerals followed by a period:
               * For English: "## 1. Introduction", "## 2. Core Concepts"
@@ -252,11 +320,16 @@ Then you strictly follow the steps given below:
         - When generating an outline, if it is not a professional term, the language should remain consistent with the user's question.\"
         
         Usage of TOOLS:
-        - search_result_classifier: Classify key files into outline sections
+        - search_result_classifier: Classify key files into outline sections. **IMPORTANT**: You MUST include the `reasoning_text` parameter with your reasoning process explaining how you analyzed the research materials and why you generated this specific outline structure. This text will be displayed to the user before the outline. Example: "基于提供的研究资料，我分析了关于[主题]的多个维度，包括[维度1]、[维度2]等。结合用户的查询需求，我将为您撰写一篇综合研究报告，大纲结构如下："
         - section_writer: Write individual chapters sequentially  
         - writer_subjective_task_done: Complete the writing task
         - concat_section_files: Concatenate the content of the saved section files into a single file
         - think tool: \"Think\" is a systematic tool requiring its use during key steps. Before executing actions like generating an outline, you must first call this tool to deeply consider the given content and key requirements, ensuring the output meets specifications. Similarly, during iterative chapter generation, after receiving feedback and before writing the next chapter, call \"think\" to reflect on the current chapter. This provides guidance to avoid content repetition and ensure smooth transitions between chapters.
+        
+        SPECIAL HANDLING - Human in the Loop Mode:
+        - If search_result_classifier returns error "WAITING_FOR_OUTLINE_CONFIRMATION", this means the system is in Human-in-the-Loop mode and waiting for user to confirm the outline.
+        - In this case, you MUST immediately call writer_subjective_task_done with completion_status="partial" to end the current task and allow the user to review the outline.
+        - Do NOT retry search_result_classifier or attempt other operations when you see this error.
         
         Execute workflow systematically to produce high-quality, coherent long-form content with substantive chapters.
 
@@ -445,8 +518,35 @@ For each function call, return a JSON object placed within the [unused11][unused
             # Initialize conversation history
             conversation_history = []
 
+            # 检测 Human in the loop Phase 2
+            is_phase2 = False
+            user_outline = ""
+            if hasattr(task_input, 'task_content') and task_input.task_content:
+                if "Human in the loop 阶段2" in task_input.task_content or "Human in the loop Phase 2" in task_input.task_content:
+                    is_phase2 = True
+                    # 提取用户确认的大纲
+                    import re as _re_outline
+                    outline_match = _re_outline.search(r'用户确认的大纲[：:]?\s*\n(.*?)(?:\n用户原始查询|$)', task_input.task_content, _re_outline.DOTALL)
+                    if outline_match:
+                        user_outline = outline_match.group(1).strip()
+                    self.logger.info(f"[HITL] Phase 2 detected, user_outline length={len(user_outline)}")
+            
+            # Also check environment variable
+            if not is_phase2:
+                is_phase2 = os.environ.get('HUMAN_IN_LOOP_PHASE2', 'false').lower() == 'true'
+                if is_phase2:
+                    # 从 workspace 文件读取大纲
+                    workspace_path = os.environ.get('AGENT_WORKSPACE_PATH', '')
+                    if workspace_path:
+                        from pathlib import Path
+                        outline_file = Path(workspace_path) / '.user_outline'
+                        if outline_file.exists():
+                            with open(outline_file, 'r', encoding='utf-8') as f:
+                                user_outline = f.read().strip()
+                    self.logger.info(f"[HITL] Phase 2 detected via env var, user_outline length={len(user_outline)}")
+            
             # Build system prompt for writing
-            system_prompt = self._build_system_prompt()
+            system_prompt = self._build_system_prompt(is_phase2=is_phase2, user_outline=user_outline)
 
             # Build initial user message from TaskInput
             user_message = self._build_initial_message_from_task_input(task_input)
@@ -600,10 +700,16 @@ For each function call, return a JSON object placed within the [unused11][unused
 
                         # Check if planning is complete
                         if tool_name in ["writer_subjective_task_done"]:
-                            task_completed = True
-                            self.log_action(iteration, tool_name, arguments, arguments)
-                            break
-                        if tool_name in ["think"]:
+                            if self._written_chapters and not self._has_merged_final_report:
+                                tool_result = {
+                                    "success": False,
+                                    "error": "最终报告尚未成功合并。请先调用 concat_section_files 生成 final_report，再调用 writer_subjective_task_done。"
+                                }
+                            else:
+                                task_completed = True
+                                self.log_action(iteration, tool_name, arguments, arguments)
+                                break
+                        elif tool_name in ["think"]:
                             tool_result = {
                                 "tool_results": "You can proceed to invoke other tools if needed. But the next step cannot call the reflect tool"}
                         elif tool_name == "section_writer":
@@ -611,10 +717,10 @@ For each function call, return a JSON object placed within the [unused11][unused
                             import re
                             write_file_path = ""
                             if isinstance(arguments, dict):
-                                write_file_path = arguments.get('write_file_path', '')
+                                write_file_path = arguments.get('target_file_path', '') or arguments.get('write_file_path', '')
                             elif isinstance(arguments, str):
                                 args_dict = json.loads(arguments)
-                                write_file_path = args_dict.get('write_file_path', '')
+                                write_file_path = args_dict.get('target_file_path', '') or args_dict.get('write_file_path', '')
                             
                             # 提取章节编号
                             chapter_match = re.search(r'part_(\d+)\.md', write_file_path)
@@ -632,45 +738,7 @@ For each function call, return a JSON object placed within the [unused11][unused
                                         "actual_chapter": chapter_num
                                     }
                                 else:
-                                    # 章节编号正确，执行工具调用
-                                    tool_result = self.execute_tool_call(tool_call)
-                                    
-                                    # 如果成功，更新计数器并推送进度
-                                    if tool_result.get("success"):
-                                        self._written_chapters.add(chapter_num)
-                                        self._expected_next_chapter = chapter_num + 1
-                                        self.logger.info(f"[章节验证] 成功完成第{chapter_num}章，下一章应为第{self._expected_next_chapter}章")
-                                        
-                                        # 推送章节进度
-                                        self._crash_test_part_count += 1
-                                        try:
-                                            # 从 arguments 中提取章节标题
-                                            outline = ""
-                                            if isinstance(arguments, dict):
-                                                outline = arguments.get('current_chapter_outline', '')
-                                            elif isinstance(arguments, str):
-                                                args_dict = json.loads(arguments)
-                                                outline = args_dict.get('current_chapter_outline', '')
-                                            
-                                            # 提取第一行作为章节标题
-                                            if outline:
-                                                chapter_title = outline.split('\n')[0].strip()
-                                                chapter_title = chapter_title.replace('#', '').strip()[:50]
-                                                
-                                                _writing_prefix = '正在撰写: ' if getattr(self, '_is_chinese_query', True) else 'Writing: '
-                                                self._send_progress('writing_chapter', f'{_writing_prefix}{chapter_title}', {
-                                                    'chapter_title': chapter_title
-                                                })
-                                        except Exception as e:
-                                            # 静默失败，不影响主流程
-                                            self.logger.debug(f"Failed to send chapter progress: {e}")
-                            else:
-                                # 无法提取章节编号，正常执行
-                                tool_result = self.execute_tool_call(tool_call)
-                                
-                                # 推送进度（无章节编号的情况）
-                                if tool_result.get("success"):
-                                    self._crash_test_part_count += 1
+                                    # 在真正开始写章节前就推送进度，避免前端长时间停留在上一状态
                                     try:
                                         outline = ""
                                         if isinstance(arguments, dict):
@@ -678,17 +746,63 @@ For each function call, return a JSON object placed within the [unused11][unused
                                         elif isinstance(arguments, str):
                                             args_dict = json.loads(arguments)
                                             outline = args_dict.get('current_chapter_outline', '')
-                                        
+
                                         if outline:
                                             chapter_title = outline.split('\n')[0].strip()
                                             chapter_title = chapter_title.replace('#', '').strip()[:50]
-                                            
+
                                             _writing_prefix = '正在撰写: ' if getattr(self, '_is_chinese_query', True) else 'Writing: '
                                             self._send_progress('writing_chapter', f'{_writing_prefix}{chapter_title}', {
                                                 'chapter_title': chapter_title
                                             })
                                     except Exception as e:
-                                        self.logger.debug(f"Failed to send chapter progress: {e}")
+                                        self.logger.debug(f"Failed to send pre-write chapter progress: {e}")
+
+                                    # 章节编号正确，执行工具调用
+                                    tool_result = self.execute_tool_call(tool_call)
+                                    
+                                    # 如果成功，更新计数器
+                                    if tool_result.get("success"):
+                                        self._written_chapters.add(chapter_num)
+                                        self._expected_next_chapter = chapter_num + 1
+                                        self.logger.info(f"[章节验证] 成功完成第{chapter_num}章，下一章应为第{self._expected_next_chapter}章")
+                                        
+                                        self._crash_test_part_count += 1
+                                        try:
+                                            _saved_msg = (
+                                                f'已保存: part_{chapter_num}.md'
+                                                if getattr(self, '_is_chinese_query', True)
+                                                else f'Saved: part_{chapter_num}.md'
+                                            )
+                                            self._send_progress('chapter_saved', _saved_msg, {'chapter_num': chapter_num})
+                                        except Exception:
+                                            pass
+                            else:
+                                try:
+                                    outline = ""
+                                    if isinstance(arguments, dict):
+                                        outline = arguments.get('current_chapter_outline', '')
+                                    elif isinstance(arguments, str):
+                                        args_dict = json.loads(arguments)
+                                        outline = args_dict.get('current_chapter_outline', '')
+
+                                    if outline:
+                                        chapter_title = outline.split('\n')[0].strip()
+                                        chapter_title = chapter_title.replace('#', '').strip()[:50]
+
+                                        _writing_prefix = '正在撰写: ' if getattr(self, '_is_chinese_query', True) else 'Writing: '
+                                        self._send_progress('writing_chapter', f'{_writing_prefix}{chapter_title}', {
+                                            'chapter_title': chapter_title
+                                        })
+                                except Exception as e:
+                                    self.logger.debug(f"Failed to send pre-write chapter progress: {e}")
+
+                                # 无法提取章节编号，正常执行
+                                tool_result = self.execute_tool_call(tool_call)
+                                
+                                # 更新计数（无章节编号的情况）
+                                if tool_result.get("success"):
+                                    self._crash_test_part_count += 1
                         elif tool_name == "concat_section_files":
                             # 在合并前检查章节完整性
                             if self._expected_next_chapter > 1:
@@ -707,10 +821,24 @@ For each function call, return a JSON object placed within the [unused11][unused
                                 else:
                                     self.logger.info(f"[完整性检查] 所有{len(self._written_chapters)}个章节已完成，可以合并")
                                     tool_result = self.execute_tool_call(tool_call)
+                                    if tool_result.get("success"):
+                                        self._has_merged_final_report = True
                             else:
                                 tool_result = self.execute_tool_call(tool_call)
+                                if tool_result.get("success"):
+                                    self._has_merged_final_report = True
                         else:
                             tool_result = self.execute_tool_call(tool_call)
+
+                        # 当章节结构与大纲不一致时，显式提示模型重试当前章节
+                        if tool_name == "section_writer" and not tool_result.get("success", False):
+                            error_text = str(tool_result.get("error", ""))
+                            if "chapter structure mismatch" in error_text:
+                                retry_msg = (
+                                    "section_writer 返回章节结构错误。请保持 current_chapter_outline 的标题逐行一致，"
+                                    "不得新增/删除/改写标题，重新调用同一章节的 section_writer。"
+                                )
+                                conversation_history.append({"role": "user", "content": retry_msg + " /no_think"})
 
                         # Log the action using base class method
                         self.log_action(iteration, tool_name, arguments, tool_result)

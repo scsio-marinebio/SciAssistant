@@ -4751,7 +4751,8 @@ class MCPTools:
             key_files: List[Dict],
             model: str = "gpt-4o",
             temperature: float = 0.3,
-            max_tokens: int = 4000
+            max_tokens: int = 4000,
+            reasoning_text: str = ""
     ) -> MCPToolResult:
         """
         Classify and organize search result files according to a structured outline for comprehensive long-form content generation.
@@ -4762,9 +4763,91 @@ class MCPTools:
             model: AI model to use for classification and organization
             temperature: Creativity level for the AI classification (0-1)
             max_tokens: Maximum tokens for the AI response
+            reasoning_text: Reasoning process text explaining the outline structure (displayed to user)
         """
         try:
             logger.info(f"我现在开始调用search_result_classifier了：{outline}, {key_files}")
+            logger.info(f"reasoning_text参数值: '{reasoning_text[:100] if reasoning_text else '空'}...'")
+
+            # Human in the loop 模式：从 workspace 文件读取状态（环境变量无法跨进程传递）
+            import os
+            human_in_loop = False
+            user_outline_path = ''
+
+            # 检查 workspace 中的 .human_in_loop 标记文件
+            human_in_loop_file = self.workspace_path / '.human_in_loop'
+            logger.info(f"[HITL DEBUG] 检查文件: {human_in_loop_file} (workspace={self.workspace_path})")
+            logger.info(f"[HITL DEBUG] 文件存在: {human_in_loop_file.exists()}")
+            if human_in_loop_file.exists():
+                try:
+                    with open(human_in_loop_file, 'r', encoding='utf-8') as f:
+                        content = f.read().strip().lower()
+                        human_in_loop = content == 'true'
+                    logger.info(f"Human in the loop: 从文件读取状态 = {human_in_loop}")
+                except Exception as e:
+                    logger.warning(f"读取 .human_in_loop 文件失败: {e}")
+            else:
+                # 尝试检查父目录
+                parent_human_in_loop = self.workspace_path.parent / '.human_in_loop'
+                logger.info(f"[HITL DEBUG] 检查父目录: {parent_human_in_loop}, 存在={parent_human_in_loop.exists()}")
+
+            # 检查 workspace 中的 .user_outline 文件
+            user_outline_file = self.workspace_path / '.user_outline'
+            if user_outline_file.exists():
+                user_outline_path = str(user_outline_file)
+
+            if human_in_loop and not user_outline_path:
+                # 首次执行，需要保存大纲并暂停
+                # 保存纯大纲内容（用于用户编辑）
+                outline_pending_path = self.workspace_path / ".outline_pending"
+                with open(outline_pending_path, 'w', encoding='utf-8') as f:
+                    f.write(outline)
+                logger.info(f"Human in the loop: 大纲已保存到 {outline_pending_path}，等待用户确认")
+
+                # 保存大纲内容到独立文件（供 a.py 读取）
+                outline_content_path = self.workspace_path / ".outline_content"
+                with open(outline_content_path, 'w', encoding='utf-8') as f:
+                    f.write(outline)
+
+                # 同时保存reasoning内容（用于前端展示）
+                if not reasoning_text:
+                    reasoning_text = "基于提供的研究资料，我将为您撰写这篇综合研究报告。让我首先生成一个系统性的研究大纲："
+                reasoning_path = self.workspace_path / ".reasoning_content"
+                with open(reasoning_path, 'w', encoding='utf-8') as f:
+                    f.write(reasoning_text)
+                logger.info(f"Human in the loop: reasoning已保存到 {reasoning_path}")
+
+                # 返回特殊状态，让 Agent 知道需要等待
+                return MCPToolResult(
+                    success=False,
+                    error="WAITING_FOR_OUTLINE_CONFIRMATION",
+                    data={
+                        "status": "waiting_for_outline_confirmation",
+                        "message": "大纲已生成，等待用户确认。请调用 writer_subjective_task_done 工具结束当前任务。",
+                        "outline": outline,
+                        "reasoning": reasoning_text
+                    }
+                )
+
+            # Auto模式：保存大纲和reasoning提示到文件供前端轮询展示（不暂停执行）
+            if not human_in_loop:
+                outline_generated_path = self.workspace_path / ".outline_generated"
+                if not reasoning_text:
+                    reasoning_text = "基于提供的研究资料，我将为您撰写这篇综合研究报告。让我首先生成一个系统性的研究大纲："
+                # 使用明确分隔符，便于前端准确分离reasoning和outline
+                full_content = f"{reasoning_text}\n\n---OUTLINE_START---\n\n{outline}"
+                with open(outline_generated_path, 'w', encoding='utf-8') as f:
+                    f.write(full_content)
+                logger.info(f"Auto模式: 大纲已保存到 {outline_generated_path}，继续执行")
+
+            # 如果有用户确认的大纲，使用用户的大纲
+            if user_outline_path and os.path.exists(user_outline_path):
+                with open(user_outline_path, 'r', encoding='utf-8') as f:
+                    user_outline = f.read().strip()
+                if user_outline:
+                    logger.info(f"Human in the loop: 使用用户确认的大纲")
+                    outline = user_outline
+
             # 处理输入的key_files - 使用四个分析维度
             # 获取本地的文件进行分析
 
@@ -5321,6 +5404,79 @@ OUTLINE TO ORGANIZE CONTENT:
 
         return '\n'.join(corrected_lines)
 
+    @staticmethod
+    def _normalize_chapter_heading(line: str) -> Optional[str]:
+        """Normalize a heading line for structure comparison."""
+        if not isinstance(line, str):
+            return None
+
+        line = line.strip()
+        if not line:
+            return None
+
+        if line.startswith("## "):
+            return line
+
+        clean = re.sub(r'^#+\s*', '', line).strip()
+        clean = re.sub(r'^\*\*(.+?)\*\*$', r'\1', clean).strip()
+        clean = re.sub(r'^[\*\-\s]+', '', clean)
+        clean = re.sub(r'[\*\s]+$', '', clean).strip()
+
+        if re.match(r'^\d+\.\d+\s+\S+', clean):
+            return clean
+        return None
+
+    @classmethod
+    def _extract_expected_chapter_headings(cls, current_chapter_outline: str) -> List[str]:
+        """Extract expected chapter headings from current chapter outline."""
+        if not current_chapter_outline or not isinstance(current_chapter_outline, str):
+            return []
+
+        expected = []
+        for raw_line in current_chapter_outline.split('\n'):
+            normalized = cls._normalize_chapter_heading(raw_line)
+            if normalized:
+                expected.append(normalized)
+        return expected
+
+    @classmethod
+    def _extract_actual_chapter_headings(cls, content: str) -> List[str]:
+        """Extract heading lines from generated chapter content."""
+        if not content or not isinstance(content, str):
+            return []
+
+        actual = []
+        for raw_line in content.split('\n'):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            normalized = cls._normalize_chapter_heading(line)
+            if normalized:
+                actual.append(normalized)
+        return actual
+
+    @classmethod
+    def _validate_chapter_structure(cls, content: str, current_chapter_outline: str) -> Dict[str, Any]:
+        """Validate generated chapter headings strictly match the outline headings."""
+        expected = cls._extract_expected_chapter_headings(current_chapter_outline)
+        actual = cls._extract_actual_chapter_headings(content)
+
+        if expected == actual:
+            return {
+                "valid": True,
+                "message": "Chapter structure is consistent with the outline.",
+                "expected": expected,
+                "actual": actual
+            }
+
+        return {
+            "valid": False,
+            "message": "Chapter structure mismatch: headings must strictly match current_chapter_outline in content and order.",
+            "expected": expected,
+            "actual": actual
+        }
+
     def section_writer(
             self,
             written_chapters_summary: str,
@@ -5437,6 +5593,7 @@ This rule applies to ALL chapter content including: headings, body text, tables,
 - You can only use the provided web page information for writing, don't make up any content, ensure the accuracy of the facts. Note that when there are contradictions between the facts described in the above search results, you should use your internal knowledge to reasonably identify the correct information. If identification is impossible, you may select the most factual result based on the authority of the web pages and a voting mechanism (e.g., the description consistent with the majority of web pages). If judgment remains impossible using these methods, you may appropriately list possible differing statements, but you must not conflate different claims—prioritize ensuring factual accuracy!
 - You are only permitted to write content strictly within the provided chapter framework. You are forbidden from creating additional subheadings or bullet points within the framework! However, there is a special exception: **You should proactively and actively use Markdown tables to present structured data**. When encountering data comparisons, technical parameters, multi-dimensional comparisons, statistical data, feature contrasts, timeline events, or any scenario where information can be organized in rows and columns, you MUST use tables instead of pure text narration. Tables greatly improve readability and information density. Furthermore, you are not allowed to use concise or summarizing language for narration! We must strictly ensure the information density of the writing and avoid excessive compression.
 - You cannot make any changes to the structure of the chapter you are currently writing, such as the title content and the bold symbols in the title, you are not allowed to make any changes. **CRITICAL: Sub-heading numbers MUST match the chapter number.** For example, if the current chapter is "## 1. Title", then sub-headings MUST be "1.1 ...", "1.2 ...", NOT "2.1 ...". If the current chapter is "## 3. Title", sub-headings must be "3.1 ...", "3.2 ...", etc. Always derive the sub-heading prefix from the chapter number in current_chapter_outline. **Important Note:** When writing Chapter 1, if you find the chapter lacks article title, you must create one based on user query. However, this rule only applies to Chapter 1 - do not add any titles to any other chapters in the work. 
+- **ABSOLUTE OUTLINE LOCK**: You MUST reproduce all heading lines from CURRENT CHAPTER OUTLINE in the exact same order (same numbering, same wording). Do NOT add, delete, or rename any heading line. Do NOT insert extra heading levels.
 - Be careful to ensure that the narrative content is highly relevant and does not contain any common sense errors, note that although you are asked to ensure the richness of information when writing, you must ensure that the content you write is highly relevant and that the context is logically coherent and readable.
 - Proceeding to explain the roles of other specified fields:
     * user_query: The user query, ensure the drafted content is highly relevant to the user's inquiry.
@@ -5538,6 +5695,72 @@ Strictly follow the following format for output:
                 logger.debug(f"Overall outline: {overall_outline[:200]}...")
                 content = self._correct_title_format(content, overall_outline)
                 logger.debug(f"Content after correction: {content[:200]}...")
+
+                # Strictly validate heading structure against current chapter outline
+                structure_validation = self._validate_chapter_structure(content, current_chapter_outline)
+                if not structure_validation.get("valid"):
+                    logger.warning(
+                        f"Chapter structure mismatch detected, trying auto-repair. "
+                        f"Expected={structure_validation.get('expected')}, Actual={structure_validation.get('actual')}"
+                    )
+                    repair_system_prompt = """You are a strict markdown structure fixer.
+Your only goal is to fix heading structure.
+Rules:
+1) Keep the chapter body content as much as possible.
+2) Heading lines MUST exactly match EXPECTED CHAPTER OUTLINE headings in the same order.
+3) Do NOT add extra headings.
+4) Keep level-1 heading with ##, and level-2 headings as plain text like '2.1 Title'.
+5) Return only <chapter_content>...</chapter_content>."""
+                    repair_user_prompt = f"""EXPECTED CHAPTER OUTLINE:
+{current_chapter_outline}
+
+CURRENT CHAPTER CONTENT:
+{content}
+"""
+
+                    repaired_response = None
+                    for attempt in range(3):
+                        try:
+                            repaired_response = requests.post(
+                                url=model_url,
+                                headers=headers,
+                                json={
+                                    "model": model_config.get('model', 'pangu_auto'),
+                                    "chat_template": "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<s>[unused9]系统：[unused10]' }}{% endif %}{% if message['role'] == 'system' %}{{'<s>[unused9]系统：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'assistant' %}{{'[unused9]助手：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'tool' %}{{'[unused9]工具：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'function' %}{{'[unused9]方法：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'user' %}{{'[unused9]用户：' + message['content'] + '[unused10]'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '[unused9]助手：' }}{% endif %}",
+                                    "messages": [
+                                        {"role": "system", "content": repair_system_prompt},
+                                        {"role": "user", "content": repair_user_prompt + " /no_think"}
+                                    ],
+                                    "spaces_between_special_tokens": False,
+                                    "max_tokens": max_tokens,
+                                    "temperature": 0.0,
+                                },
+                                timeout=model_config.get("timeout", 180)
+                            )
+                            repaired_response = repaired_response.json()
+                            repaired_text = repaired_response["choices"][0]["message"]["content"].strip()
+                            repaired_content = repaired_text
+                            if "<chapter_content>" in repaired_text:
+                                repaired_content = repaired_text.split("<chapter_content>")[1].split("</chapter_content>")[0].strip()
+                            content = self._correct_title_format(repaired_content, overall_outline)
+                            structure_validation = self._validate_chapter_structure(content, current_chapter_outline)
+                            if structure_validation.get("valid"):
+                                logger.info("Chapter structure auto-repair succeeded.")
+                                break
+                        except Exception as repair_err:
+                            logger.warning(f"Chapter structure auto-repair attempt {attempt + 1} failed: {repair_err}")
+                            if attempt == 2:
+                                break
+                            time.sleep(2)
+
+                if not structure_validation.get("valid"):
+                    return MCPToolResult(
+                        success=False,
+                        error=(
+                            "section writer failed: chapter structure mismatch with outline. "
+                            f"expected={structure_validation.get('expected')}, actual={structure_validation.get('actual')}"
+                        )
+                    )
                 # Second round: Request summary
                 summary_prompt = "Please give a brief summary of the output chapter content. Be sure to ensure that the language of the summary is consistent with the language of the output chapter content. For example, if the chapter content is in Chinese, your summary should also be in Chinese."
 
@@ -5600,15 +5823,17 @@ Strictly follow the following format for output:
                 if not write_result.success:
                     raise Exception(f"File write failed: {write_result.error}")
 
-                results = []
+                chapter_payload = {
+                    "chapter_summary": summary,
+                    "structure_validation": structure_validation
+                }
                 return MCPToolResult(
                     success=True,
-                    data=results.append({
-                        "chapter_summary": summary,
-                    }),
+                    data=chapter_payload,
                     metadata={
                         'content_length': len(content),
-                        'summary_length': len(summary)
+                        'summary_length': len(summary),
+                        'structure_valid': structure_validation.get("valid", False)
                     }
                 )
 
@@ -10646,6 +10871,11 @@ MCP_TOOL_SCHEMAS = {
                     "type": "integer",
                     "default": 2000,
                     "description": "Maximum tokens for the AI response"
+                },
+                "reasoning_text": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Your reasoning process text explaining how you analyzed the research materials and why you generated this specific outline structure. This text will be displayed to the user before the outline. Write it in the same language as the user's query. Example: '基于提供的研究资料，我分析了关于[主题]的多个维度，包括[维度1]、[维度2]等。结合用户的查询需求，我将为您撰写一篇综合研究报告，大纲结构如下：'"
                 }
             },
             "required": ["key_files", "outline"]
