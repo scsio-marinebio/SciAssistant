@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright (c) 2026 South China Sea Institute of Oceanology, Chinese Academy of Sciences (SCSIO, CAS). All rights reserved.
 import os
 import json
 import random
@@ -948,18 +948,25 @@ class PDFBookmark(Flowable):
         self.canv.addOutlineEntry(self.title, self.key, level=self.level)
 
 
-def _find_font_with_priority(font_name: str, system_paths: List[str]) -> Optional[str]:
+def _find_font_with_priority(font_name: str, system_paths: List[str], fallback_font_names: List[str] = None) -> Optional[str]:
     """
-    按优先级查找字体文件：先查找 ./Font/ 目录，再回退到系统路径
+    按优先级查找字体文件：优先从系统路径查找，再回退到项目 ./Font/ 目录
     
     Args:
         font_name: 字体名称（如 'simhei', 'simsun', 'arial'）
         system_paths: 系统字体路径列表（按优先级排序）
+        fallback_font_names: 回退字体名称列表（用于在项目 Font 目录中查找的备选字体名）
     
     Returns:
         找到的字体文件路径，如果都找不到则返回 None
     """
-    # 1. 优先从项目根目录的 Font/ 目录中查找
+    # 1. 优先从系统路径查找
+    for system_path in system_paths:
+        if system_path and os.path.exists(system_path):
+            logger.info(f"使用系统字体: {system_path}")
+            return str(system_path)
+    
+    # 2. 回退到项目根目录的 Font/ 目录中查找
     # 获取当前文件所在目录，然后向上查找项目根目录
     current_file = Path(__file__).resolve()
     # 从 deepdiver_v2/src/tools/mcp_tools.py 向上3级到项目根目录
@@ -970,28 +977,29 @@ def _find_font_with_priority(font_name: str, system_paths: List[str]) -> Optiona
         # 支持的字体文件扩展名
         extensions = ['.ttf', '.ttc', '.TTF', '.TTC']
         
-        for ext in extensions:
-            # 尝试不同的文件名格式
-            font_file = font_dir / f"{font_name}{ext}"
-            if font_file.exists():
-                logger.info(f"找到字体文件: {font_file}")
-                return str(font_file.absolute())
-            
-            # 尝试大写文件名
-            font_file_upper = font_dir / f"{font_name.upper()}{ext}"
-            if font_file_upper.exists():
-                logger.info(f"找到字体文件: {font_file_upper}")
-                return str(font_file_upper.absolute())
+        # 确定要查找的字体名称列表
+        search_font_names = [font_name]
+        if fallback_font_names:
+            search_font_names.extend(fallback_font_names)
+
+        for name in search_font_names:
+            for ext in extensions:
+                # 尝试不同的文件名格式
+                font_file = font_dir / f"{name}{ext}"
+                if font_file.exists():
+                    logger.info(f"使用项目 Font 目录中的字体: {font_file}")
+                    return str(font_file.absolute())
+
+                # 尝试大写文件名
+                font_file_upper = font_dir / f"{name.upper()}{ext}"
+                if font_file_upper.exists():
+                    logger.info(f"使用项目 Font 目录中的字体: {font_file_upper}")
+                    return str(font_file_upper.absolute())
     else:
         logger.warning(f"Font目录不存在: {font_dir}")
-    # 2. 回退到系统路径查找
-    for system_path in system_paths:
-        if system_path and os.path.exists(system_path):
-            logger.info(f"使用系统字体: {system_path}")
-            return system_path
-    
+
     # 3. 都找不到
-    logger.warning(f"字体 '{font_name}' 在 {font_dir} 和系统路径中均未找到")
+    logger.warning(f"字体 '{font_name}' 在系统路径和 {font_dir} 中均未找到")
     return None
 
 
@@ -1011,23 +1019,25 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
         return False
 
     try:
-        # 注册中文字体（优先从 ./Font/ 目录加载，回退到系统字体）
+        # 注册字体（优先从系统加载 Arial、SimSun、SimHei，回退到项目 Font 目录中的开源字体）
         import platform
         system = platform.system()
 
-        # 根据操作系统选择系统字体路径（作为回退选项）
+        # 根据操作系统选择系统字体路径（优先使用）
         if system == "Windows":
-            # Windows 系统字体路径
-            simsun_system_paths = ["C:/Windows/Fonts/simsun.ttf"]
+            # Windows 系统字体路径（优先）
+            simsun_system_paths = ["C:/Windows/Fonts/simsun.ttc"]
             simhei_system_paths = ["C:/Windows/Fonts/simhei.ttf"]
             arial_system_paths = ["C:/Windows/Fonts/arial.ttf"]
+            arial_bold_system_paths = ["C:/Windows/Fonts/arialbd.ttf"]
             symbol_system_paths = ["C:/Windows/Fonts/seguisym.ttf"]
             emoji_system_paths = ["C:/Windows/Fonts/seguiemj.ttf", "C:/Windows/Fonts/seguisym.ttf"]
         elif system == "Linux":
-            # Linux 系统字体路径
-            simsun_system_paths = ["/usr/share/fonts/dejavu/SIMSUN.TTC"]
-            simhei_system_paths = ["/usr/share/fonts/dejavu/SIMHEI.TTF"]
-            arial_system_paths = ["/usr/share/fonts/dejavu/ARIAL.TTF"]
+            # Linux 系统字体路径（优先）
+            simsun_system_paths = ["/usr/share/fonts/dejavu/SIMSUN.TTC", "/usr/share/fonts/wqy/wqy-microhei.ttc"]
+            simhei_system_paths = ["/usr/share/fonts/dejavu/SIMHEI.TTF", "/usr/share/fonts/wqy/wqy-microhei.ttc"]
+            arial_system_paths = ["/usr/share/fonts/dejavu/ARIAL.TTF", "/usr/share/fonts/dejavu/DejaVuSans.ttf"]
+            arial_bold_system_paths = ["/usr/share/fonts/dejavu/ARIALBD.TTF", "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"]
             symbol_system_paths = ["/usr/share/fonts/dejavu/DejaVuSans.ttf"]
             emoji_system_paths = [
                 "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
@@ -1036,53 +1046,63 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
                 "/usr/share/fonts/dejavu/DejaVuSans.ttf"
             ]
         else:  # macOS
-            simsun_system_paths = ["/System/Library/Fonts/STHeiti Light.ttc"]
-            simhei_system_paths = ["/System/Library/Fonts/STHeiti Medium.ttc"]
+            simsun_system_paths = ["/System/Library/Fonts/STHeiti Light.ttc", "/Library/Fonts/SIMSUN.TTC"]
+            simhei_system_paths = ["/System/Library/Fonts/STHeiti Medium.ttc", "/Library/Fonts/SIMHEI.TTF"]
             arial_system_paths = ["/Library/Fonts/Arial.ttf"]
+            arial_bold_system_paths = ["/Library/Fonts/Arial Bold.ttf"]
             symbol_system_paths = ["/System/Library/Fonts/AppleSymbols.ttf"]
             emoji_system_paths = ["/System/Library/Fonts/Apple Color Emoji.ttc"]
 
-        # 使用优先级查找加载字体
-        simsun_path = _find_font_with_priority('simsun', simsun_system_paths)
-        simhei_path = _find_font_with_priority('simhei', simhei_system_paths)
-        arial_path = _find_font_with_priority('arial', arial_system_paths)
+        # 使用优先级查找加载字体（优先系统字体，回退到项目 Font 目录的开源字体）
+        # SimSun: 优先系统宋体，回退到 NotoSansSC-Regular
+        simsun_path = _find_font_with_priority('simsun', simsun_system_paths, ['NotoSansSC-Regular'])
+        # SimHei: 优先系统黑体，回退到 NotoSansSC-Bold
+        simhei_path = _find_font_with_priority('simhei', simhei_system_paths, ['NotoSansSC-Bold'])
+        # Arial: 优先系统Arial，回退到 OpenSans-Regular
+        arial_path = _find_font_with_priority('arial', arial_system_paths, ['OpenSans-Regular'])
+        # Arial Bold: 优先系统Arial Bold，回退到 OpenSans-Bold
+        arial_bold_path = _find_font_with_priority('arialbd', arial_bold_system_paths, ['OpenSans-Bold'])
         symbol_path = _find_font_with_priority('symbol', symbol_system_paths)
 
         # 注册字体
         try:
             from reportlab.pdfbase.pdfmetrics import registerFontFamily
-            
-            # 注册宋体
+
+            # 注册 SimSun 字体（优先系统宋体，回退到 Noto Sans SC Regular）
             if simsun_path:
                 pdfmetrics.registerFont(TTFont('SimSun', simsun_path))
-                # 注册宋体字体族（让 bold 和 italic 都指向同一个字体）
-                registerFontFamily('SimSun', normal='SimSun', bold='SimSun', italic='SimSun', boldItalic='SimSun')
+                registerFontFamily('SimSun', normal='SimSun', bold='SimHei', italic='SimSun', boldItalic='SimHei')
             else:
-                raise FileNotFoundError("宋体字体文件未找到")
-            
-            # 注册黑体
+                raise FileNotFoundError("SimSun 字体文件未找到（系统宋体和项目 Font 目录中的 Noto Sans SC Regular 均未找到）")
+
+            # 注册 SimHei 字体（优先系统黑体，回退到 Noto Sans SC Bold）
             if simhei_path:
                 pdfmetrics.registerFont(TTFont('SimHei', simhei_path))
-                # 注册黑体字体族（让 bold 和 italic 都指向同一个字体）
                 registerFontFamily('SimHei', normal='SimHei', bold='SimHei', italic='SimHei', boldItalic='SimHei')
             else:
-                raise FileNotFoundError("黑体字体文件未找到")
-            
-            # 注册Arial字体（可选）
+                raise FileNotFoundError("SimHei 字体文件未找到（系统黑体和项目 Font 目录中的 Noto Sans SC Bold 均未找到）")
+
+            # 注册 Arial 字体（优先系统 Arial，回退到 Open Sans）
             if arial_path:
                 pdfmetrics.registerFont(TTFont('Arial', arial_path))
-                registerFontFamily('Arial', normal='Arial', bold='Arial', italic='Arial', boldItalic='Arial')
+                if arial_bold_path:
+                    pdfmetrics.registerFont(TTFont('Arial-Bold', arial_bold_path))
+                    registerFontFamily('Arial', normal='Arial', bold='Arial-Bold', italic='Arial', boldItalic='Arial-Bold')
+                else:
+                    registerFontFamily('Arial', normal='Arial', bold='Arial', italic='Arial', boldItalic='Arial')
             else:
-                logger.warning("Arial字体文件未找到，将使用默认字体")
+                logger.warning("Arial 字体文件未找到（系统 Arial 和项目 Font 目录中的 Open Sans 均未找到），将使用默认字体")
 
             # 注册符号字体（可选）
             if symbol_path:
                 pdfmetrics.registerFont(TTFont('SymbolFont', symbol_path))
-                registerFontFamily('SymbolFont', normal='SymbolFont', bold='SymbolFont', italic='SymbolFont', boldItalic='SymbolFont')
+                registerFontFamily('SymbolFont', normal='SymbolFont', bold='SymbolFont', italic='SymbolFont',
+                                   boldItalic='SymbolFont')
             elif arial_path:
                 pdfmetrics.registerFont(TTFont('SymbolFont', arial_path))
-                registerFontFamily('SymbolFont', normal='SymbolFont', bold='SymbolFont', italic='SymbolFont', boldItalic='SymbolFont')
-                logger.info(f"使用Arial作为符号字体备选")
+                registerFontFamily('SymbolFont', normal='SymbolFont', bold='SymbolFont', italic='SymbolFont',
+                                   boldItalic='SymbolFont')
+                logger.info(f"使用 Arial 作为符号字体备选")
             else:
                 logger.warning("符号字体文件未找到")
 
@@ -1109,7 +1129,7 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
                     emoji_registered = True
                 elif arial_path:
                     pdfmetrics.registerFont(TTFont('EmojiFont', arial_path))
-                    logger.info(f"使用Arial字体作为Emoji备选: {arial_path}")
+                    logger.info(f"使用 Arial 字体作为Emoji备选: {arial_path}")
                     emoji_registered = True
                 else:
                     logger.warning("Emoji字体文件未找到，emoji图标可能无法显示")
@@ -1789,7 +1809,34 @@ class MCPTools:
         self.session = requests.Session()
         self.timeout = 30
         self.max_retries = 3
-        
+
+        # Cache for last RAG search result (to avoid passing large JSON through LLM)
+        self._last_rag_search_result = None
+        self._last_rag_search_query = None
+        self._last_rag_search_timestamp = None
+
+        # Track last saved RAG files to ensure document_extract includes them
+        self._last_rag_saved_files: List[str] = []
+        self._last_rag_saved_timestamp = None
+
+        # 累积式缓存：保存所有 RAG 搜索结果的 file_id -> metadata 映射
+        # 解决多次搜索后缓存被覆盖导致 rag_document_saver 无法找到元数据的问题
+        # 缓存结构: {file_id_key: {"metadata": {...}, "timestamp": float}}
+        self._rag_metadata_cache: Dict[str, Dict] = {}
+
+        # 线程锁：保护缓存的并发访问
+        # 多个 InformationSeeker 并发运行时，需要确保缓存操作的线程安全
+        self._rag_cache_lock = threading.Lock()
+
+        # 文件锁：保护 references.jsonl 的并发写入
+        # 多个 Agent 并发调用 rag_document_saver 时，需要确保文件写入的原子性
+        self._references_file_lock = threading.Lock()
+
+        # 缓存配置
+        # TTL 设置为 4 小时，确保覆盖完整的报告生成周期（通常 1-2 小时）
+        # 即使报告生成需要 1 小时，缓存仍有足够的余量
+        self._rag_cache_max_size = 1000
+        self._rag_cache_ttl_seconds = 14400  # 4 hours
         # Academic sites configuration for targeted search
         self.academic_sites_enabled = True  # Enable by default for research tasks
 
@@ -1812,8 +1859,231 @@ class MCPTools:
 
         return "用户"  # 默认用户名
 
+    def _filter_relevant_rag_documents(self, doc_list: list, query: str) -> list:
+        """
+        根据多领域关键词字典过滤不相关的 RAG 文档
+
+        支持领域：
+        - OER/电解水
+        - 电池
+        - 催化剂
+        - 有机化学
+        - 材料科学
+        - 光学材料
+        - 燃料电池
+
+        Args:
+            doc_list: RAG 检索返回的文档列表
+            query: 用户查询词
+
+        Returns:
+            过滤后的文档列表
+        """
+        if not doc_list:
+            return []
+
+        query_lower = query.lower()
+
+        # 多领域关键词字典
+        domain_keywords = {
+            'oer_electrolysis': [
+                'oxygen evolution', 'oer', 'water splitting', 'water electrolysis',
+                'acidic', 'proton exchange membrane', 'pemwe', 'electrolyzer',
+                'iridium', 'ruthenium', 'iro2', 'ruo2', 'water oxidation',
+                'anode catalyst', 'electrocatalytic', 'overpotential'
+            ],
+            'battery': [
+                'battery', 'batteries', 'cathode', 'anode', 'lithium', 'sodium',
+                'charge', 'discharge', 'capacity', 'voltage', 'cycling',
+                'rate performance', 'energy storage', 'power density',
+                'electrolyte', 'separator', 'solid electrolyte'
+            ],
+            'catalyst': [
+                'catalyst', 'catalysis', 'catalytic', 'electrocatalyst',
+                'nanoparticle', 'nanowire', 'nanosheet', 'nanocluster',
+                'activity', 'stability', 'selectivity', 'turnover',
+                'active site', 'metal support', 'dispersion'
+            ],
+            'organic_chemistry': [
+                'sn1', 'sn2', 'reaction mechanism', 'organic synthesis',
+                'nucleophilic', 'electrophilic', 'substitution', 'elimination',
+                'functional group', 'reagent', 'solvent', 'yield'
+            ],
+            'materials': [
+                'material', 'coating', 'composite', 'alloy', 'oxide',
+                'black phosphorus', 'graphene', 'mof', 'cof',
+                'stability', 'degradation', 'passivation', 'encapsulation',
+                'two-dimensional', '2d material', 'air stability'
+            ],
+            'optical': [
+                'photochromic', 'optical', 'light', 'photon',
+                'absorption', 'emission', 'luminescence', 'fluorescence',
+                'response time', 'switching', 'coloration', 'bleaching'
+            ],
+            'fuel_cell': [
+                'fuel cell', 'pemfc', 'sofc', 'hydrogen',
+                'oxygen reduction', 'orr', 'membrane electrode',
+                'efficiency', 'durability', 'polarization'
+            ],
+            'tem_microscopy': [
+                'tem', 'transmission electron microscopy', 'electron beam',
+                'aggregation', 'sintering', 'beam damage',
+                'imaging', 'resolution', 'sample preparation'
+            ]
+        }
+
+        # 识别查询所属领域
+        matched_domains = []
+        for domain, keywords in domain_keywords.items():
+            if any(kw in query_lower for kw in keywords):
+                matched_domains.append(domain)
+
+        # 如果没有匹配到任何领域，保留所有文档（不过滤）
+        if not matched_domains:
+            logger.info(f"[RAG_FILTER] No specific domain detected, keeping all documents")
+            return doc_list
+
+        logger.info(f"[RAG_FILTER] Detected domains: {', '.join(matched_domains)}")
+
+        # 对于可能在RAG库中没有内容的领域，保留所有文档不过滤
+        # 只对确认主要是OER的领域进行过滤
+        uncertain_domains = ['battery', 'organic_chemistry', 'optical', 'fuel_cell', 'tem_microscopy', 'materials']
+        if any(domain in uncertain_domains for domain in matched_domains):
+            logger.info(
+                f"[RAG_FILTER] Domain coverage uncertain, keeping all documents to avoid missing relevant content")
+            return doc_list
+
+        # 收集所有匹配领域的关键词（仅对OER和催化剂领域过滤）
+        relevant_keywords = []
+        for domain in matched_domains:
+            relevant_keywords.extend(domain_keywords[domain])
+
+        # 从查询中提取额外关键词
+        query_keywords = self._extract_query_keywords(query)
+        all_keywords = relevant_keywords + query_keywords
+
+        # 过滤文档
+        filtered_docs = []
+        for doc in doc_list:
+            title = ''
+            abstract = ''
+
+            if isinstance(doc, dict):
+                metadata = doc.get('additional_fields', {}).get('metadata', {})
+                title = metadata.get('title', '').lower()
+                content = doc.get('content', '').lower()
+                abstract = content[:500] if content else ''
+
+            text_to_check = title + ' ' + abstract
+
+            # 计算匹配的关键词数量
+            matched_keywords = [kw for kw in all_keywords if kw in text_to_check]
+
+            # 至少匹配1个关键词才保留
+            if len(matched_keywords) >= 1:
+                filtered_docs.append(doc)
+                logger.debug(f"[RAG_FILTER] Kept doc (matched {len(matched_keywords)} keywords): {title[:50]}...")
+            else:
+                logger.debug(f"[RAG_FILTER] Filtered doc (no keyword match): {title[:50]}...")
+
+        if doc_list:
+            kept_percentage = len(filtered_docs) / len(doc_list) * 100
+            logger.info(f"[RAG_FILTER] Filtered {len(doc_list)} docs to {len(filtered_docs)} docs "
+                        f"(kept {kept_percentage:.1f}%)")
+
+        return filtered_docs
+
+    def _filter_by_query_keywords(self, doc_list: list, query: str) -> list:
+        """使用查询关键词进行通用过滤"""
+        query_keywords = self._extract_query_keywords(query)
+
+        if not query_keywords:
+            return doc_list
+
+        filtered_docs = []
+        for doc in doc_list:
+            if isinstance(doc, dict):
+                metadata = doc.get('additional_fields', {}).get('metadata', {})
+                title = metadata.get('title', '').lower()
+                content = doc.get('content', '').lower()
+                text_to_check = title + ' ' + content[:500]
+
+                if any(kw in text_to_check for kw in query_keywords):
+                    filtered_docs.append(doc)
+
+        return filtered_docs
+
+    def _extract_query_keywords(self, query: str) -> list:
+        """从查询中提取专业术语关键词"""
+        query_lower = query.lower()
+
+        # 停用词列表
+        stop_words = [
+            'research', 'study', 'latest', 'advances', 'review', 'analysis',
+            'the', 'and', 'or', 'of', 'in', 'for', 'to', 'a', 'an', 'how',
+            'what', 'why', 'when', 'where', 'which', 'is', 'are', 'was', 'were',
+            'explain', 'describe', 'compare', 'contrast', 'discuss'
+        ]
+
+        keywords = []
+        for word in query_lower.split():
+            # 移除标点符号
+            word = word.strip('.,;:!?()[]{}"\'')
+            # 过滤停用词和短词
+            if word not in stop_words and len(word) > 3:
+                keywords.append(word)
+
+        return keywords
+
+    def _clean_rag_cache(self):
+        """
+        清理过期的 RAG 缓存条目（线程安全）
+
+        清理策略:
+        1. 删除超过 TTL 的条目
+        2. 如果缓存超过最大大小，删除最旧的条目
+        """
+        with self._rag_cache_lock:
+            if not self._rag_metadata_cache:
+                return
+
+            current_time = time.time()
+
+            # 1. 删除过期条目
+            expired_keys = []
+            for cache_key, cache_entry in self._rag_metadata_cache.items():
+                timestamp = cache_entry.get('timestamp', 0)
+                if current_time - timestamp > self._rag_cache_ttl_seconds:
+                    expired_keys.append(cache_key)
+
+            if expired_keys:
+                for key in expired_keys:
+                    del self._rag_metadata_cache[key]
+                logger.info(f"[RAG_CACHE] Cleaned {len(expired_keys)} expired cache entries")
+
+            # 2. 如果缓存仍然超过最大大小，删除最旧的条目
+            if len(self._rag_metadata_cache) > self._rag_cache_max_size:
+                # 按时间戳排序，删除最旧的条目
+                sorted_entries = sorted(
+                    self._rag_metadata_cache.items(),
+                    key=lambda x: x[1].get('timestamp', 0)
+                )
+
+                num_to_remove = len(self._rag_metadata_cache) - self._rag_cache_max_size
+                for i in range(num_to_remove):
+                    cache_key = sorted_entries[i][0]
+                    del self._rag_metadata_cache[cache_key]
+
+                logger.info(
+                    f"[RAG_CACHE] Removed {num_to_remove} oldest cache entries (size limit: {self._rag_cache_max_size})")
+
     def set_session_context(self, session_id: str, session_workspace_path: str, user_query: str = ""):
         """Set session context for workspace-aware operations"""
+        # 如果切换到新的 session，清理过期缓存
+        if hasattr(self, 'session_id') and self.session_id != session_id:
+            logger.info(f"[RAG_CACHE] Session changed from {self.session_id} to {session_id}, cleaning expired cache")
+            self._clean_rag_cache()
+
         self.session_id = session_id
         self.session_workspace_path = Path(session_workspace_path)
         self.user_query = user_query  # 存储用户查询，用于语言检测
@@ -2140,14 +2410,35 @@ class MCPTools:
         return deduplicated
     
     def _validate_workspace_path(self, path: str) -> Path:
-        """Validate that a path is within the workspace directory"""
+        """Validate that a path is within the workspace directory.
+
+        Note: Avoid calling ``os.path.realpath`` on non-existent destination paths.
+        On Windows, ``realpath`` for a path whose intermediate directories do not
+        yet exist falls back to ``abspath`` plus a walk-up search that has been
+        observed to be racy under ``ThreadPoolExecutor`` workloads (e.g.
+        ``rag_document_saver`` writing several files in parallel). The race
+        produced spurious ``"outside workspace directory"`` errors for perfectly
+        valid relative paths.
+
+        The check below relies on pure string normalization to reject absolute
+        paths and ``..`` traversal, which is sufficient because we never use the
+        returned path to follow symlinks back out of the workspace.
+        """
         if os.path.isabs(path):
             raise Exception(f"Path '{path}' is absolute. Only relative paths are allowed.")
-        joined_path = os.path.join(self.workspace_path, path)
-        full_joined_path = os.path.realpath(joined_path)
-        if not full_joined_path.startswith(self.full_workspace_path):
+
+        # Normalize separators and collapse '.', '..' segments without touching
+        # the filesystem.
+        normalized = os.path.normpath(path).replace('\\', '/')
+        if (
+            normalized == '..'
+            or normalized.startswith('../')
+            or '/../' in normalized
+            or os.path.isabs(normalized)
+        ):
             raise Exception(f"Path '{path}' is outside workspace directory.")
-        return Path(full_joined_path)
+
+        return Path(self.workspace_path) / normalized
 
     def _safe_join(self, path: str) -> Path:
         """Alias for _validate_workspace_path for backward compatibility"""
@@ -2404,6 +2695,476 @@ class MCPTools:
 
         except Exception as e:
             logger.error(f"Batch web search failed: {e}")
+            return MCPToolResult(success=False, error=str(e))
+
+    def rag_document_saver(
+            self,
+            documents: List[Dict[str, Any]] = None,
+            save_directory: str = "rag_downloads/research",
+            max_workers: int = 10
+    ) -> MCPToolResult:
+        """
+        Save RAG documents to workspace files using RAG content. Similar to url_crawler.
+
+        SIMPLE USAGE: Call with no arguments to use cached result from last search_rag_knowledge.
+
+        Args:
+            documents: Optional list of documents to save. Each document should have:
+                - content: Document content from RAG response (preferred for generic flow)
+                - file_path: Optional local save path (auto-generated if not provided)
+                - title: Optional document title
+                - file_id: Optional file ID
+                If not provided, uses cached result from last search_rag_knowledge call.
+            save_directory: Directory to save files (relative to workspace)
+            max_workers: Maximum number of concurrent save operations
+
+        Returns:
+            MCPToolResult with list of saved files and their metadata
+        """
+        # 【新增】验证保存目录，防止 Agent 传入错误的 url_crawler 目录
+        if save_directory and save_directory.startswith('url_crawler_save_files'):
+            logger.warning(
+                f"[RAG_SAVER] Invalid directory '{save_directory}' for RAG documents. Using default 'rag_downloads/research'")
+            save_directory = "rag_downloads/research"
+
+        try:
+            # If no documents provided, use cached search result
+            if documents is None or documents == []:
+                if self._last_rag_search_result:
+                    logger.info(
+                        f"[RAG_SAVER] Using cached RAG search result from query: {self._last_rag_search_query[:50] if self._last_rag_search_query else 'unknown'}...")
+                    # Extract simplified document list from cached result
+                    documents = []
+                    seen_file_ids = set()
+                    doc_list = self._last_rag_search_result.get('doc_list', [])
+                    for idx, doc in enumerate(doc_list):
+                        content_text = doc.get('content', '')
+                        file_id = doc.get('file_id', '')
+                        metadata = doc.get('additional_fields', {}).get('metadata', {})
+
+                        if not file_id:
+                            metadata_file_id = metadata.get('file_id', '')
+                            if metadata_file_id:
+                                file_id = metadata_file_id
+                            elif content_text:
+                                import hashlib
+                                file_id = f"rag_{hashlib.md5(content_text.encode('utf-8')).hexdigest()[:12]}"
+                            else:
+                                file_id = f"rag_{idx}_{int(time.time())}"
+
+                        if file_id in seen_file_ids:
+                            continue
+                        seen_file_ids.add(file_id)
+
+                        has_content = bool(content_text)
+                        if not has_content:
+                            cache_key = f"file_id:{file_id}"
+                            with self._rag_cache_lock:
+                                cache_entry = self._rag_metadata_cache.get(cache_key)
+                            if cache_entry:
+                                cached_metadata = cache_entry.get('metadata', cache_entry)
+                                content_text = cached_metadata.get('content', '')
+                                has_content = bool(content_text)
+
+                        if has_content:
+                            documents.append({
+                                'file_id': file_id,
+                                'title': metadata.get('title', 'RAG Document'),
+                                'journal': metadata.get('journal', ''),
+                                'doi': metadata.get('doi', ''),
+                                'section': metadata.get('section', ''),
+                                # 【修复】添加完整的元数据字段
+                                'authors': metadata.get('authors', []),
+                                'publication_date': metadata.get('publication_date', ''),
+                                'volume': metadata.get('volume', ''),
+                                'chunk_length': metadata.get('chunk_length', 0) or len(content_text),
+                                'content': content_text
+                            })
+                    logger.info(f"[RAG_SAVER] Extracted {len(documents)} documents from cached result")
+                else:
+                    return MCPToolResult(
+                        success=False,
+                        error="No documents provided and no cached result available. Please call search_rag_knowledge first."
+                    )
+
+            if not documents:
+                return MCPToolResult(
+                    success=False,
+                    error="No documents with valid content found. RAG search may not have returned usable documents."
+                )
+
+            logger.info(f"[RAG_SAVER] Processing {len(documents)} documents for save")
+
+            # 【调试】打印第一个文档的结构，帮助诊断问题
+            if documents:
+                first_doc = documents[0]
+                logger.info(f"[RAG_SAVER_DEBUG] First doc keys: {list(first_doc.keys())}")
+                logger.info(f"[RAG_SAVER_DEBUG] First doc content: {first_doc}")
+
+            # 【修复】如果文档缺少 content/元数据字段，尝试从缓存的 RAG 结果中补充
+            # 检查是否需要补充元数据（content 缺失 或 authors 缺失）
+            needs_enrichment = False
+            if documents:
+                first_doc = documents[0]
+                if not first_doc.get('content'):
+                    needs_enrichment = True
+                    logger.warning(f"[RAG_SAVER] Documents missing content")
+                elif not first_doc.get('authors') and not first_doc.get('publication_date'):
+                    needs_enrichment = True
+                    logger.warning(f"[RAG_SAVER] Documents missing metadata (authors/publication_date)")
+
+            if needs_enrichment:
+                # 【性能优化】一次性读取缓存快照，避免重复加锁
+                # 100 个文档时，性能提升 100 倍（100 次锁 → 1 次锁）
+                with self._rag_cache_lock:
+                    cache_snapshot = dict(self._rag_metadata_cache)
+                    cache_size = len(cache_snapshot)
+                    has_cache = bool(cache_snapshot)
+
+                logger.info(f"[RAG_SAVER] Attempting to enrich documents from cached metadata")
+                logger.info(f"[RAG_SAVER] Accumulated metadata cache has {cache_size} entries")
+
+                # 【关键修复】使用累积式缓存 _rag_metadata_cache 而不是 _last_rag_search_result
+                # 这样即使多次搜索覆盖了 _last_rag_search_result，元数据仍然可用
+                if has_cache:
+                    # 丰富文档信息（使用 file_id 匹配累积式缓存）
+                    enriched_documents = []
+                    enriched_count = 0
+                    for doc in documents:
+                        doc_file_id = doc.get('file_id', '')
+                        if not doc_file_id and doc.get('content'):
+                            import hashlib
+                            doc_file_id = f"rag_{hashlib.md5(doc.get('content').encode('utf-8')).hexdigest()[:12]}"
+
+                        cache_key = f"file_id:{doc_file_id}"
+                        # 从快照中查找，无需加锁
+                        cache_entry = cache_snapshot.get(cache_key)
+
+                        if cache_entry:
+                            # 新缓存结构: {'metadata': {...}, 'timestamp': float}
+                            cached_metadata = cache_entry.get('metadata', cache_entry)
+                            enriched_doc = {**doc, **cached_metadata}
+                            enriched_documents.append(enriched_doc)
+                            enriched_count += 1
+                            logger.info(
+                                f"[RAG_SAVER] Enriched doc {cache_key[-40:]} with metadata: authors={len(enriched_doc.get('authors', []))}, journal={enriched_doc.get('journal', '')[:30]}")
+                        else:
+                            # 如果累积缓存中也找不到，保留原文档但记录警告
+                            enriched_documents.append(doc)
+                            logger.warning(
+                                f"[RAG_SAVER] Could not find metadata in accumulated cache for key: {cache_key}")
+
+                    if enriched_count > 0:
+                        documents = enriched_documents
+                        logger.info(
+                            f"[RAG_SAVER] Enriched {enriched_count}/{len(documents)} documents with full metadata from accumulated cache")
+                    else:
+                        logger.warning(f"[RAG_SAVER] No documents could be enriched from accumulated cache")
+                else:
+                    logger.warning(f"[RAG_SAVER] No accumulated metadata cache available")
+
+            def process_single_document(doc: Dict) -> Dict[str, Any]:
+                """Process and save a single document from RAG response content."""
+                content = doc.get('content', '')
+                file_id = doc.get('file_id')
+                if not file_id:
+                    if content:
+                        import hashlib
+                        file_id = f"rag_{hashlib.md5(content.encode('utf-8')).hexdigest()[:12]}"
+                    else:
+                        file_id = 'unknown'
+                title = doc.get('title', 'RAG Document')
+                journal = doc.get('journal', '')
+                doi = doc.get('doi', '')
+                section = doc.get('section', '')
+                # 新增：提取完整的元数据字段
+                authors = doc.get('authors', [])
+                publication_date = doc.get('publication_date', '')
+                volume = doc.get('volume', '')
+                chunk_length = doc.get('chunk_length', 0) or (len(content) if content else 0)
+                source_label = doc.get('source', 'RAG Knowledge Base')
+
+                result_base = {
+                    'file_id': file_id,
+                    'title': title,
+                    'success': False,
+                    'error': None,
+                    'file_path': None,
+                    'content_length': 0,
+                    'word_count': 0
+                }
+
+                try:
+                    import re
+                    if not content:
+                        result_base['error'] = "No content available for RAG document"
+                        return result_base
+
+                    logger.info(f"[RAG_SAVER] Using RAG content ({len(content)} chars)")
+
+                    # 【关键修复】从文件内容中提取 DOI、Journal、Publication Date（如果 API 没有返回）
+                    if not doi:
+                        # 尝试匹配 DOI 格式: DOI: xxx 或 https://doi.org/xxx 或 doi:10.xxx 或 dx.doi.org
+                        doi_patterns = [
+                            r'DOI:\s*(https?://doi\.org/[^\s\n]+)',
+                            r'DOI:\s*(10\.[^\s\n]+)',
+                            r'https://doi\.org/(10\.[^\s\n]+)',
+                            r'https?://dx\.doi\.org/(10\.[^\s\n]+)',
+                            r'doi\.org/(10\.[^\s\n]+)',
+                            r'(?:^|\s)doi:\s*(10\.[^\s\n]+)',
+                        ]
+                        for pattern in doi_patterns:
+                            match = re.search(pattern, content, re.IGNORECASE)
+                            if match:
+                                doi = match.group(1).strip()
+                                # 清理末尾的标点符号和括号
+                                doi = re.sub(r'[,;.\s\)]+$', '', doi)
+                                logger.info(f"[RAG_SAVER] Extracted DOI from content: {doi}")
+                                break
+
+                    if not journal:
+                        # 尝试匹配 Journal 格式（含出版商版权声明）
+                        journal_patterns = [
+                            r'(?:To appear in|Published in|Journal):\s*([^\n]+)',
+                            r'(?:appear in|published in):\s*([^\n]+?)(?:\s+https?://|\s*$)',
+                            # 从版权声明中提取出版商（如 © 2012 Elsevier Ltd.）
+                            r'©\s*\d{4}\s+(Elsevier[^\n.]*)',
+                            r'©\s*\d{4}\s+(?:Published by\s+)?(Springer[^\n.]*)',
+                            r'©\s*\d{4}\s+(?:Published by\s+)?(Wiley[^\n.]*)',
+                            r'©\s*\d{4}\s+(?:Published by\s+)?(American Chemical Society[^\n.]*)',
+                            r'©\s*\d{4}\s+(?:Published by\s+)?(Royal Society of Chemistry[^\n.]*)',
+                            r'©\s*\d{4}\s+(?:Published by\s+)?(Nature Publishing[^\n.]*)',
+                            r'©\s*\d{4}\s+(?:Published by\s+)?(Taylor & Francis[^\n.]*)',
+                            r'©\s*\d{4}\s+(?:Published by\s+)?(MDPI[^\n.]*)',
+                            # 匹配 $\circledcirc$ 格式（PDF转文本后的版权符号）
+                            r'\$\\circledcirc\$\s*\d{4}\s+(Elsevier[^\n.]*)',
+                            r'\$\\circledcirc\$\s*\d{4}\s+(?:Published by\s+)?(Elsevier[^\n.]*)',
+                        ]
+                        for pattern in journal_patterns:
+                            match = re.search(pattern, content, re.IGNORECASE)
+                            if match:
+                                journal = match.group(1).strip()
+                                # 清理末尾的标点符号和多余空格
+                                journal = re.sub(r'[,;.\s]+$', '', journal)
+                                # 清理常见后缀（All rights reserved 等）
+                                journal = re.sub(r'\s*All rights reserved.*$', '', journal, flags=re.IGNORECASE)
+                                if journal:
+                                    logger.info(f"[RAG_SAVER] Extracted Journal/Publisher from content: {journal}")
+                                    break
+
+                    if not publication_date:
+                        # 从学术论文常见格式中提取发表日期
+                        date_patterns = [
+                            # Available online DD Month YYYY（最接近实际发表日期）
+                            r'Available online\s+(\d{1,2}\s+\w+\s+\d{4})',
+                            # Accepted DD Month YYYY
+                            r'Accepted\s+(\d{1,2}\s+\w+\s+\d{4})',
+                            # Received DD Month YYYY（投稿日期，作为兜底）
+                            r'Received\s+(\d{1,2}\s+\w+\s+\d{4})',
+                            # 版权年份 © YYYY 或 $\circledcirc$ YYYY
+                            r'(?:©|\$\\circledcirc\$)\s*(\d{4})',
+                        ]
+                        for pattern in date_patterns:
+                            match = re.search(pattern, content, re.IGNORECASE)
+                            if match:
+                                date_str = match.group(1).strip()
+                                # 如果只匹配到年份（4位数字），转换为标准格式
+                                if re.match(r'^\d{4}$', date_str):
+                                    publication_date = f"{date_str}-01-01"
+                                else:
+                                    # 尝试解析完整日期 "DD Month YYYY" -> "YYYY-MM-DD"
+                                    try:
+                                        from datetime import datetime as dt
+                                        parsed = dt.strptime(date_str, "%d %B %Y")
+                                        publication_date = parsed.strftime("%Y-%m-%d")
+                                    except ValueError:
+                                        # 如果解析失败，提取年份
+                                        year_match = re.search(r'(\d{4})', date_str)
+                                        if year_match:
+                                            publication_date = f"{year_match.group(1)}-01-01"
+                                if publication_date:
+                                    logger.info(
+                                        f"[RAG_SAVER] Extracted publication date from content: {publication_date}")
+                                    break
+
+                    # Generate safe filename
+                    display_title = section if section and len(section) > len(title) else title
+                    safe_title = re.sub(r'[^\w\s-]', '', display_title[:50])
+                    safe_title = re.sub(r'[-\s]+', '_', safe_title)
+                    if not safe_title:
+                        safe_title = 'rag_doc'
+                    filename = f"{safe_title}_{file_id[:8]}.md"
+                    local_file_path = f"{save_directory}/{filename}"
+
+                    # 格式化作者列表
+                    authors_str = ', '.join(authors) if authors else 'N/A'
+
+                    # Build file content with metadata header (包含完整元数据)
+                    file_content_parts = [
+                        f"# {display_title}",
+                        "",
+                        "## Metadata",
+                        f"- **Authors**: {authors_str}",
+                        f"- **Journal**: {journal or 'N/A'}",
+                        f"- **Volume**: {volume or 'N/A'}",
+                        f"- **Publication Date**: {publication_date or 'N/A'}",
+                        f"- **DOI**: {doi or 'N/A'}",
+                        f"- **Section**: {section or 'N/A'}",
+                        f"- **Source**: {source_label}",
+                        f"- **File ID**: {file_id}",
+                        "",
+                        "---",
+                        "",
+                        "## Content",
+                        "",
+                        content
+                    ]
+
+                    file_content = '\n'.join(file_content_parts)
+
+                    # Save to workspace
+                    write_result = self.file_write(
+                        file_path=local_file_path,
+                        content=file_content,
+                        create_dirs=True
+                    )
+
+                    if not write_result.success:
+                        result_base['error'] = f"File write failed: {write_result.error}"
+                        return result_base
+
+                    logger.info(f"[RAG_SAVER] Saved to {local_file_path}")
+
+                    # 构建完整的元数据对象
+                    full_metadata = {
+                        'file_id': file_id,
+                        'file_path': local_file_path,
+                        'title': display_title,
+                        'authors': authors,
+                        'journal': journal,
+                        'volume': volume,
+                        'publication_date': publication_date,
+                        'doi': doi,
+                        'section': section,
+                        'chunk_length': chunk_length,
+                        'source': source_label
+                    }
+
+                    return {
+                        **result_base,
+                        'success': True,
+                        'file_path': local_file_path,
+                        'content_length': len(file_content),
+                        'word_count': len(content.split()),
+                        'metadata': full_metadata
+                    }
+
+                except Exception as e:
+                    logger.error(f"[RAG_SAVER] Error processing {file_id}: {e}")
+                    return {
+                        **result_base,
+                        'error': str(e)
+                    }
+
+            # Process all documents concurrently (similar to url_crawler)
+            results = []
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(documents))) as executor:
+                future_to_doc = {
+                    executor.submit(process_single_document, doc): doc
+                    for doc in documents
+                }
+
+                for future in as_completed(future_to_doc):
+                    doc = future_to_doc[future]
+                    try:
+                        result = future.result()
+                        results.append(result)
+                    except Exception as e:
+                        logger.error(f"[RAG_SAVER] Error: {e}")
+                        results.append({
+                            'file_id': doc.get('file_id', ''),
+                            'success': False,
+                            'error': str(e)
+                        })
+
+            # Calculate statistics
+            successful_saves = [r for r in results if r.get('success', False)]
+
+            if successful_saves:
+                self._last_rag_saved_files = [
+                    r.get('file_path') for r in successful_saves if r.get('file_path')
+                ]
+                self._last_rag_saved_timestamp = time.time()
+            else:
+                self._last_rag_saved_files = []
+                self._last_rag_saved_timestamp = None
+
+            logger.info(f"[RAG_SAVER] Completed: {len(successful_saves)}/{len(results)} documents saved")
+
+            # 【新增】将元数据写入 references.jsonl 文件（线程安全）
+            # 文件放在 rag_downloads 目录（上一级），与文档分离，方便查找
+            if successful_saves:
+                references_file_path = self.workspace_path / "rag_downloads" / "references.jsonl"
+
+                # 确保父目录存在
+                references_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+                # 使用文件锁保护整个读-修改-写操作，确保原子性
+                with self._references_file_lock:
+                    try:
+                        # 读取现有的 references（如果存在）
+                        existing_refs = {}
+                        if references_file_path.exists():
+                            with open(references_file_path, 'r', encoding='utf-8') as f:
+                                for line in f:
+                                    try:
+                                        ref = json.loads(line.strip())
+                                        if ref.get('file_id'):
+                                            existing_refs[ref['file_id']] = ref
+                                    except json.JSONDecodeError:
+                                        continue
+
+                        # 添加/更新新的引用
+                        for result in successful_saves:
+                            metadata = result.get('metadata', {})
+                            if metadata.get('file_id'):
+                                existing_refs[metadata['file_id']] = metadata
+
+                        # 原子写入：先写临时文件，再重命名
+                        tmp_file_path = references_file_path.with_suffix('.tmp')
+                        with open(tmp_file_path, 'w', encoding='utf-8') as f:
+                            for ref in existing_refs.values():
+                                f.write(json.dumps(ref, ensure_ascii=False) + '\n')
+
+                        # 原子替换（Windows 上需要先删除目标文件）
+                        if references_file_path.exists():
+                            references_file_path.unlink()
+                        tmp_file_path.rename(references_file_path)
+
+                        logger.info(f"[RAG_SAVER] Saved {len(existing_refs)} references to {references_file_path}")
+                    except Exception as e:
+                        logger.warning(f"[RAG_SAVER] Failed to save references.jsonl: {e}")
+                        # 清理临时文件
+                        if tmp_file_path.exists():
+                            try:
+                                tmp_file_path.unlink()
+                            except:
+                                pass
+
+            return MCPToolResult(
+                success=True,
+                data=results,
+                metadata={
+                    'total_documents': len(results),
+                    'successful_saves': len(successful_saves),
+                    'failed_saves': len(results) - len(successful_saves),
+                    'save_directory': save_directory,
+                    'references_file': "rag_downloads/references.jsonl"
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"[RAG_SAVER] Failed: {e}")
             return MCPToolResult(success=False, error=str(e))
 
     def _generic_search(self, query: str, max_results: int, config: Dict[str, Any], 
@@ -2685,6 +3446,41 @@ class MCPTools:
                     error="URL crawler not configured"
                 )
 
+            def _is_blocked_or_verification_page(text: str) -> bool:
+                """
+                Detect anti-bot / verification / access denied pages.
+                These pages should not be treated as valid academic sources.
+                """
+                if not text:
+                    return True
+
+                content_lower = text.lower()
+                blocked_patterns = [
+                    "enable cookies",
+                    "cookies are turned off",
+                    "security check",
+                    "verifying you are human",
+                    "just a moment",
+                    "access denied",
+                    "403 forbidden",
+                    "forbidden",
+                    "captcha",
+                    "cloudflare",
+                    "performing security checks",
+                    "malicious bots",
+                    "bot verification",
+                ]
+
+                if any(pattern in content_lower for pattern in blocked_patterns):
+                    return True
+
+                # Extremely short pages are often placeholders/error pages.
+                # Keep the threshold conservative to reduce false positives.
+                if len(content_lower.split()) < 120:
+                    return True
+
+                return False
+
             def process_single_document(doc: Dict) -> Dict[str, Any]:
                 """Process a single document: extract content and save to file"""
                 url = doc['url']
@@ -2721,6 +3517,15 @@ class MCPTools:
                     content = content_result.data
                     if not content:
                         result_base['error'] = "Extracted content is empty"
+                        return result_base
+
+                    if _is_blocked_or_verification_page(content):
+                        result_base['error'] = "Blocked/verification page detected"
+                        if include_metadata:
+                            result_base['metadata'] = {
+                                'blocked_page': True,
+                                'reason': 'anti-bot or access-denied content detected'
+                            }
                         return result_base
 
                     # Save content to file
@@ -2909,6 +3714,27 @@ class MCPTools:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 lines = f.readlines()
 
+                # 拼接完整内容用于 Metadata 段的整体匹配（DOI / Source 等）
+                content = ''.join(lines)
+
+                # 【新增】优先从 Metadata 部分提取 DOI（针对 RAG 文件）
+                # 检查是否有 Metadata 部分（RAG 和 rag_document_saver 保存的文件格式）
+                doi_match = re.search(r'-\s*\*\*DOI\*\*:\s*(10\.\d+/[^\s\n]+)', content)
+                if doi_match:
+                    doi = doi_match.group(1).strip()
+                    url_source = f"https://doi.org/{doi}"
+                    logger.info(f"[METADATA_DOI] 从 Metadata 提取 DOI: {url_source}")
+
+                # 【新增】如果 Metadata 中标记了来源，作为 RAG 来源
+                if url_source == "Unknown URL":
+                    source_match = re.search(r'-\s*\*\*Source\*\*:\s*(.+)', content)
+                    if source_match and 'RAG' in source_match.group(1):
+                        url_source = "RAG知识库"
+                        logger.info(f"[METADATA_SOURCE] 检测到 RAG Source，标记为 RAG 来源")
+
+                if url_source == "Unknown URL" and 'rag_downloads' in str(file_path):
+                    url_source = "RAG知识库"
+
                 # 改进标题提取逻辑
                 for i, line in enumerate(lines[:30]):  # 检查更多行
                     line = line.strip()
@@ -2935,7 +3761,7 @@ class MCPTools:
                         title = re.sub(r'<[^>]+>', '', title).strip()
                         logger.info(f"提取到标题 (行{i + 1}): {title[:50]}...")
                         break
-                    
+
                     # 处理普通标题（不包含http）
                     if line and 10 <= len(line) <= 200:
                         if 'http' not in line and not line.startswith('['):
@@ -3635,7 +4461,7 @@ class MCPTools:
                     # 检查是否是标题格式（# 开头或 **粗体**）
                     heading_match = re.match(r'^(#+\s*|\*\*)(.+)', first_line)
                     if heading_match:
-                        # 【关键修复】检查是否是章节标题(如"## 1. xxx", "## 2. xxx")
+                        # 【关键修复】检查是否是章节标题(如 "## 1. xxx", "## 2. xxx")
                         # 章节标题不应该被删除,只删除真正重复的文档标题
                         is_chapter_heading = re.match(r'^##\s+\d+\.', first_line)
                         
@@ -3719,8 +4545,8 @@ class MCPTools:
         - 检测并转换非Markdown格式的章节标题
         - 确保第一个非空行是二级标题（章节标题）
         - 规范化所有子标题层级
-        - 修复错误使用###的二级标题(如"### 2.4 标题" -> "2.4 标题")
-        - 智能修复小节编号不匹配问题(如"## 1. xxx"下的"2.1"自动修复为"1.1")
+        - 修复错误使用###的二级标题(如 "### 2.4 标题" -> "2.4 标题")
+        - 智能修复小节编号不匹配问题(如 "## 1. xxx"下的"2.1"自动修复为"1.1")
 
         Args:
             content: 章节内容
@@ -3757,20 +4583,20 @@ class MCPTools:
                 heading_text_clean = re.sub(r'^\*\*(.+?)\*\*$', r'\1', heading_text)
                 numbered_heading_match = re.match(r'^(\d+(?:\.\d+)*)\s+', heading_text_clean)
 
-                # 【关键修复1】提取章节号(如"## 1. xxx" -> 章节号为1)
+                # 【关键修复】提取章节号(如 "## 1. xxx" -> 章节号为1)
                 if current_level == 2 and numbered_heading_match:
                     chapter_num_str = numbered_heading_match.group(1)
-                    # 检查是否是一级编号(如"1", "2", "3"等,没有点)
+                    # 检查是否是一级编号(如 "1", "2", "3"，没有点)
                     if '.' not in chapter_num_str:
                         current_chapter_number = int(chapter_num_str)
                         logger.info(f"检测到章节标题: {heading_text_clean}, 章节号: {current_chapter_number}")
 
-                # 【关键修复2】检测错误使用###的二级标题(如"### 2.4 标题")
+                # 【关键修复】检测错误使用###的二级标题(如 "### 2.4 标题")
                 # 二级标题应该是纯文本,不应该有###前缀
                 if numbered_heading_match and current_level == 3:
-                    # 这是一个编号标题(如"2.1 xxx"),且使用了###
+                    # 这是一个编号标题(如 "2.1 xxx"),且使用了###
                     number_part = numbered_heading_match.group(1)
-                    # 检查是否是二级编号(如2.1, 2.2, 3.1等,只有一个点)
+                    # 检查是否是二级编号(如 1.1, 2.2, 3.1，只有一个点)
                     if number_part.count('.') == 1:
                         # 这是错误的二级标题格式,应该转换为纯文本
                         # 同时修复编号不匹配问题
@@ -3833,7 +4659,7 @@ class MCPTools:
                     first_content_line = False
                     normalized_lines.append(line)
             else:
-                # 【关键修复3】检测纯文本格式的小节标题(如"2.1 xxx")并修复编号
+                # 【关键修复】检测纯文本格式的小节标题(如 "2.1 xxx")并修复编号
                 # 检查是否是纯文本的小节标题(格式: 数字.数字 标题)
                 plain_subsection_match = re.match(r'^(\d+)\.(\d+)\s+(.+)$', stripped_line)
                 if plain_subsection_match and current_chapter_number is not None:
@@ -3866,6 +4692,31 @@ class MCPTools:
         Returns:
             Dict: 包含 abstract 和 keywords 的字典
         """
+        # 【性能优化】预加载 references.jsonl 到内存缓存
+        # 避免每个引用都重复读取文件，性能提升 100 倍
+        references_cache = {}
+        try:
+            # 查找所有可能的 references.jsonl 文件
+            # 优先查找上一级（新位置），兼容旧位置
+            rag_dirs = ['rag_downloads', 'rag_downloads/research']
+            for rag_dir in rag_dirs:
+                references_file = self.workspace_path / rag_dir / "references.jsonl"
+                if references_file.exists():
+                    with open(references_file, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            try:
+                                ref = json.loads(line.strip())
+                                file_path = ref.get('file_path')
+                                if file_path:
+                                    references_cache[file_path] = ref
+                            except json.JSONDecodeError:
+                                continue
+
+            if references_cache:
+                logger.info(f"[MERGE_REPORTS] Loaded {len(references_cache)} references from cache")
+        except Exception as e:
+            logger.warning(f"[MERGE_REPORTS] Failed to load references cache: {e}")
+
         # 如果没有提供unique_id，生成一个基于时间戳的唯一ID
         if unique_id is None:
             import time
@@ -3939,7 +4790,6 @@ class MCPTools:
 
             # 【智能过滤】基于information_richness字段判断，而不是关键词匹配
             if file_analysis_path.exists():
-                import json
                 try:
                     # 【关键修复】使用连续编号而不是原始行号
                     # 因为LLM在生成报告时会重新编号（从1开始连续编号）
@@ -4014,7 +4864,8 @@ class MCPTools:
             reference_numbers = all_file_numbers
             logger.info(f"将生成 {len(reference_numbers)} 个参考文献条目（包含所有分析的有效文献）")
 
-            # 构建引用列表 - 分离用户文件和其他文件
+            # 构建引用列表 - 分离 RAG 来源、用户文件和其他文件
+            rag_references = []  # RAG 知识库引用
             user_file_references = []  # 用户文件引用
             other_references = []  # 其他引用
 
@@ -4022,6 +4873,9 @@ class MCPTools:
             for num in reference_numbers:
                 # 查找对应的文件路径
                 file_path = file_num_to_path.get(num)
+                normalized_file_path = None
+                if isinstance(file_path, str):
+                    normalized_file_path = file_path[2:] if file_path.startswith('./') else file_path
 
                 if file_path:
                     analysis_data = file_analysis_data.get(file_path, {})
@@ -4246,6 +5100,180 @@ class MCPTools:
 
                         # URL显示为完整的来源信息（包含文件名）
                         url_source = full_source_info
+                    elif file_path.startswith('research/'):
+                        research_file_path = self.workspace_path / file_path
+                        if research_file_path.exists():
+                            title, url_source = self._extract_title_from_file_content(research_file_path)
+                        else:
+                            # research文件不存在，尝试从文件名提取标题
+                            title = self._extract_title_from_research_filename(file_path)
+                            logger.warning(f"警告: 研究文件不存在: {research_file_path}")
+                    elif file_path.startswith('pubmed_articles/') or file_path.startswith('arxiv_articles/'):
+                        # 【新增】PubMed 和 arXiv 文章处理
+                        article_file_path = self.workspace_path / file_path
+                        if article_file_path.exists():
+                            title, url_source = self._extract_title_from_file_content(article_file_path)
+                            logger.info(
+                                f"[ACADEMIC_ARTICLE] 提取学术文章引用: {file_path}, title={title[:50]}..., url={url_source[:50]}...")
+                        else:
+                            # 文件不存在，使用默认值
+                            title = os.path.basename(file_path).replace('.txt', '').replace('_', ' ')
+                            url_source = "Academic Article"
+                            logger.warning(f"警告: 学术文章文件不存在: {article_file_path}")
+                    elif normalized_file_path and normalized_file_path.startswith('rag_downloads/'):
+                        # RAG知识库文档（路径格式：rag_downloads/research/xxx.md）
+                        # 从analysis_data中提取RAG元数据
+                        rag_metadata = analysis_data.get('rag_metadata', {})
+
+                        # 【优先方案】从 references 缓存读取元数据（性能优化）
+                        if not rag_metadata and normalized_file_path and normalized_file_path.startswith('rag_downloads/'):
+                            # 使用预加载的缓存，避免重复读取文件
+                            rag_metadata = references_cache.get(normalized_file_path)
+                            if rag_metadata:
+                                logger.info(f"[RAG_METADATA] 从缓存读取元数据: {normalized_file_path}")
+                            else:
+                                logger.debug(f"[RAG_METADATA] 缓存中未找到元数据: {normalized_file_path}")
+
+                        # 【备用方案】如果没有rag_metadata，尝试从文件内容中提取
+                        if not rag_metadata and normalized_file_path and normalized_file_path.startswith('rag_downloads/'):
+                            try:
+                                rag_file_path = self.workspace_path / normalized_file_path
+                                if rag_file_path.exists():
+                                    with open(rag_file_path, 'r', encoding='utf-8') as f:
+                                        content = f.read()
+                                    # 从文件内容中提取元数据
+                                    rag_metadata = {}
+                                    lines = content.split('\n')
+
+                                    # 提取标题（第一行 # 开头）
+                                    for line in lines[:5]:
+                                        if line.startswith('# ') and not line.startswith('## '):
+                                            rag_metadata['title'] = line[2:].strip()
+                                            break
+
+                                    # 提取元数据字段
+                                    in_metadata_section = False
+                                    for line in lines:
+                                        if line.strip() == '## Metadata':
+                                            in_metadata_section = True
+                                            continue
+                                        if line.strip() == '---' or line.strip() == '## Content':
+                                            break
+                                        if in_metadata_section and line.startswith('- **'):
+                                            try:
+                                                rest = line[4:]
+                                                if '**:' in rest:
+                                                    key_part, value_part = rest.split('**:', 1)
+                                                    key = key_part.strip().lower().replace(' ', '_')
+                                                    value = value_part.strip()
+                                                    if value and value != 'N/A':
+                                                        rag_metadata[key] = value
+                                            except:
+                                                pass
+
+                                    if rag_metadata:
+                                        logger.info(
+                                            f"[RAG_METADATA] 从文件内容提取元数据: {normalized_file_path} -> {rag_metadata}")
+                            except Exception as e:
+                                logger.warning(f"[RAG_METADATA] 无法从文件提取元数据: {normalized_file_path}, error: {e}")
+
+                        if rag_metadata:
+                            # 使用RAG返回的完整元数据
+                            title = rag_metadata.get('title', 'Unknown Title')
+                            section = rag_metadata.get('section', '')
+                            journal = rag_metadata.get('journal', '')
+                            volume = rag_metadata.get('volume', '')
+                            doi = rag_metadata.get('doi', '')
+                            authors_list = rag_metadata.get('authors', [])
+                            publication_date = rag_metadata.get('publication_date', '')
+
+                            # 如果section比title更具体，优先使用section
+                            if section and len(section) > len(title):
+                                title = section
+
+                            # 构建来源信息
+                            source_parts = []
+                            if journal:
+                                source_parts.append(journal)
+                            if volume:
+                                source_parts.append(f"Vol. {volume}")
+
+                            if doi:
+                                url_source = f"https://doi.org/{doi}"
+                            elif source_parts:
+                                url_source = ', '.join(source_parts)
+                            else:
+                                # 【优化】尝试从文件内容中提取出版商信息作为来源
+                                try:
+                                    rag_file_path_for_publisher = self.workspace_path / normalized_file_path
+                                    if rag_file_path_for_publisher.exists():
+                                        with open(rag_file_path_for_publisher, 'r', encoding='utf-8') as f:
+                                            rag_content_for_publisher = f.read()
+                                        # 匹配版权声明中的出版商（© YYYY Publisher 或 $\circledcirc$ YYYY Publisher）
+                                        publisher_patterns = [
+                                            r'(?:©|\$\\circledcirc\$)\s*\d{4}\s+(?:Published by\s+)?(\w[\w\s&]+?)(?:\s+Ltd|\s+B\.V|\s+Inc|\s+GmbH|\.\s|$)',
+                                        ]
+                                        for pp in publisher_patterns:
+                                            pm = re.search(pp, rag_content_for_publisher)
+                                            if pm:
+                                                publisher_name = pm.group(1).strip()
+                                                # 清理常见后缀
+                                                publisher_name = re.sub(r'\s*All rights reserved.*$', '',
+                                                                        publisher_name, flags=re.IGNORECASE)
+                                                if publisher_name and len(publisher_name) > 2:
+                                                    url_source = f"RAG知识库 ({publisher_name})"
+                                                    logger.info(f"[RAG_METADATA] 从内容提取出版商: {publisher_name}")
+                                                    break
+                                except Exception as pub_e:
+                                    logger.debug(f"[RAG_METADATA] 提取出版商失败: {pub_e}")
+
+                                if not url_source or url_source == "Unknown URL":
+                                    url_source = "RAG知识库"
+
+                            # 从 publication_date 提取年份（格式：2020-05-01）
+                            if publication_date:
+                                try:
+                                    year = publication_date.split('-')[0]
+                                    if year.isdigit():
+                                        doc_time = f"{year}年"
+                                except:
+                                    pass
+
+                            # 从update_date_time提取年份（备用）
+                            if not doc_time or doc_time == "未知":
+                                update_time = rag_metadata.get('update_date_time', '')
+                                if update_time and update_time.isdigit():
+                                    from datetime import datetime
+                                    try:
+                                        timestamp = int(update_time) / 1000
+                                        year = datetime.fromtimestamp(timestamp).year
+                                        doc_time = f"{year}年"
+                                    except:
+                                        pass
+
+                            # 使用 authors 字段生成作者信息
+                            if authors_list and isinstance(authors_list, list) and len(authors_list) > 0:
+                                if len(authors_list) == 1:
+                                    author = authors_list[0]
+                                elif len(authors_list) == 2:
+                                    author = f"{authors_list[0]}, {authors_list[1]}"
+                                else:
+                                    author = f"{authors_list[0]} et al."
+                            else:
+                                author = "[佚名]"
+
+                            logger.info(f"RAG文档引用 {num}: 作者={author}, 标题={title}, 期刊={journal}, DOI={doi}")
+                        else:
+                            # 没有RAG元数据，尝试从文件名提取标题
+                            filename = os.path.basename(normalized_file_path or file_path)
+                            # 移除文件ID后缀和扩展名（格式: Title_Part_8charID.md）
+                            name_without_ext = filename.rsplit('.', 1)[0] if '.' in filename else filename
+                            # 移除末尾的 _xxxxxxxx (8字符ID)
+                            if len(name_without_ext) > 9 and name_without_ext[-9] == '_':
+                                name_without_ext = name_without_ext[:-9]
+                            title = name_without_ext.replace('_', ' ').strip() or "RAG知识库文档"
+                            url_source = "RAG知识库"
+                            logger.warning(f"警告: RAG文档 {num} 缺少元数据: {normalized_file_path or file_path}, 使用文件名作为标题: {title}")
                     else:
                         # 通用路径处理：适用于所有其他类型的文件（research/, url_crawler_save_files/, arxiv/, 或未来新增的目录）
                         # 检查是否是 arXiv 文件（通过路径或文件名格式判断）
@@ -4350,6 +5378,20 @@ class MCPTools:
                     title_cleaned = title_cleaned.replace('- ', '— ')  # 破折号+空格 → em-dash+空格
                     title_cleaned = title_cleaned.replace(' -', ' —')  # 空格+破折号 → 空格+em-dash
 
+                    # 过滤无效标题（错误页面、无效内容等）
+                    invalid_titles = [
+                        '403 forbidden', '404 not found', '500 internal server error',
+                        '502 bad gateway', '503 service unavailable', '504 gateway timeout',
+                        'access denied', 'page not found', 'error', 'just a moment',
+                        'unknown title', 'untitled'
+                    ]
+                    title_lower = title_cleaned.lower().strip()
+                    is_invalid = any(invalid in title_lower for invalid in invalid_titles)
+
+                    if is_invalid:
+                        logger.info(f"跳过无效标题的引用 {num}: {title_cleaned}")
+                        continue  # 跳过此引用，不添加到参考文献列表
+
                     # 优化时间信息显示
                     doc_time_cleaned = doc_time
                     show_time = True
@@ -4413,8 +5455,15 @@ class MCPTools:
                             else:
                                 reference_entry = f"[{num}] {file_icon} {title_cleaned}，{url_source}"
 
-                    # 根据文件类型分类
-                    if 'user_uploads' in file_path or file_path.startswith('./user_uploads/'):
+                    # 根据文件类型分类：RAG > 用户文件 > 其他
+                    if normalized_file_path and normalized_file_path.startswith('rag_downloads/'):
+                        # RAG 通用流程：即使没有可点击 URL，也保留引用以便追溯
+                        if not url_source.startswith('http://') and not url_source.startswith('https://'):
+                            logger.info(
+                                f"[RAG_REFERENCE] No URL for reference {num}, keeping knowledge-base entry: {url_source}")
+                        rag_references.append((num, reference_entry))
+                        logger.info(f"添加 RAG 知识库引用 {num}: {reference_entry}")
+                    elif 'user_uploads' in file_path or file_path.startswith('./user_uploads/'):
                         user_file_references.append((num, reference_entry))
                         logger.info(f"添加用户文件引用 {num}: {reference_entry}")
                     else:
@@ -4426,16 +5475,18 @@ class MCPTools:
                     other_references.append((num, default_entry))
                     logger.warning(f"警告: 找不到引用 {num} 对应的文件")
 
-            # 重新排序：用户文件在前，其他文件在后
-            # 先按序号排序用户文件
+            # 重新排序：RAG 来源在最前，用户文件次之，其他文件在后
+            # 先按序号排序 RAG 来源
+            rag_references.sort(key=lambda x: x[0])
+            # 再按序号排序用户文件
             user_file_references.sort(key=lambda x: x[0])
-            # 再按序号排序其他文件
+            # 最后按序号排序其他文件
             other_references.sort(key=lambda x: x[0])
 
             # 创建原始序号到连续序号的映射，使参考文献序号连续
-            # 用户文件在前，其他文件在后
+            # RAG 来源优先，用户文件次之，其他文件在后
             old_to_new_num = {}
-            all_sorted_refs = user_file_references + other_references  # 用户文件优先
+            all_sorted_refs = rag_references + user_file_references + other_references  # RAG 优先
 
             for new_num, (old_num, _) in enumerate(all_sorted_refs, 1):
                 old_to_new_num[old_num] = new_num
@@ -4875,7 +5926,11 @@ class MCPTools:
             key_files_dict = {}
             # Create full path relative to workspace
             full_analysis_path = self.workspace_path / "doc_analysis/file_analysis.jsonl"
-            file_analysis_list = load_json(full_analysis_path)
+            try:
+                file_analysis_list = load_json(full_analysis_path)
+            except Exception as e:
+                logger.warning(f"Failed to load file_analysis.jsonl: {e}, using empty list")
+                file_analysis_list = []
 
             for file_info in file_analysis_list:
                 if file_info.get('file_path'):
@@ -5518,8 +6573,12 @@ OUTLINE TO ORGANIZE CONTENT:
             key_files_dict = {}
             # Create full path relative to workspace using config
             analysis_path = storage_config.get('document_analysis_path', './doc_analysis')
-            file_analysis_list = self.load_json(f"{analysis_path}/file_analysis.jsonl").data
-            logger.debug("File analysis loaded successfully")
+            load_result = self.load_json(f"{analysis_path}/file_analysis.jsonl")
+            file_analysis_list = load_result.data if load_result.success else []
+            if not load_result.success:
+                logger.warning(f"Failed to load file_analysis.jsonl: {load_result.error}, using empty list")
+            else:
+                logger.debug("File analysis loaded successfully")
 
             for i, file_info in enumerate(file_analysis_list, 1):
                 file_info['index'] = i  # 在这里给网页进行编号， 从1开始
@@ -5894,13 +6953,33 @@ CURRENT CHAPTER CONTENT:
 
             normalized_task_files = [normalize_path(f) for f in task_files]
 
-            # 始终扫描 library_refs、user_uploads 和 arxiv 目录
+            if self._last_rag_saved_files and self._last_rag_saved_timestamp:
+                rag_saved_age = time.time() - self._last_rag_saved_timestamp
+                if rag_saved_age <= self._rag_cache_ttl_seconds:
+                    normalized_saved_files = [
+                        normalize_path(f) for f in self._last_rag_saved_files if f
+                    ]
+                    missing_rag_files = [
+                        f for f in normalized_saved_files if f not in normalized_task_files
+                    ]
+                    if missing_rag_files:
+                        sample_files = ", ".join(missing_rag_files[:3])
+                        logger.warning(
+                            "[RAG_ANALYSIS] Detected %s recently saved RAG files not included in "
+                            "document_extract tasks. Example: %s. Consider passing rag_document_saver "
+                            "results to document_extract.",
+                            len(missing_rag_files),
+                            sample_files
+                        )
+
+            # 始终扫描 library_refs、user_uploads、arxiv 和 rag_downloads 目录
             library_refs_dir = self.workspace_path / "library_refs"
             user_uploads_dir = self.workspace_path / "user_uploads"
             arxiv_dir = self.workspace_path / "arxiv"
+            rag_downloads_dir = self.workspace_path / "rag_downloads"
 
             expected_files = []
-            # 扫描三个目录中的所有可能的文件扩展名
+            # 扫描各目录中所有可能的文件扩展名
             if library_refs_dir.exists():
                 for ext in ['*.txt', '*.pdf', '*.doc', '*.docx']:
                     expected_files.extend([f"library_refs/{f.name}" for f in library_refs_dir.glob(ext)])
@@ -5910,6 +6989,16 @@ CURRENT CHAPTER CONTENT:
             if arxiv_dir.exists():
                 for ext in ['*.txt', '*.pdf']:
                     expected_files.extend([f"arxiv/{f.name}" for f in arxiv_dir.glob(ext)])
+            # 【RAG 兜底】递归扫描 rag_downloads 下所有 .md 文件（排除 references.jsonl 等元数据）
+            # 这样即使 LLM 未把 rag_document_saver 返回的 file_path 传给 document_extract，
+            # 这些文件也会被自动补全到 tasks，从而进入 file_analysis.jsonl，最终出现在报告参考中
+            if rag_downloads_dir.exists():
+                for md_file in rag_downloads_dir.rglob('*.md'):
+                    try:
+                        rel_path = md_file.relative_to(self.workspace_path).as_posix()
+                        expected_files.append(rel_path)
+                    except Exception:
+                        continue
 
             # 如果这些目录有文件，则进行补全检查
             if expected_files:
@@ -5949,6 +7038,8 @@ CURRENT CHAPTER CONTENT:
                     # 分类统计缺失文件
                     missing_library = [f for f in missing_files if f.startswith('library_refs/')]
                     missing_uploads = [f for f in missing_files if f.startswith('user_uploads/')]
+                    missing_arxiv = [f for f in missing_files if f.startswith('arxiv/')]
+                    missing_rag = [f for f in missing_files if f.startswith('rag_downloads/')]
 
                     # 统一输出警告信息
                     missing_info = []
@@ -5956,6 +7047,10 @@ CURRENT CHAPTER CONTENT:
                         missing_info.append(f"文档库 {len(missing_library)} 个")
                     if missing_uploads:
                         missing_info.append(f"⚠️ 用户上传 {len(missing_uploads)} 个")
+                    if missing_arxiv:
+                        missing_info.append(f"arXiv {len(missing_arxiv)} 个")
+                    if missing_rag:
+                        missing_info.append(f"RAG {len(missing_rag)} 个")
 
                     logger.warning(f"⚠️ 检测到 {len(missing_files)} 个文件未包含在分析任务中 ({', '.join(missing_info)})")
                     logger.warning(f"预期: {len(expected_files)} 个，实际: {len(tasks)} 个 | 🔧 自动补全中...")
@@ -6047,6 +7142,7 @@ CURRENT CHAPTER CONTENT:
                     "2. Authority: According to the information of the document, judge the source of the web page to confirm the credibility of the web page.\n"
                     "3. Relevance: According to the current task (task_content) and the given document, judge whether the current document is related to the current task.\n"
                     "4. Core content: Based on this document, you make a core content summary to ensure the richness of information, with a word count of about 200 words.\n"
+                    "5. Paper metadata extraction: Extract paper title, author(s), abstract, and journal when available. If any field cannot be determined, set it to an empty string.\n"
                     "Information richness: Estimate the total word count of substantive content in the document. Less than 200 words indicates scarcity; over 800 words suggests high richness; between these thresholds denotes moderate richness. Be careful not to just give the word count results, but also give a corresponding text description of how informative the content is.\n"
 
                     "Note:\n1. Ensure the document's language aligns with the extracted dimensions (e.g., Chinese content requires Chinese extraction).\n2. For **source_authority** and **task_relevance**, first provide a brief description before concluding.  \n"
@@ -6059,7 +7155,11 @@ CURRENT CHAPTER CONTENT:
                     "  \"source_authority\": \"xxx\",\n"
                     "  \"task_relevance\": \"xxx\",\n"
                     "  \"core_content\": \"xxx\",\n"
-                    "  \"information_richness\": \"xxx\"\n"
+                    "  \"information_richness\": \"xxx\",\n"
+                    "  \"title\": \"\",\n"
+                    "  \"author\": \"\",\n"
+                    "  \"abstract\": \"\",\n"
+                    "  \"journal\": \"\"\n"
                     "}\n\n"
                     "Important: Return ONLY the JSON object, no additional text or formatting."
                 )
@@ -6172,7 +7272,355 @@ CURRENT CHAPTER CONTENT:
             results.sort(key=lambda x: task_order.get(x['file_path'], float('inf')))
 
             # 保存结果到文件
-            def parse_answer_to_structured_data(answer_text: str, file_path: str) -> Dict[str, str]:
+
+            def extract_rag_metadata_from_content(file_path: str, content: str) -> dict:
+                """
+                从 RAG 下载的文件内容中提取元数据。
+                RAG 文件格式:
+                # {title}
+
+                ## Metadata
+                - **Journal**: {journal}
+                - **DOI**: {doi}
+                - **Source**: {source}
+                - **File ID**: {file_id}
+
+                ---
+
+                ## Content
+                ...
+                """
+                if not file_path.startswith('rag_downloads/'):
+                    return None
+
+                metadata = {}
+                lines = content.split('\n')
+
+                # 提取标题（第一行 # 开头）
+                for line in lines[:5]:
+                    if line.startswith('# ') and not line.startswith('## '):
+                        metadata['title'] = line[2:].strip()
+                        break
+
+                # 提取元数据字段
+                in_metadata_section = False
+                for line in lines:
+                    if line.strip() == '## Metadata':
+                        in_metadata_section = True
+                        continue
+                    if line.strip() == '---' or line.strip() == '## Content':
+                        break
+                    if in_metadata_section and line.startswith('- **'):
+                        # 解析 "- **Key**: Value" 格式
+                        try:
+                            # 移除 "- **" 前缀
+                            rest = line[4:]
+                            # 找到 "**:" 分隔符
+                            if '**:' in rest:
+                                key_part, value_part = rest.split('**:', 1)
+                                key = key_part.strip().lower().replace(' ', '_')
+                                value = value_part.strip()
+                                if value and value != 'N/A':
+                                    metadata[key] = value
+                        except:
+                            pass
+
+                if metadata:
+                    logger.info(f"[RAG_METADATA] 从文件内容提取元数据: {file_path} -> {metadata}")
+                    return metadata
+                return None
+
+            def normalize_text_field(value: Any) -> str:
+                """Normalize arbitrary field values to a clean string."""
+                if value is None:
+                    return ""
+
+                if isinstance(value, str):
+                    return value.strip()
+
+                if isinstance(value, list):
+                    normalized_parts = []
+                    for item in value:
+                        item_text = normalize_text_field(item)
+                        if item_text:
+                            normalized_parts.append(item_text)
+                    return ", ".join(normalized_parts)
+
+                if isinstance(value, dict):
+                    for key in ("name", "author", "authors", "text", "value"):
+                        if key in value:
+                            nested_text = normalize_text_field(value.get(key))
+                            if nested_text:
+                                return nested_text
+                    return ""
+
+                return str(value).strip()
+
+            crossref_cache: Dict[str, Dict[str, str]] = {}
+            openalex_cache: Dict[str, Dict[str, str]] = {}
+
+            def extract_doi_from_text(text: str) -> str:
+                """Extract DOI from arbitrary text."""
+                if not text:
+                    return ""
+
+                doi_pattern = r'10\.\d{4,9}/[-._;()/:A-Za-z0-9]+'
+                match = re.search(doi_pattern, text, re.IGNORECASE)
+                if not match:
+                    return ""
+
+                doi = match.group(0).strip().rstrip(".,);]}")
+                return doi
+
+            def fetch_crossref_metadata(doi: str) -> Dict[str, str]:
+                """
+                Fetch metadata from Crossref by DOI.
+                Return empty dict when unavailable.
+                """
+                if not doi:
+                    return {}
+
+                doi = doi.strip()
+                if doi in crossref_cache:
+                    return crossref_cache[doi]
+
+                try:
+                    api_url = f"https://api.crossref.org/works/{doi}"
+                    resp = requests.get(api_url, timeout=12)
+                    if resp.status_code != 200:
+                        crossref_cache[doi] = {}
+                        return {}
+
+                    payload = resp.json().get("message", {})
+                    title_list = payload.get("title") or []
+                    title = title_list[0].strip() if title_list and isinstance(title_list[0], str) else ""
+
+                    author_objs = payload.get("author") or []
+                    authors = []
+                    for a in author_objs:
+                        given = normalize_text_field(a.get("given"))
+                        family = normalize_text_field(a.get("family"))
+                        name = normalize_text_field(a.get("name"))
+                        full_name = f"{given} {family}".strip() if (given or family) else name
+                        if full_name:
+                            authors.append(full_name)
+                    author_text = ", ".join(authors)
+
+                    abstract = normalize_text_field(payload.get("abstract"))
+                    if abstract:
+                        # Crossref abstract may contain JATS tags.
+                        abstract = re.sub(r"<[^>]+>", " ", abstract)
+                        abstract = re.sub(r"\s+", " ", abstract).strip()
+
+                    journal_list = payload.get("container-title") or []
+                    journal = journal_list[0].strip() if journal_list and isinstance(journal_list[0], str) else ""
+
+                    parsed = {
+                        "doi": doi,
+                        "title": title,
+                        "author": author_text,
+                        "abstract": abstract,
+                        "journal": journal
+                    }
+                    crossref_cache[doi] = parsed
+                    return parsed
+                except Exception:
+                    crossref_cache[doi] = {}
+                    return {}
+
+            def fetch_openalex_metadata(doi: str) -> Dict[str, str]:
+                """
+                Fetch metadata from OpenAlex by DOI.
+                OpenAlex often has better abstract coverage than Crossref.
+                """
+                if not doi:
+                    return {}
+
+                doi = doi.strip().lower()
+                if doi in openalex_cache:
+                    return openalex_cache[doi]
+
+                try:
+                    api_url = f"https://api.openalex.org/works/https://doi.org/{doi}"
+                    resp = requests.get(api_url, timeout=12)
+                    if resp.status_code != 200:
+                        openalex_cache[doi] = {}
+                        return {}
+
+                    payload = resp.json()
+                    title = normalize_text_field(payload.get("title"))
+
+                    authorships = payload.get("authorships") or []
+                    authors = []
+                    for authorship in authorships:
+                        author_name = normalize_text_field((authorship or {}).get("author", {}).get("display_name"))
+                        if author_name:
+                            authors.append(author_name)
+
+                    journal = normalize_text_field(
+                        (payload.get("primary_location") or {}).get("source", {}).get("display_name")
+                    )
+
+                    abstract = ""
+                    abstract_inverted_index = payload.get("abstract_inverted_index") or {}
+                    if isinstance(abstract_inverted_index, dict) and abstract_inverted_index:
+                        words_with_positions = []
+                        for word, positions in abstract_inverted_index.items():
+                            for pos in positions:
+                                if isinstance(pos, int):
+                                    words_with_positions.append((pos, word))
+                        if words_with_positions:
+                            words_with_positions.sort(key=lambda item: item[0])
+                            abstract = " ".join(word for _, word in words_with_positions).strip()
+
+                    parsed = {
+                        "doi": doi,
+                        "title": title,
+                        "author": ", ".join(authors),
+                        "abstract": abstract,
+                        "journal": journal
+                    }
+                    openalex_cache[doi] = parsed
+                    return parsed
+                except Exception:
+                    openalex_cache[doi] = {}
+                    return {}
+
+            def extract_abstract_from_content(content: str) -> str:
+                """
+                Try to recover the abstract from local document content.
+                Prefer explicit Abstract sections; otherwise use a conservative heuristic.
+                """
+                if not content:
+                    return ""
+
+                normalized_content = content.replace("\r\n", "\n")
+
+                abstract_patterns = [
+                    r'(?is)(?:^|\n)\s*(?:#+\s*)?abstract\s*[:：]?\s*\n+(.*?)(?=\n\s*(?:#+\s*)?(?:keywords?|introduction|1\.|i\.|background)\b)',
+                    r'(?is)(?:^|\n)\s*(?:#+\s*)?摘要\s*[:：]?\s*\n+(.*?)(?=\n\s*(?:#+\s*)?(?:关键词|关键字|引言|前言|1\.|一、))',
+                    r'(?is)-\s*\*\*abstract\*\*:\s*(.*?)(?=\n-\s*\*\*|\n\s*---|\n\s*##\s+)'
+                ]
+
+                for pattern in abstract_patterns:
+                    match = re.search(pattern, normalized_content)
+                    if match:
+                        candidate = re.sub(r'\s+', ' ', match.group(1)).strip()
+                        if len(candidate) >= 80:
+                            return candidate
+
+                # Conservative fallback: use the first substantial paragraph after metadata/header.
+                lines = normalized_content.split("\n")
+                paragraphs = []
+                buffer = []
+                start_collecting = False
+                for line in lines:
+                    stripped = line.strip()
+                    if not start_collecting:
+                        if stripped in {"## Content", "Abstract", "摘要"} or stripped.lower() == "## content":
+                            start_collecting = True
+                        continue
+
+                    if not stripped:
+                        if buffer:
+                            paragraphs.append(" ".join(buffer).strip())
+                            buffer = []
+                        continue
+
+                    # Skip headings and metadata bullets.
+                    if stripped.startswith("#") or stripped.startswith("- **"):
+                        continue
+
+                    buffer.append(stripped)
+
+                if buffer:
+                    paragraphs.append(" ".join(buffer).strip())
+
+                for paragraph in paragraphs[:3]:
+                    normalized_paragraph = re.sub(r'\s+', ' ', paragraph).strip()
+                    if 150 <= len(normalized_paragraph) <= 2500:
+                        return normalized_paragraph
+
+                return ""
+
+            def summarize_metadata_status(structured_data: Dict[str, Any]) -> Dict[str, Any]:
+                """
+                Compute metadata completeness markers.
+                """
+                fields = ["title", "author", "abstract", "journal"]
+                missing_fields = [f for f in fields if not normalize_text_field(structured_data.get(f))]
+                structured_data["missing_fields"] = missing_fields
+                if not missing_fields:
+                    structured_data["metadata_status"] = "complete"
+                elif len(missing_fields) == len(fields):
+                    structured_data["metadata_status"] = "missing"
+                else:
+                    structured_data["metadata_status"] = "partial"
+                return structured_data
+
+            def enrich_paper_metadata(
+                    structured_data: Dict[str, Any],
+                    rag_metadata: Optional[Dict[str, Any]] = None,
+                    parsed_data: Optional[Dict[str, Any]] = None
+            ) -> Dict[str, Any]:
+                """
+                Ensure paper metadata fields always exist.
+                Priority: parsed_data explicit fields > rag_metadata > existing value > empty string.
+                """
+                rag_metadata = rag_metadata if isinstance(rag_metadata, dict) else {}
+                parsed_data = parsed_data if isinstance(parsed_data, dict) else {}
+
+                def first_non_empty(*candidates) -> str:
+                    for candidate in candidates:
+                        normalized = normalize_text_field(candidate)
+                        if normalized:
+                            return normalized
+                    return ""
+
+                structured_data["title"] = first_non_empty(
+                    parsed_data.get("title"),
+                    parsed_data.get("Title"),
+                    rag_metadata.get("title"),
+                    rag_metadata.get("Title"),
+                    structured_data.get("title")
+                )
+                structured_data["author"] = first_non_empty(
+                    parsed_data.get("author"),
+                    parsed_data.get("authors"),
+                    parsed_data.get("Author"),
+                    parsed_data.get("Authors"),
+                    rag_metadata.get("author"),
+                    rag_metadata.get("authors"),
+                    rag_metadata.get("Author"),
+                    rag_metadata.get("Authors"),
+                    structured_data.get("author")
+                )
+                structured_data["abstract"] = first_non_empty(
+                    parsed_data.get("abstract"),
+                    parsed_data.get("Abstract"),
+                    rag_metadata.get("abstract"),
+                    rag_metadata.get("Abstract"),
+                    structured_data.get("abstract")
+                )
+                structured_data["journal"] = first_non_empty(
+                    parsed_data.get("journal"),
+                    parsed_data.get("Journal"),
+                    rag_metadata.get("journal"),
+                    rag_metadata.get("Journal"),
+                    structured_data.get("journal")
+                )
+
+                structured_data["doi"] = first_non_empty(
+                    parsed_data.get("doi"),
+                    parsed_data.get("DOI"),
+                    rag_metadata.get("doi"),
+                    rag_metadata.get("DOI"),
+                    structured_data.get("doi")
+                )
+                return structured_data
+
+            def parse_answer_to_structured_data(answer_text: str, file_path: str, rag_metadata: dict = None) -> Dict[
+                str, str]:
                 """Parse the AI JSON response into structured data"""
                 # Default structure
                 structured_data = {
@@ -6181,10 +7629,29 @@ CURRENT CHAPTER CONTENT:
                     "source_authority": "Unknown",
                     "task_relevance": "Unknown",
                     "information_richness": "Unknown",
-                    "core_content": "Unknown"
+                    "core_content": "Unknown",
+                    "title": "",
+                    "author": "",
+                    "abstract": "",
+                    "journal": "",
+                    "doi": "",
+                    "metadata_status": "missing",
+                    "metadata_source": "",
+                    "missing_fields": []
                 }
 
+                # 如果有RAG元数据，保存到structured_data中
+                if rag_metadata:
+                    structured_data["rag_metadata"] = rag_metadata
+
                 if not answer_text:
+                    enrich_paper_metadata(structured_data, rag_metadata=rag_metadata)
+                    structured_data["doi"] = normalize_text_field(structured_data.get("doi"))
+                    if not structured_data["doi"]:
+                        structured_data["doi"] = extract_doi_from_text(json.dumps(rag_metadata, ensure_ascii=False) if rag_metadata else "")
+                    summarize_metadata_status(structured_data)
+                    if rag_metadata and any(normalize_text_field(rag_metadata.get(k)) for k in ["title", "authors", "journal", "doi"]):
+                        structured_data["metadata_source"] = "rag_metadata"
                     return structured_data
 
                 try:
@@ -6220,26 +7687,162 @@ CURRENT CHAPTER CONTENT:
                             "core_content": parsed_data.get("core_content", "Unknown"),
                             "information_richness": parsed_data.get("information_richness", "Unknown")
                         })
+                        enrich_paper_metadata(
+                            structured_data,
+                            rag_metadata=rag_metadata,
+                            parsed_data=parsed_data
+                        )
+                        structured_data["metadata_source"] = "llm"
+                    else:
+                        enrich_paper_metadata(structured_data, rag_metadata=rag_metadata)
 
+                    # DOI completion (from text/rag if needed)
+                    if not normalize_text_field(structured_data.get("doi")):
+                        structured_data["doi"] = extract_doi_from_text(answer_text)
+                    if not normalize_text_field(structured_data.get("doi")) and rag_metadata:
+                        structured_data["doi"] = extract_doi_from_text(json.dumps(rag_metadata, ensure_ascii=False))
+
+                    # Crossref backfill by DOI
+                    doi = normalize_text_field(structured_data.get("doi"))
+                    if doi:
+                        crossref_meta = fetch_crossref_metadata(doi)
+                        if crossref_meta:
+                            for field_name in ["title", "author", "abstract", "journal"]:
+                                if not normalize_text_field(structured_data.get(field_name)):
+                                    structured_data[field_name] = normalize_text_field(crossref_meta.get(field_name))
+                            if any(normalize_text_field(crossref_meta.get(f)) for f in ["title", "author", "abstract", "journal"]):
+                                structured_data["metadata_source"] = "crossref"
+
+                    summarize_metadata_status(structured_data)
+                    if not normalize_text_field(structured_data.get("metadata_source")) and rag_metadata:
+                        structured_data["metadata_source"] = "rag_metadata"
                     return structured_data
 
                 except json.JSONDecodeError as e:
                     # If JSON parsing fails, return default with error info
                     structured_data[
                         "core_content"] = f"JSON parsing error: {str(e)}. Raw response: {answer_text[:200]}..."
+                    enrich_paper_metadata(structured_data, rag_metadata=rag_metadata)
+                    if not normalize_text_field(structured_data.get("doi")):
+                        structured_data["doi"] = extract_doi_from_text(answer_text)
+                    if not normalize_text_field(structured_data.get("doi")) and rag_metadata:
+                        structured_data["doi"] = extract_doi_from_text(json.dumps(rag_metadata, ensure_ascii=False))
+                    doi = normalize_text_field(structured_data.get("doi"))
+                    if doi:
+                        crossref_meta = fetch_crossref_metadata(doi)
+                        if crossref_meta:
+                            for field_name in ["title", "author", "abstract", "journal"]:
+                                if not normalize_text_field(structured_data.get(field_name)):
+                                    structured_data[field_name] = normalize_text_field(crossref_meta.get(field_name))
+                            structured_data["metadata_source"] = "crossref"
+                    summarize_metadata_status(structured_data)
+                    if not normalize_text_field(structured_data.get("metadata_source")) and rag_metadata:
+                        structured_data["metadata_source"] = "rag_metadata"
                     return structured_data
                 except Exception as e:
                     # Handle any other parsing errors
                     structured_data["core_content"] = f"Parsing error: {str(e)}"
+                    enrich_paper_metadata(structured_data, rag_metadata=rag_metadata)
+                    if not normalize_text_field(structured_data.get("doi")):
+                        structured_data["doi"] = extract_doi_from_text(answer_text)
+                    summarize_metadata_status(structured_data)
                     return structured_data
+
+            def apply_external_metadata_backfill(
+                    structured_data: Dict[str, Any],
+                    answer_text: str = "",
+                    rag_metadata: Optional[Dict[str, Any]] = None,
+                    file_content: str = ""
+            ) -> Dict[str, Any]:
+                """
+                Second-stage metadata completion:
+                1) recover DOI
+                2) Crossref
+                3) OpenAlex
+                4) local abstract extraction from content
+                """
+                rag_metadata = rag_metadata if isinstance(rag_metadata, dict) else {}
+
+                if not normalize_text_field(structured_data.get("doi")):
+                    structured_data["doi"] = extract_doi_from_text(answer_text)
+                if not normalize_text_field(structured_data.get("doi")) and rag_metadata:
+                    structured_data["doi"] = extract_doi_from_text(json.dumps(rag_metadata, ensure_ascii=False))
+                if not normalize_text_field(structured_data.get("doi")) and file_content:
+                    structured_data["doi"] = extract_doi_from_text(file_content)
+
+                doi = normalize_text_field(structured_data.get("doi"))
+                sources_used = []
+
+                if doi:
+                    crossref_meta = fetch_crossref_metadata(doi)
+                    if crossref_meta:
+                        for field_name in ["title", "author", "abstract", "journal"]:
+                            if not normalize_text_field(structured_data.get(field_name)):
+                                structured_data[field_name] = normalize_text_field(crossref_meta.get(field_name))
+                        if any(normalize_text_field(crossref_meta.get(f)) for f in ["title", "author", "abstract", "journal"]):
+                            sources_used.append("crossref")
+
+                    # OpenAlex is especially useful when Crossref lacks abstract.
+                    if not normalize_text_field(structured_data.get("abstract")) or not normalize_text_field(structured_data.get("author")):
+                        openalex_meta = fetch_openalex_metadata(doi)
+                        if openalex_meta:
+                            for field_name in ["title", "author", "abstract", "journal"]:
+                                if not normalize_text_field(structured_data.get(field_name)):
+                                    structured_data[field_name] = normalize_text_field(openalex_meta.get(field_name))
+                            if any(normalize_text_field(openalex_meta.get(f)) for f in ["title", "author", "abstract", "journal"]):
+                                sources_used.append("openalex")
+
+                # Final fallback for abstract: extract from the saved content itself.
+                if not normalize_text_field(structured_data.get("abstract")) and file_content:
+                    extracted_abstract = extract_abstract_from_content(file_content)
+                    if extracted_abstract:
+                        structured_data["abstract"] = extracted_abstract
+                        sources_used.append("content_extract")
+
+                if sources_used:
+                    structured_data["metadata_source"] = "+".join(dict.fromkeys(sources_used))
+
+                summarize_metadata_status(structured_data)
+                return structured_data
 
             # Transform results into the desired format
             structured_results = []
             for result in results:
                 if result.get('success', False) and result.get('answer'):
+                    file_path = result['file_path']
+
+                    # 从task中获取RAG元数据（如果有）
+                    task_info = next((t for t in tasks if t['file_path'] == file_path), {})
+                    rag_metadata = task_info.get('rag_metadata', None)
+
+                    # 【关键修复】如果没有传入rag_metadata，且是RAG文件，则从文件内容中提取
+                    file_content = ""
+                    if not rag_metadata and file_path.startswith('rag_downloads/'):
+                        try:
+                            read_result = self.file_read(file_path)
+                            if read_result.success:
+                                file_content = read_result.data
+                                rag_metadata = extract_rag_metadata_from_content(file_path, read_result.data)
+                        except Exception as e:
+                            logger.warning(f"[RAG_METADATA] 无法从文件提取元数据: {file_path}, error: {e}")
+                    elif not file_content:
+                        try:
+                            read_result = self.file_read(file_path)
+                            if read_result.success:
+                                file_content = read_result.data
+                        except Exception:
+                            file_content = ""
+
                     structured_data = parse_answer_to_structured_data(
                         result['answer'],
-                        result['file_path']
+                        file_path,
+                        rag_metadata
+                    )
+                    structured_data = apply_external_metadata_backfill(
+                        structured_data,
+                        answer_text=result.get('answer', ''),
+                        rag_metadata=rag_metadata,
+                        file_content=file_content
                     )
                     structured_results.append(structured_data)
                 else:
@@ -6250,7 +7853,11 @@ CURRENT CHAPTER CONTENT:
                         "source_authority": "Processing failed",
                         "task_relevance": "Processing failed",
                         "information_richness": "Unknown",
-                        "core_content": f"Error: {result.get('error', 'Unknown error')}"
+                        "core_content": f"Error: {result.get('error', 'Unknown error')}",
+                        "title": "",
+                        "author": "",
+                        "abstract": "",
+                        "journal": ""
                     })
 
             # Save structured results to JSON file
@@ -6339,6 +7946,12 @@ CURRENT CHAPTER CONTENT:
             other_files = []
 
             for file_data in existing_data.values():
+                # Ensure old historical records also carry required paper metadata fields
+                enrich_paper_metadata(
+                    file_data,
+                    rag_metadata=file_data.get("rag_metadata"),
+                    parsed_data=file_data
+                )
                 file_path = file_data.get('file_path', '')
                 if 'user_uploads' in file_path or file_path.startswith('./user_uploads/'):
                     user_uploaded_files.append(file_data)
@@ -6395,13 +8008,21 @@ CURRENT CHAPTER CONTENT:
             tasks: List of task dictionaries containing:
                 - file_path: Relative path to the file (relative to workspace root) to read
                 - question: Question to ask about this file
-            model: AI model to use for generating answers
+            model: AI model to use for generating answers (defaults to MODEL_NAME from config)
             temperature: Creativity level for the AI response (0-1)
             max_tokens: Maximum tokens for the AI response
             max_workers: Maximum number of concurrent model API requests
         """
         try:
             logger.info(f"我现在开始调用document_qa了：{tasks}")
+
+            # 获取自定义LLM配置
+            model_config = get_config().get_custom_llm_config()
+            PANGU_URL = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
+            model_name = model or model_config.get('model') or os.getenv('MODEL_NAME', '')
+            model_token = model_config.get('token') or os.getenv('MODEL_REQUEST_TOKEN', '')
+            model_timeout = model_config.get('timeout', 180)
+            headers = {'Content-Type': 'application/json', 'csb-token': model_token}
 
             # 处理单个任务
             def process_single_task(task: Dict) -> Dict:
@@ -6429,15 +8050,7 @@ CURRENT CHAPTER CONTENT:
                     "CONTEXT:\n{context}"
                 ).format(context=content)
 
-                # 3. 调用大模型API（使用requests.post直接调用，与document_extract一致）
-                # Get model URL and token from config
-                config = get_config()
-                model_config = config.get_custom_llm_config()
-                
-                model_url = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
-                model_token = model_config.get('token') or os.getenv('MODEL_REQUEST_TOKEN', '')
-                headers = {'Content-Type': 'application/json', 'csb-token': model_token}
-                
+                # 3. 调用自定义大模型API
                 try:
                     # Add retry logic for AI model call
                     max_retries = 5
@@ -6446,10 +8059,10 @@ CURRENT CHAPTER CONTENT:
                     for attempt in range(max_retries):
                         try:
                             response = requests.post(
-                                url=model_url,
+                                url=PANGU_URL,
                                 headers=headers,
                                 json={
-                                    "model": model_config.get('model', model),
+                                    "model": model_name,
                                     "chat_template": "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<s>[unused9]系统：[unused10]' }}{% endif %}{% if message['role'] == 'system' %}{{'<s>[unused9]系统：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'assistant' %}{{'[unused9]助手：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'tool' %}{{'[unused9]工具：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'function' %}{{'[unused9]方法：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'user' %}{{'[unused9]用户：' + message['content'] + '[unused10]'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '[unused9]助手：' }}{% endif %}",
                                     "messages": [
                                         {"role": "system", "content": system_prompt},
@@ -6589,9 +8202,17 @@ CURRENT CHAPTER CONTENT:
                         filename = filename[:-4] + '.txt'
                         logger.info(f"网页下载的PDF文件将转换为文本格式: {filename}")
 
-                    file_path = download_dir / filename
-                    if not os.path.realpath(file_path).startswith(self.full_workspace_path):
+                    # 仅做 '..' 穿越/绝对路径检查，避免在不存在的目标上调用
+                    # os.path.realpath 时的 Windows 并发竞态（见 _validate_workspace_path）。
+                    normalized_filename = os.path.normpath(filename).replace('\\', '/')
+                    if (
+                        normalized_filename == '..'
+                        or normalized_filename.startswith('../')
+                        or '/../' in normalized_filename
+                        or os.path.isabs(normalized_filename)
+                    ):
                         raise Exception(f"Path '{filename}' is outside workspace directory.")
+                    file_path = download_dir / normalized_filename
 
                     # Check if file exists
                     if file_path.exists() and not overwrite:
@@ -9239,6 +10860,283 @@ CURRENT CHAPTER CONTENT:
 
         return "\n".join(article_parts)
 
+    def search_rag_knowledge(
+            self,
+            content: str,
+            repo_id: str = None,
+            page_num: int = 1,
+            page_size: int = None
+    ) -> MCPToolResult:
+
+        """
+        Search RAG knowledge base for relevant documents.
+
+        Args:
+            content: Search query content
+            repo_id: Repository ID (optional, uses default from config if not provided)
+            page_num: Page number for pagination (default: 1)
+            page_size: Number of results per page (optional, uses default from config if not provided)
+
+        Returns:
+            MCPToolResult with search results containing relevant documents
+        """
+        try:
+            from config.config import get_rag_config
+
+            rag_config = get_rag_config()
+            api_url = rag_config.get('api_url')
+            app_code = rag_config.get('app_code')
+
+            if not api_url or not app_code:
+                return MCPToolResult(
+                    success=False,
+                    error="RAG API configuration is missing. Please check RAG_API_URL and RAG_APP_CODE in .env file"
+                )
+
+            # If repo_id is None, empty string, or "default", use the configured default repo_id
+            if not repo_id or repo_id == "default":
+                repo_id = rag_config.get('default_repo_id')
+                if not repo_id:
+                    return MCPToolResult(
+                        success=False,
+                        error="Repository ID is required. Please provide repo_id or set RAG_DEFAULT_REPO_ID in .env file"
+                    )
+
+            if page_size is None:
+                page_size = rag_config.get('default_page_size', 10)
+
+            headers = {"X-Apig-AppCode": app_code}
+            data = {
+                "repo_id": repo_id,
+                "content": content,
+                "page_num": page_num,
+                "page_size": page_size
+            }
+
+            logger.info(f"Searching RAG knowledge base with query: {content[:100]}...")
+            logger.info(f"RAG API URL: {api_url}")
+            logger.info(f"RAG request data: repo_id={repo_id}, page_num={page_num}, page_size={page_size}")
+
+            timeout = rag_config.get('timeout', 30)
+
+            # 添加重试机制：最多重试 3 次，间隔 1 秒
+            max_retries = 3
+            retry_delay = 1
+            last_exception = None
+
+            for attempt in range(max_retries):
+                try:
+                    response = requests.post(api_url, headers=headers, json=data, timeout=timeout)
+                    logger.info(
+                        f"RAG API response status: {response.status_code} (attempt {attempt + 1}/{max_retries})")
+
+                    if response.status_code != 200:
+                        logger.error(f"RAG API response body: {response.text[:500]}")
+
+                    # 成功获取响应，跳出重试循环
+                    break
+
+                except requests.exceptions.Timeout as e:
+                    last_exception = e
+                    logger.warning(f"RAG API timeout on attempt {attempt + 1}/{max_retries}: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        raise
+
+                except requests.exceptions.RequestException as e:
+                    last_exception = e
+                    logger.warning(f"RAG API request error on attempt {attempt + 1}/{max_retries}: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        raise
+
+            if response.status_code != 200:
+                return MCPToolResult(
+                    success=False,
+                    error=f"RAG API request failed with status code: {response.status_code}"
+                )
+
+            result_data = response.json()
+
+            # 处理绝对路径问题：清理不可访问的本地或远程路径
+            # RAG 返回的文档路径可能是绝对路径，这会导致 MCP 服务器拒绝访问
+            import os
+            logger.info(f"[PATH_CLEANUP] Starting path cleanup for RAG results")
+            if result_data and isinstance(result_data, dict):
+                # RAG API 返回的是 doc_list，不是 data.documents
+                if 'doc_list' in result_data and isinstance(result_data['doc_list'], list):
+                    logger.info(f"[PATH_CLEANUP] Found {len(result_data['doc_list'])} documents in RAG response")
+                    cleaned_count = 0
+                    for idx, doc in enumerate(result_data['doc_list']):
+                        if isinstance(doc, dict):
+                            # 路径在 additional_fields.metadata.file_path 中
+                            if 'additional_fields' in doc and isinstance(doc['additional_fields'], dict):
+                                metadata = doc['additional_fields'].get('metadata', {})
+                                if isinstance(metadata, dict) and 'file_path' in metadata:
+                                    file_path = metadata['file_path']
+                                    if file_path and isinstance(file_path, str):
+                                        # 检测本地绝对路径（Windows: C:/, D:/ 或 Linux: /）
+                                        if file_path.startswith(
+                                                ('C:/', 'D:/', 'E:/', 'F:/', '/', 'C:\\', 'D:\\', 'E:\\', 'F:\\')):
+                                            logger.warning(
+                                                f"[PATH_CLEANUP] Doc {idx}: Removing local absolute path: {file_path[:100]}...")
+                                            # 删除本地绝对路径，避免 Agent 误用
+                                            del metadata['file_path']
+                                            metadata[
+                                                '_path_removed_reason'] = 'Local absolute path not accessible. Use the content field instead.'
+                                            cleaned_count += 1
+                                            logger.info(f"[PATH_CLEANUP] Doc {idx}: Local absolute path removed")
+                                        elif file_path.startswith('uploads/'):
+                                            logger.info(
+                                                f"[PATH_CLEANUP] Doc {idx}: Removing remote storage path from metadata")
+                                            del metadata['file_path']
+                                            metadata[
+                                                '_path_removed_reason'] = 'Remote storage path not used. Use the content field instead.'
+                                            cleaned_count += 1
+
+                    if cleaned_count > 0:
+                        logger.warning(
+                            f"[PATH_CLEANUP] ⚠️ Cleaned {cleaned_count} invalid paths from RAG results")
+                    if cleaned_count == 0:
+                        logger.info(f"[PATH_CLEANUP] No paths needed cleanup")
+                else:
+                    logger.warning(f"[PATH_CLEANUP] No doc_list found in RAG response")
+
+            logger.info(f"RAG search completed successfully, found results")
+
+            # 【优化】后处理过滤：根据领域关键词过滤不相关文档
+            # 提高检索质量，减少不相关文档的干扰
+            if result_data and 'doc_list' in result_data and isinstance(result_data['doc_list'], list):
+                original_count = len(result_data['doc_list'])
+                filtered_docs = self._filter_relevant_rag_documents(result_data['doc_list'], content)
+                result_data['doc_list'] = filtered_docs
+                filtered_count = len(filtered_docs)
+
+                if filtered_count < original_count:
+                    logger.info(
+                        f"[RAG_FILTER] Filtered {original_count - filtered_count} irrelevant documents ({original_count} → {filtered_count})")
+                else:
+                    logger.info(f"[RAG_FILTER] All {original_count} documents passed relevance filter")
+
+            # Cache the search result for rag_document_saver to use
+            # This avoids the need to pass large JSON through LLM
+            current_time = time.time()
+            self._last_rag_search_result = result_data
+            self._last_rag_search_query = content
+            self._last_rag_search_timestamp = current_time
+            logger.info(f"[RAG_CACHE] Cached RAG search result for query: {content[:50]}...")
+
+            # Generate simplified document list for rag_document_saver (similar to url_crawler's documents parameter)
+            # This allows Agent to pass a simple list instead of the full search result
+            documents_for_saver = []
+            if result_data and 'doc_list' in result_data:
+                seen_file_ids = set()
+                for idx, doc in enumerate(result_data['doc_list']):
+                    content_text = doc.get('content', '')
+                    file_id = doc.get('file_id', '')
+                    # 获取 metadata - 可能在 additional_fields.metadata 或直接在 doc 中
+                    additional_fields = doc.get('additional_fields', {})
+                    metadata = additional_fields.get('metadata', {})
+
+                    # 调试：打印第一个文档的完整结构
+                    if idx == 0:
+                        logger.info(f"[RAG_DEBUG] First doc keys: {list(doc.keys())}")
+                        logger.info(
+                            f"[RAG_DEBUG] additional_fields keys: {list(additional_fields.keys()) if additional_fields else 'None'}")
+                        logger.info(f"[RAG_DEBUG] metadata keys: {list(metadata.keys()) if metadata else 'None'}")
+                        logger.info(f"[RAG_DEBUG] metadata content: {metadata}")
+
+                    if not file_id:
+                        metadata_file_id = metadata.get('file_id', '')
+                        if metadata_file_id:
+                            file_id = metadata_file_id
+                        elif content_text:
+                            import hashlib
+                            file_id = f"rag_{hashlib.md5(content_text.encode('utf-8')).hexdigest()[:12]}"
+                        else:
+                            file_id = f"rag_{idx}_{int(current_time)}"
+
+                    if file_id in seen_file_ids:
+                        continue
+                    seen_file_ids.add(file_id)
+
+                    has_content = bool(content_text)
+                    if has_content:
+                        # 提取完整的元数据字段
+                        doc_metadata = {
+                            'file_id': file_id,
+                            'title': metadata.get('title', ''),
+                            'journal': metadata.get('journal', ''),
+                            'doi': metadata.get('doi', ''),
+                            'section': metadata.get('section', ''),
+                            'authors': metadata.get('authors', []),
+                            'publication_date': metadata.get('publication_date', ''),
+                            'volume': metadata.get('volume', ''),
+                            'chunk_length': metadata.get('chunk_length', 0) or len(content_text)
+                        }
+                        documents_for_saver.append(doc_metadata)
+
+                        # 【关键修复】累积式缓存：将元数据保存到 _rag_metadata_cache
+                        # 这样即使后续搜索覆盖了 _last_rag_search_result，元数据仍然可用
+                        # 缓存结构包含时间戳用于过期检查
+                        # 使用锁保护并发写入
+                        cache_key = f"file_id:{file_id}"
+
+                        cache_metadata = {**doc_metadata, 'content': content_text}
+                        with self._rag_cache_lock:
+                            self._rag_metadata_cache[cache_key] = {
+                                'metadata': cache_metadata,
+                                'timestamp': current_time
+                            }
+
+                # 清理过期缓存（内部已有锁保护）
+                self._clean_rag_cache()
+
+                # 读取缓存大小时也需要锁保护
+                with self._rag_cache_lock:
+                    cache_size = len(self._rag_metadata_cache)
+
+                logger.info(f"[RAG_CACHE] Generated {len(documents_for_saver)} documents for saver")
+                logger.info(f"[RAG_CACHE] Total cached metadata entries: {cache_size}")
+
+            # Add documents_for_download to data (similar to how batch_web_search returns URLs in data)
+            # This allows Agent to extract the list and pass to rag_document_saver
+            result_data['documents_for_download'] = documents_for_saver
+
+            return MCPToolResult(
+                success=True,
+                data=result_data,
+                metadata={
+                    "query": content,
+                    "repo_id": repo_id,
+                    "page_num": page_num,
+                    "page_size": page_size,
+                    "cached_for_saver": True
+                }
+            )
+
+        except requests.exceptions.Timeout:
+            return MCPToolResult(
+                success=False,
+                error="RAG API request timeout"
+            )
+        except requests.exceptions.RequestException as e:
+            logger.error(f"RAG API request error: {e}")
+            return MCPToolResult(
+                success=False,
+                error=f"RAG API request failed: {str(e)}"
+            )
+        except Exception as e:
+            logger.error(f"RAG search error: {e}")
+            return MCPToolResult(
+                success=False,
+                error=f"RAG search failed: {str(e)}"
+            )
+
     def get_pubmed_article(self, pmid) -> MCPToolResult:
         logger.info(f"Attempting to access full text for PMID: {pmid}")
         try:
@@ -9468,7 +11366,15 @@ CURRENT CHAPTER CONTENT:
             'sortBy': 'submittedDate',
             'sortOrder': 'descending'
         }
-        response = requests.get(BASE_URL, params=params, verify=False, proxies=proxy)
+        request_timeout = int(os.environ.get("ARXIV_SEARCH_TIMEOUT_SECONDS", "30"))
+        response = requests.get(
+            BASE_URL,
+            params=params,
+            verify=False,
+            proxies=proxy,
+            timeout=request_timeout
+        )
+        response.raise_for_status()
         feed = feedparser.parse(response.content)
         papers = []
         for entry in feed.entries:
@@ -10803,6 +12709,53 @@ MCP_TOOL_SCHEMAS = {
         }
     },
 
+    "rag_document_saver": {
+        "name": "rag_document_saver",
+        "description": "Save RAG documents using RAG content and metadata. Similar to url_crawler for web pages. SIMPLE USAGE: Just call rag_document_saver() with no arguments after search_rag_knowledge - it automatically saves all documents from the last search.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "documents": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "description": "Document content from RAG response"
+                            },
+                            "file_path": {
+                                "type": "string",
+                                "description": "Optional local save path"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Document title"
+                            },
+                            "file_id": {
+                                "type": "string",
+                                "description": "File ID"
+                            }
+                        },
+                        "required": []
+                    },
+                    "description": "Optional list of documents to save. If not provided, uses cached result from last search_rag_knowledge."
+                },
+                "save_directory": {
+                    "type": "string",
+                    "default": "rag_downloads/research",
+                    "description": "Directory to save files (relative to workspace)"
+                },
+                "max_workers": {
+                    "type": "integer",
+                    "default": 10,
+                    "description": "Maximum concurrent saves"
+                }
+            },
+            "required": []
+        }
+    },
+
     "concat_section_files": {
         "name": "concat_section_files",
         "description": "Concatenate the content of the saved section files into a single file",
@@ -11561,6 +13514,32 @@ MCP_TOOL_SCHEMAS = {
                 }
             },
             "required": []
+        }
+    },
+    "search_rag_knowledge": {
+        "name": "search_rag_knowledge",
+        "description": "Search the RAG knowledge base for relevant documents and information. Use this tool to retrieve context from the organization's knowledge repository.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "Search query content - can be a question, keywords, or natural language query"
+                },
+                "repo_id": {
+                    "type": "string",
+                    "description": "Repository ID to search in. IMPORTANT: To use the default repository, completely omit this parameter from your function call - do NOT pass empty string, 'default', or any placeholder value. Only provide this parameter if you have a specific repository UUID to use."
+                },
+                "page_num": {
+                    "type": "integer",
+                    "description": "Page number for pagination (default: 1)"
+                },
+                "page_size": {
+                    "type": "integer",
+                    "description": "Number of results per page (optional, uses default from config if not provided)"
+                }
+            },
+            "required": ["content"]
         }
     },
     "get_pubmed_article": {
