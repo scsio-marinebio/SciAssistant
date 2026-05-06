@@ -26,8 +26,20 @@ sys.path.insert(0, str(Path(__file__).parent))
 # 导入日志配置
 from deepdiver_v2.config.logging_config import quick_setup, get_logger
 
-# 加载环境变量
+# 加载环境变量（项目根 .env）后加载 deepdiver 配置，后者覆盖同名键
 load_dotenv()
+_DEEPDIVER_ENV_PATH = Path(__file__).resolve().parent / "deepdiver_v2" / "config" / ".env"
+load_dotenv(_DEEPDIVER_ENV_PATH, override=True)
+
+# app.py 联网搜索 / 大模型：优先 SERPER_*、LLM_*，兼容 deepdiver 既有键名
+LLM_API_URL = os.getenv("MODEL_REQUEST_URL")
+
+LLM_MODEL_NAME = os.getenv("MODEL_NAME") or "pangu"
+SERPER_API_URL = (
+    os.getenv("SEARCH_ENGINE_BASE_URL")
+    or "https://google.serper.dev/search"
+)
+SERPER_API_KEY = os.getenv("SEARCH_ENGINE_API_KEYS")
 # 数据库配置
 MYSQL_HOST=""
 MYSQL_USER=""
@@ -1792,9 +1804,7 @@ def start_file_qa():
         return jsonify({'success': False, 'message': f'启动文件问答失败: {str(e)}'}), 500
 
 # ------------------- 联网搜索增强接口 -------------------
-# 大模型API配置
-LLM_API_URL = "http://10.1.11.175:8088/v1/chat/completions"
-LLM_MODEL_NAME = "pangu"
+# 大模型 / Serper 配置见文件顶部（从 deepdiver_v2/config/.env 等加载）
 
 def call_llm(messages, stream=False, timeout=60):
     """调用大模型API的辅助函数"""
@@ -1876,8 +1886,6 @@ def rewrite_query_for_search(user_query):
         return [user_query]
 
 
-SERPER_API_URL = "https://google.serper.dev/search"
-SERPER_API_KEY = "***"
 
 
 def web_search(query, max_results=5):
