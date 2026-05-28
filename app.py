@@ -1,3 +1,4 @@
+# Copyright (c) 2026 South China Sea Institute of Oceanology, Chinese Academy of Sciences (SCSIO, CAS). All rights reserved.
 import pathlib
 import pymysql
 import hashlib

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 South China Sea Institute of Oceanology, Chinese Academy of Sciences (SCSIO, CAS). All rights reserved.
 """
 PlannerAgent HTTP Server
 基于FastAPI实现的PlannerAgent服务器，提供RESTful API接口
