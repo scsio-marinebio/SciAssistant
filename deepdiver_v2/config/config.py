@@ -42,6 +42,13 @@ class APIConfig:
     url_crawler_api_keys: Optional[str] = None  # Can be comma-separated for rotation
     url_crawler_max_tokens: int = 100000
     
+    # RAG Knowledge Base Configuration
+    rag_api_url: Optional[str] = None
+    rag_app_code: Optional[str] = None
+    rag_default_repo_id: Optional[str] = None
+    rag_default_page_size: int = 20  # 增加到 20，提高相关文档覆盖率
+    search_source_rag: bool = True  # 是否全局启用 RAG 搜索源
+
     # Proxy Configuration
     http_proxy: Optional[str] = None
     https_proxy: Optional[str] = None
@@ -95,6 +102,13 @@ class APIConfig:
         self.url_crawler_api_keys = os.getenv("URL_CRAWLER_API_KEYS")
         self.url_crawler_max_tokens = int(os.getenv("URL_CRAWLER_MAX_TOKENS", self.url_crawler_max_tokens))
         
+        # RAG Knowledge Base Configuration
+        self.rag_api_url = os.getenv("RAG_API_URL")
+        self.rag_app_code = os.getenv("RAG_APP_CODE")
+        self.rag_default_repo_id = os.getenv("RAG_DEFAULT_REPO_ID")
+        self.rag_default_page_size = int(os.getenv("RAG_DEFAULT_PAGE_SIZE", self.rag_default_page_size))
+        self.search_source_rag = os.getenv("SEARCH_SOURCE_RAG", "true").lower() == "true"
+
         # Proxy Configuration
         self.http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
         self.https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
@@ -236,6 +250,17 @@ def get_mcp_config() -> Dict[str, Any]:
         "server_url": config.mcp_server_url,
         "auth_token": config.mcp_auth_token,
         "use_stdio": config.mcp_use_stdio,
+        "timeout": config.timeout
+    }
+
+def get_rag_config() -> Dict[str, Any]:
+    """Get RAG knowledge base configuration"""
+    return {
+        "api_url": config.rag_api_url,
+        "app_code": config.rag_app_code,
+        "default_repo_id": config.rag_default_repo_id,
+        "default_page_size": config.rag_default_page_size,
+        "search_source_rag": config.search_source_rag,
         "timeout": config.timeout
     }
 

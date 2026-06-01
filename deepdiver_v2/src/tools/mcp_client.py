@@ -506,6 +506,11 @@ class MCPClient:
                 'env_var': 'SEARCH_SOURCE_SPRINGER',
                 'tools': ['springer_search', 'springer_get_article']
             },
+            'RAG': {
+                'name': 'RAG知识库',
+                'env_var': 'SEARCH_SOURCE_RAG',
+                'tools': ['search_rag_knowledge', 'rag_document_saver']
+            },
         }
         
         # Build tool to source mapping from configuration
@@ -820,6 +825,10 @@ INFORMATION_SEEKER_TOOLS = [
     # Academic search tools - Springer Nature
     "springer_search",
     "springer_get_article",
+
+    # RAG Knowledge Base
+    "search_rag_knowledge",
+    "rag_document_saver",  # Save RAG search results to workspace for citation generation
 ]
 
 WRITER_AGENT_TOOLS = [
