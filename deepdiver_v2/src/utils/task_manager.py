@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 class TaskStatus(Enum):
     """Task execution status"""
     PENDING = "pending"
+    QUEUED = "queued"
     RUNNING = "running"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
@@ -37,6 +38,7 @@ class TaskInfo:
     result: Optional[Any] = None
     error: Optional[str] = None
     progress: Dict[str, Any] = field(default_factory=dict)
+    queue_position: Optional[int] = None
     
     def is_cancelled(self) -> bool:
         """Check if task has been cancelled"""
@@ -158,19 +160,28 @@ class TaskManager:
         Returns:
             True if task was found and cancellation requested, False otherwise
         """
-        with self._tasks_lock:
-            if task_id not in self._tasks:
-                logger.warning(f"Task {task_id} not found for cancellation")
-                return False
-            
-            task = self._tasks[task_id]
-            if task.status in [TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED]:
-                logger.info(f"Task {task_id} already in terminal state: {task.status.value}")
-                return False
-            
-            task.cancel()
-            logger.info(f"Task {task_id} cancellation requested")
-            return True
+        # 【关键修复】使用单次锁获取，避免死锁和长时间阻塞
+        # 整个操作非常快（只是设置Event和更新状态），不需要复杂的双重检查
+        try:
+            with self._tasks_lock:
+                if task_id not in self._tasks:
+                    logger.warning(f"Task {task_id} not found for cancellation")
+                    return False
+                
+                task = self._tasks[task_id]
+                
+                # 检查任务是否已经在终态
+                if task.status in [TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED]:
+                    logger.info(f"Task {task_id} already in terminal state: {task.status.value}")
+                    return False
+                
+                # 执行取消操作
+                task.cancel()
+                logger.info(f"Task {task_id} cancellation requested, status: {task.status.value}")
+                return True
+        except Exception as e:
+            logger.error(f"Error cancelling task {task_id}: {e}")
+            return False
     
     def get_cancellation_token(self, task_id: str) -> Optional[threading.Event]:
         """
@@ -247,6 +258,34 @@ class TaskManager:
         with self._tasks_lock:
             return sum(1 for task in self._tasks.values() 
                       if task.status == TaskStatus.RUNNING)
+    
+    def get_queued_tasks_count(self) -> int:
+        """Get count of queued tasks"""
+        with self._tasks_lock:
+            return sum(1 for task in self._tasks.values() 
+                      if task.status == TaskStatus.QUEUED)
+    
+    def get_queue_position(self, task_id: str) -> Optional[int]:
+        """Get the position of a task in the queue (1-indexed)"""
+        with self._tasks_lock:
+            queued_tasks = sorted(
+                [task for task in self._tasks.values() if task.status == TaskStatus.QUEUED],
+                key=lambda t: t.created_at
+            )
+            for i, task in enumerate(queued_tasks, 1):
+                if task.task_id == task_id:
+                    return i
+            return None
+    
+    def update_queue_positions(self):
+        """Update queue positions for all queued tasks"""
+        with self._tasks_lock:
+            queued_tasks = sorted(
+                [task for task in self._tasks.values() if task.status == TaskStatus.QUEUED],
+                key=lambda t: t.created_at
+            )
+            for i, task in enumerate(queued_tasks, 1):
+                task.queue_position = i
     
     def remove_task(self, task_id: str):
         """

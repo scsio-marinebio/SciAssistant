@@ -1,4 +1,3 @@
-# Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
 # Copyright (c) 2026 South China Sea Institute of Oceanology, Chinese Academy of Sciences (SCSIO, CAS). All rights reserved.
 #!/usr/bin/env python3
 """
@@ -14,6 +13,7 @@ import logging
 import time
 import uuid
 import yaml
+import os
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -49,16 +49,35 @@ except ImportError:
 # Workspace knowledge manager disabled
 WORKSPACE_KNOWLEDGE_AVAILABLE = False
 
-# Configure structured logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('mcp_server.log')
-    ]
-)
+# Configure structured logging - write to logs directory like app.log
+# Create logs directory if it doesn't exist
+log_dir = Path(__file__).parent.parent.parent.parent / 'logs'
+log_dir.mkdir(parents=True, exist_ok=True)
+
+# Force configure root logger (basicConfig may be ignored if already configured)
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# Remove existing handlers to avoid duplicates
+for handler in root_logger.handlers[:]:
+    root_logger.removeHandler(handler)
+
+# Add console handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
+console_handler.setFormatter(console_formatter)
+root_logger.addHandler(console_handler)
+
+# Add file handler
+file_handler = logging.FileHandler(log_dir / 'mcp_server.log', encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
+file_handler.setFormatter(file_formatter)
+root_logger.addHandler(file_handler)
+
 logger = logging.getLogger(__name__)
+logger.info(f"MCP Server logging configured: {log_dir / 'mcp_server.log'}")
 
 # ================ CONFIGURATION ================
 
@@ -324,6 +343,32 @@ def get_tool_function(tool_name: str):
         
         # Internal tools - available to server but NOT exposed to agents via tool schemas
         "internal_file_read_unlimited": lambda tools, **kwargs: tools.internal_file_read_unlimited(**kwargs),
+        # Resource Library - PubMed tools
+        "search_pubmed_key_words": lambda tools, **kwargs: tools.search_pubmed_key_words(**kwargs),
+        "search_pubmed_advanced": lambda tools, **kwargs: tools.search_pubmed_advanced(**kwargs),
+        "get_pubmed_article": lambda tools, **kwargs: tools.get_pubmed_article(**kwargs),
+        
+        # Resource Library - arXiv tools
+        "arxiv_search": lambda tools, **kwargs: tools.arxiv_search(**kwargs),
+        "arxiv_read_paper": lambda tools, **kwargs: tools.arxiv_read_paper(**kwargs),
+        
+        # Resource Library - medRxiv tools
+        "medrxiv_search": lambda tools, **kwargs: tools.medrxiv_search(**kwargs),
+        "medrxiv_read_paper": lambda tools, **kwargs: tools.medrxiv_read_paper(**kwargs),
+        
+        # Resource Library - Google Scholar tools
+        "google_scholar_search": lambda tools, **kwargs: tools.google_scholar_search(**kwargs),
+        "advanced_google_scholar_search": lambda tools, **kwargs: tools.advanced_google_scholar_search(**kwargs),
+        "google_scholar_get_paper": lambda tools, **kwargs: tools.google_scholar_get_paper(**kwargs),
+        
+        # Resource Library - Sci-Hub tools
+        "scihub_search": lambda tools, **kwargs: tools.scihub_search(**kwargs),
+        "scihub_search_by_title": lambda tools, **kwargs: tools.scihub_search_by_title(**kwargs),
+        "scihub_get_paper": lambda tools, **kwargs: tools.scihub_get_paper(**kwargs),
+        
+        # Resource Library - Springer Nature tools
+        "springer_search": lambda tools, **kwargs: tools.springer_search(**kwargs),
+        "springer_get_article": lambda tools, **kwargs: tools.springer_get_article(**kwargs),
     }
     return tool_map.get(tool_name)
 
@@ -695,11 +740,14 @@ class ThreadSafeSessionManager:
         
         # 如果找不到，使用当前工作目录
         if project_root is None:
-            project_root = Path.cwd()
+            project_root = current_file.parent.parent.parent.parent
+            logger.warning(f"Could not find app.py, using fallback project root: {project_root}")
         
         # 将 base_workspace_dir 设置为项目根目录下的路径
         self.base_workspace_dir = project_root / base_workspace_dir
         self.base_workspace_dir.mkdir(exist_ok=True, parents=True)
+        
+        logger.info(f"Workspace base directory initialized at: {self.base_workspace_dir}")
         
         # Thread-safe session storage
         self.sessions: Dict[str, Session] = {}
@@ -1144,6 +1192,11 @@ async def _call_session_tool_async(session: Session, tool_name: str, tool_args: 
             # Define the synchronous tool execution function
             def execute_tool_sync():
                 """Synchronous tool execution to be run in thread pool"""
+                # CRITICAL FIX: For sync tools, set session context inside the thread
+                # to ensure workspace_path is correctly updated before tool execution
+                if hasattr(mcp_tools, 'set_session_context'):
+                    mcp_tools.set_session_context(session.id, str(session.workspace_path))
+                    logger.debug(f"[HITL DEBUG] Sync tool {tool_name}: set session context, workspace={session.workspace_path}")
                 return tool_method(**tool_args)
             
             # Execute tool asynchronously in thread pool for true non-blocking execution

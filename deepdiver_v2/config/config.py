@@ -1,4 +1,3 @@
-# Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
 # Copyright (c) 2026 South China Sea Institute of Oceanology, Chinese Academy of Sciences (SCSIO, CAS). All rights reserved.
 import os
 from typing import Optional, Dict, Any
@@ -43,10 +42,22 @@ class APIConfig:
     url_crawler_api_keys: Optional[str] = None  # Can be comma-separated for rotation
     url_crawler_max_tokens: int = 100000
     
+    # RAG Knowledge Base Configuration
+    rag_api_url: Optional[str] = None
+    rag_app_code: Optional[str] = None
+    rag_default_repo_id: Optional[str] = None
+    rag_default_page_size: int = 20  # 增加到 20，提高相关文档覆盖率
+    search_source_rag: bool = True  # 是否全局启用 RAG 搜索源
+
+    # Proxy Configuration
+    http_proxy: Optional[str] = None
+    https_proxy: Optional[str] = None
+    no_proxy: Optional[str] = None
+    
     # Model Interaction Configuration
     model_temperature: float = 0.3
     model_max_tokens: int = 8192
-    model_request_timeout: int = 6000
+    model_request_timeout: int = 900
     
     # Tool Trajectory and Output Configuration  
     trajectory_storage_path: str = "./workspace"
@@ -90,6 +101,18 @@ class APIConfig:
         self.url_crawler_base_url = os.getenv("URL_CRAWLER_BASE_URL")
         self.url_crawler_api_keys = os.getenv("URL_CRAWLER_API_KEYS")
         self.url_crawler_max_tokens = int(os.getenv("URL_CRAWLER_MAX_TOKENS", self.url_crawler_max_tokens))
+        
+        # RAG Knowledge Base Configuration
+        self.rag_api_url = os.getenv("RAG_API_URL")
+        self.rag_app_code = os.getenv("RAG_APP_CODE")
+        self.rag_default_repo_id = os.getenv("RAG_DEFAULT_REPO_ID")
+        self.rag_default_page_size = int(os.getenv("RAG_DEFAULT_PAGE_SIZE", self.rag_default_page_size))
+        self.search_source_rag = os.getenv("SEARCH_SOURCE_RAG", "true").lower() == "true"
+
+        # Proxy Configuration
+        self.http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+        self.https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
+        self.no_proxy = os.getenv("NO_PROXY") or os.getenv("no_proxy")
         
         # Model Interaction Configuration
         self.model_temperature = float(os.getenv("MODEL_TEMPERATURE", self.model_temperature))
@@ -229,6 +252,39 @@ def get_mcp_config() -> Dict[str, Any]:
         "use_stdio": config.mcp_use_stdio,
         "timeout": config.timeout
     }
+
+def get_rag_config() -> Dict[str, Any]:
+    """Get RAG knowledge base configuration"""
+    return {
+        "api_url": config.rag_api_url,
+        "app_code": config.rag_app_code,
+        "default_repo_id": config.rag_default_repo_id,
+        "default_page_size": config.rag_default_page_size,
+        "search_source_rag": config.search_source_rag,
+        "timeout": config.timeout
+    }
+
+
+def get_proxy_config() -> Dict[str, str]:
+    """
+    Get proxy configuration for requests library.
+    Returns empty dict if no proxy is configured, allowing requests to use system proxy.
+    
+    Returns:
+        Dict with 'http' and 'https' keys if proxy is configured, otherwise empty dict
+    """
+    # If environment variables are set, return empty dict to let requests auto-detect
+    # This allows system proxy to work automatically
+    if config.http_proxy or config.https_proxy:
+        proxy_dict = {}
+        if config.http_proxy:
+            proxy_dict['http'] = config.http_proxy
+        if config.https_proxy:
+            proxy_dict['https'] = config.https_proxy
+        return proxy_dict
+    
+    # Return empty dict to allow requests to use system proxy automatically
+    return {}
 
 
 # Example usage and testing

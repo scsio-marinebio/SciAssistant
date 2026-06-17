@@ -1,4 +1,3 @@
-# Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
 # Copyright (c) 2026 South China Sea Institute of Oceanology, Chinese Academy of Sciences (SCSIO, CAS). All rights reserved.
 """
 Planner Agent for Multi-Agent Task Coordination
@@ -50,6 +49,9 @@ class PlannerAgent(BaseAgent):
 		# Task management for cancellation support
         self.task_id = task_id
         self._cancellation_token = None
+        
+        # Progress callback for SSE streaming
+        self.progress_callback = None
 		
         # Add built-in task assignment methods to available tools
         self._add_builtin_assignment_tools()
@@ -59,6 +61,32 @@ class PlannerAgent(BaseAgent):
 
         self.sub_agent_configs = {}
 
+    def set_progress_callback(self, callback):
+        """设置进度回调函数"""
+        self.progress_callback = callback
+    
+    def _send_progress(self, stage: str, message: str, details: dict = None):
+        """发送进度更新"""
+        self.logger.info(f"[PROGRESS] _send_progress called: stage={stage}, message={message}, has_callback={self.progress_callback is not None}, task_id={self.task_id}")
+        if self.progress_callback and self.task_id:
+            # 统一设置task_type为writing，所有任务都显示详细进度
+            details = details or {}
+            if 'task_type' not in details:
+                details['task_type'] = 'writing'
+            
+            progress_data = {
+                'type': 'progress',
+                'stage': stage,
+                'message': message,
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'details': details
+            }
+            self.logger.info(f"[PROGRESS] Progress data: {progress_data}")
+            self.logger.info(f"[PROGRESS] Calling progress_callback with task_id={self.task_id}")
+            self.progress_callback(self.task_id, progress_data)
+        else:
+            self.logger.warning(f"[PROGRESS] Progress not sent: has_callback={self.progress_callback is not None}, task_id={self.task_id}")
+    
     def _add_builtin_assignment_tools(self):
         """Add built-in task assignment methods as available tools"""
         # Add assignment methods that share the MCP client connection
@@ -72,6 +100,14 @@ class PlannerAgent(BaseAgent):
         tool_schemas_str = json.dumps(self.tool_schemas, ensure_ascii=False)
 
         auto_system_prompt_template = """# PlannerAgent: Multi-Agent Task Coordinator
+
+## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+**Detect the language of the user's query and respond accordingly:**
+- **English query → Respond in English**
+- **Chinese query (中文) → Respond in Chinese (中文回复)**
+- **Mixed Chinese-English query → Respond in Chinese (中文回复)**
+This rule applies to ALL outputs including: task planning, final answers, summaries, and any content delivered to the user.
+
 **Role:** Analyze complex queries, first distinguish query type (long-form writing type/objective question type), then create structured plans, and coordinate specialized agents to deliver comprehensive solutions—call corresponding tools based on query type, and only invoke writer for long-form writing type queries.
 
 #### Available Sub-Agents:  
@@ -155,6 +191,14 @@ For each function call, return a JSON object placed within the [unused11][unused
 [unused11][{\"name\": <function name>, \"arguments\": <args json object>}][unused12]"""
 
         writing_system_prompt_template = """### PlannerAgent: Multi-Agent Task Coordinator  
+
+## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+**Detect the language of the user's query and respond accordingly:**
+- **English query → Respond in English**
+- **Chinese query (中文) → Respond in Chinese (中文回复)**
+- **Mixed Chinese-English query → Respond in Chinese (中文回复)**
+This rule applies to ALL outputs including: task planning, final answers, summaries, and any content delivered to the user.
+
 **Role:** Analyze complex queries, create structured plans, and coordinate specialized agents to deliver comprehensive solutions.  
 
 #### Available Sub-Agents:  
@@ -205,6 +249,9 @@ For each function call, return a JSON object placed within the [unused11][unused
   - Before invoking writer, analyze collected information for sufficiency: evaluate both quantity and comprehensiveness to ensure adequate material for long article generation
   - If information is insufficient, adjust subtask direction and initiate additional targeted information collection
 - **When information is sufficient, invoke writer agent** via `assign_subjective_task_to_writer`
+  - **CRITICAL:** You MUST collect ALL key_files returned by ALL completed information_seeker subtasks and pass them to the writer agent in the key_files parameter
+  - Each key_file should include the file_path field containing the exact relative path returned by information_seeker
+  - Do NOT filter or select files - pass ALL key_files from ALL subtasks to ensure the writer has complete information
 
 #### 3. Completion & Synthesis Phase  
 - **Validation:** Cross-check multi-source outputs for consistency, and Check whether the information source is sufficient
@@ -240,6 +287,14 @@ For each function call, return a JSON object placed within the [unused11][unused
 [unused11][{\"name\": <function name>, \"arguments\": <args json object>}][unused12]"""
 
         qa_system_prompt_template = """### PlannerAgent: Multi-Agent Task Coordinator  
+
+## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+**Detect the language of the user's query and respond accordingly:**
+- **English query → Respond in English**
+- **Chinese query (中文) → Respond in Chinese (中文回复)**
+- **Mixed Chinese-English query → Respond in Chinese (中文回复)**
+This rule applies to ALL outputs including: task planning, final answers, summaries, and any content delivered to the user.
+
 **Role:** Analyze complex queries, create structured plans, and coordinate specialized agents to deliver comprehensive solutions.  
 
 #### Available Sub-Agents:  
@@ -340,6 +395,15 @@ For each function call, return a JSON object placed within the [unused11][unused
             MCPToolResult with execution results for all tasks
         """
         try:
+            # 发送进度：开始信息搜集（包含子任务列表）
+            subtask_names = [task.get('task_content', '')[:50] for task in tasks]  # 截取前50字符
+            _info_msg = '正在搜集信息' if getattr(self, '_is_chinese_query', True) else 'Gathering information'
+            self._send_progress('info_seeking', _info_msg, {
+                'subtasks_count': len(tasks),
+                'task_type': 'objective',
+                'subtask_names': subtask_names
+            })
+            
             # Validate task count (1-4 tasks)
             if not (1 <= len(tasks) <= 5):
                 return {
@@ -379,6 +443,9 @@ For each function call, return a JSON object placed within the [unused11][unused
                         max_iterations=info_seeker_config.get('max_iterations', 30),
                         shared_mcp_client=self.mcp_tools.client if hasattr(self.mcp_tools, 'client') else self.mcp_tools
                     )
+                    # 【关键修复】传递取消令牌给子 Agent
+                    if self._cancellation_token:
+                        info_seeker.set_cancellation_token(self._cancellation_token)
 
                     self.logger.info(f"Assigning task to InformationSeekerAgent: {task['task_content'][:8000]}...")
 
@@ -455,7 +522,7 @@ For each function call, return a JSON object placed within the [unused11][unused
             self,
             tasks: List[Dict[str, str]],
             max_workers: int = 5
-    ) -> Dict[str, Any]:
+        ) -> Dict[str, Any]:
         """
         Creates multiple TaskInput objects and routes them to info_seeker agents for concurrent execution.
         This tool enables the PlannerAgent to assign multiple research tasks through the MCP tool interface.
@@ -475,6 +542,15 @@ For each function call, return a JSON object placed within the [unused11][unused
             MCPToolResult with execution results for all tasks
         """
         try:
+            # 发送进度：开始信息搜集（主观型，包含子任务列表）
+            subtask_names = [task.get('task_content', '')[:100] + ('...' if len(task.get('task_content', '')) > 100 else '') for task in tasks]  # 截取前100字符
+            _info_msg = '正在搜集信息' if getattr(self, '_is_chinese_query', True) else 'Gathering information'
+            self._send_progress('info_seeking', _info_msg, {
+                'subtasks_count': len(tasks),
+                'task_type': 'subjective',
+                'subtask_names': subtask_names
+            })
+            
             # Validate task count (1-4 tasks)
             if not (1 <= len(tasks) <= 6):
                 return {
@@ -512,6 +588,9 @@ For each function call, return a JSON object placed within the [unused11][unused
                         max_iterations=info_seeker_config.get('max_iterations', 30),
                         shared_mcp_client=self.mcp_tools.client if hasattr(self.mcp_tools, 'client') else self.mcp_tools
                     )
+                    # 【关键修复】传递取消令牌给子 Agent
+                    if self._cancellation_token:
+                        info_seeker.set_cancellation_token(self._cancellation_token)
 
                     self.logger.info(f"Assigning task to InformationSeekerAgent: {task['task_content'][:8000]}...")
 
@@ -562,6 +641,13 @@ For each function call, return a JSON object placed within the [unused11][unused
 
             # Check overall success
             all_success = all(task_result.get("success", False) for task_result in results)
+            
+            # 信息搜集完成后，发送简单的完成消息
+            # 文件列表将在WriterAgent开始写作时推送
+            if all_success:
+                _completed_msg = '信息搜集完成' if getattr(self, '_is_chinese_query', True) else 'Information gathering completed'
+                self._send_progress('info_seeking_completed', _completed_msg)
+                self.logger.info(f"[PROGRESS] 信息搜集完成，文件列表将在写作开始时推送")
 
             return {
                 "success": all_success,
@@ -618,10 +704,21 @@ For each function call, return a JSON object placed within the [unused11][unused
                 model=writer_config.get('model', self.config.model),
                 max_iterations=writer_config.get('max_iterations', 20),
                 temperature=writer_config.get('temperature', 0.3),
-                max_tokens=writer_config.get('max_tokens', 16384)
+                max_tokens=writer_config.get('max_tokens', 16384),
+                task_id=self.task_id
             )
+            # 【关键修复】传递取消令牌给子 Agent
+            if self._cancellation_token:
+                writer.set_cancellation_token(self._cancellation_token)
+            # 传递进度回调给子 Agent
+            if self.progress_callback:
+                writer.set_progress_callback(self.progress_callback)
+            # 传递语言标志给子 Agent
+            writer._is_chinese_query = getattr(self, '_is_chinese_query', True)
 
             self.logger.info(f"Assigning task to WriterAgent: {task_content[:800]}...")
+
+            # 文件列表将由WriterAgent在过滤完文件后推送，确保显示的是实际使用的文件数量
 
             # Execute the task with shared connection
             response = writer.execute_task(task_input)
@@ -643,7 +740,9 @@ For each function call, return a JSON object placed within the [unused11][unused
                 }
 
         except Exception as e:
+            import traceback
             self.logger.error(f"Failed to assign task to WriterAgent: {e}")
+            self.logger.error(f"Full traceback: {traceback.format_exc()}")
             return {
                 "success": False,
                 "error": f"Task assignment failed: {str(e)}"
@@ -865,7 +964,7 @@ For each function call, return a JSON object placed within the [unused11][unused
                             },
                             "task_summary": {
                                 "type": "string",
-                                "description": "This field is mainly used to describe the main content of the article, briefly summarize it, and finally indicate the path where the final article is saved.",
+                                "description": "This field is mainly used to describe the main content of the article, briefly summarize it, and finally indicate the path where the final article is saved. CRITICAL: Must use the SAME LANGUAGE as the user's query (Chinese query → Chinese summary, English query → English summary).",
                                 "format": "markdown"
                             },
                             "task_name": {
@@ -892,7 +991,7 @@ For each function call, return a JSON object placed within the [unused11][unused
                         "properties": {
                             "task_summary": {
                                 "type": "string",
-                                "description": "Comprehensive markdown covering what the agent was asked to do, steps taken, tools used, key findings, files created, challenges",
+                                "description": "Comprehensive markdown covering what the agent was asked to do, steps taken, tools used, key findings, files created, challenges. CRITICAL: Must use the SAME LANGUAGE as the user's query (Chinese query → Chinese summary, English query → English summary).",
                                 "format": "markdown"
                             },
                             "task_name": {
@@ -928,7 +1027,7 @@ For each function call, return a JSON object placed within the [unused11][unused
                             },
                             "final_answer": {
                                 "type": "string",
-                                "description": "The final response displayed to the user",
+                                "description": "The final response displayed to the user. CRITICAL: Must use the SAME LANGUAGE as the user's query (Chinese query → Chinese answer, English query → English answer).",
                             }
                         },
                         "required": ["task_summary", "task_name", "key_files", "completion_status", "final_answer"]
@@ -985,8 +1084,9 @@ For each function call, return a JSON object placed within the [unused11][unused
 
             # Build system prompt for planning
             system_prompt = self._build_system_prompt()
+            localtime = time.localtime()
             # Add to conversation
-            conversation_history.append({"role": "system", "content": system_prompt})
+            conversation_history.append({"role": "system", "content":f"当前时间为：{localtime}"+ system_prompt})
             conversation_history.append({"role": "user", "content": initial_message + " /no_think"})
 
             iteration = 0
@@ -1002,15 +1102,48 @@ For each function call, return a JSON object placed within the [unused11][unused
             headers = {'Content-Type': 'application/json', 'csb-token': model_token}
             # ReAct Loop: Reasoning -> Acting -> Reasoning -> Acting...
             while iteration < self.config.max_iterations and not task_completed:
+                # 【关键修复】检查任务是否被取消
+                if self._check_cancellation():
+                    self.logger.warning(f"Task {self.task_id} was cancelled at iteration {iteration}")
+                    return {
+                        "success": False,
+                        "error": "Task was cancelled by user",
+                        "reasoning_trace": self.reasoning_trace,
+                        "iterations": iteration,
+                        "execution_time": time.time() - start_time
+                    }
+                
                 iteration += 1
                 self.logger.info(f"Planning iteration {iteration}")
 
                 try:
+                    # 【取消检查】在LLM调用前检查取消状态
+                    if self._check_cancellation():
+                        self.logger.info(f"Task {self.task_id} cancelled before LLM call at iteration {iteration}")
+                        return {
+                            "success": False,
+                            "error": "Task was cancelled by user",
+                            "reasoning_trace": self.reasoning_trace,
+                            "iterations": iteration,
+                            "execution_time": time.time() - start_time
+                        }
+                    
                     # Get LLM response (reasoning + potential tool calls)
                     retry_num = 1
                     max_retry_num = 10
                     while retry_num < max_retry_num:
                         try:
+                            # 【取消检查】在每次重试前检查
+                            if self._check_cancellation():
+                                self.logger.info(f"Task {self.task_id} cancelled during LLM retry {retry_num}")
+                                return {
+                                    "success": False,
+                                    "error": "Task was cancelled by user",
+                                    "reasoning_trace": self.reasoning_trace,
+                                    "iterations": iteration,
+                                    "execution_time": time.time() - start_time
+                                }
+                            
                             response = requests.post(
                                 url=pangu_url,
                                 headers=headers,
@@ -1028,7 +1161,17 @@ For each function call, return a JSON object placed within the [unused11][unused
                             self.logger.debug(f"API response received")
                             break
                         except Exception as e:
-                            time.sleep(3)
+                            # 【取消检查】在异常处理时也检查取消状态
+                            if self._check_cancellation():
+                                self.logger.info(f"Task {self.task_id} cancelled during LLM error handling")
+                                return {
+                                    "success": False,
+                                    "error": "Task was cancelled by user",
+                                    "reasoning_trace": self.reasoning_trace,
+                                    "iterations": iteration,
+                                    "execution_time": time.time() - start_time
+                                }
+                            time.sleep(1)  # 减少重试间隔
                             retry_num += 1
                             if retry_num == max_retry_num:
                                 raise ValueError(str(e))
@@ -1073,6 +1216,17 @@ For each function call, return a JSON object placed within the [unused11][unused
                     # Execute tool calls if any (Acting phase)
 
                     for tool_call in tool_calls:
+                        # 【取消检查】在每个工具调用前检查取消状态
+                        if self._check_cancellation():
+                            self.logger.info(f"Task {self.task_id} cancelled during tool execution loop")
+                            return {
+                                "success": False,
+                                "error": "Task was cancelled by user",
+                                "reasoning_trace": self.reasoning_trace,
+                                "iterations": iteration,
+                                "execution_time": time.time() - start_time
+                            }
+                        
                         arguments = tool_call["arguments"]
                         self.logger.debug(f"Arguments is string: {isinstance(arguments, str)}")
 
@@ -1084,7 +1238,29 @@ For each function call, return a JSON object placed within the [unused11][unused
                         if tool_call["name"] in ["think", "reflect"]:
                             tool_result = {"tool_results": "You can proceed to invoke other tools if needed. "}
                         else:
+                            # 【取消检查】在执行工具前最后检查一次
+                            if self._check_cancellation():
+                                self.logger.info(f"Task {self.task_id} cancelled before executing tool {tool_call['name']}")
+                                return {
+                                    "success": False,
+                                    "error": "Task was cancelled by user",
+                                    "reasoning_trace": self.reasoning_trace,
+                                    "iterations": iteration,
+                                    "execution_time": time.time() - start_time
+                                }
+                            
                             tool_result = self.execute_tool_call(tool_call)
+                            
+                            # 【取消检查】工具执行后立即检查
+                            if self._check_cancellation():
+                                self.logger.info(f"Task {self.task_id} cancelled after executing tool {tool_call['name']}")
+                                return {
+                                    "success": False,
+                                    "error": "Task was cancelled by user",
+                                    "reasoning_trace": self.reasoning_trace,
+                                    "iterations": iteration,
+                                    "execution_time": time.time() - start_time
+                                }
 
                         # Log the action using base class method
                         self.log_action(iteration, tool_call["name"], arguments, tool_result)
@@ -1108,7 +1284,12 @@ For each function call, return a JSON object placed within the [unused11][unused
                 except Exception as e:
                     error_msg = f"Error in planning iteration {iteration}: {e}"
                     self.log_error(iteration, error_msg)
-                    break
+                    # 【关键修复】不要在异常时立即break，而是继续下一次迭代
+                    # 这样可以给任务更多机会完成，避免因为临时网络问题导致任务失败
+                    self.logger.warning(f"Iteration {iteration} failed, will retry in next iteration: {e}")
+                    # 添加短暂延迟后继续
+                    time.sleep(2)
+                    continue
 
             execution_time = time.time() - start_time
 
@@ -1163,6 +1344,87 @@ For each function call, return a JSON object placed within the [unused11][unused
 
         try:
             self.logger.info(f"Starting planner task: {user_query}")
+            
+            # 检测用户查询语言
+            import re as _re
+            _zh_count = len(_re.findall(r'[\u4e00-\u9fff]', user_query))
+            _total_chars = len(user_query.strip())
+            # 只有当中文字符占比超过30%时才判定为中文查询
+            self._is_chinese_query = (_zh_count / max(_total_chars, 1)) > 0.3
+            
+            # 发送初始进度（根据语言切换）
+            _init_msg = '开始分析任务' if self._is_chinese_query else 'Analyzing task'
+            self._send_progress('init', _init_msg, {'query': user_query[:100]})
+
+            # Human in the loop 阶段2：跳过搜索，直接使用已有结果调用 WriterAgent
+            human_in_loop_phase2 = os.environ.get('HUMAN_IN_LOOP_PHASE2', 'false').lower() == 'true'
+            if human_in_loop_phase2:
+                self.logger.info("Human in the loop Phase 2: 跳过搜索阶段，直接调用 WriterAgent")
+                
+                # 读取 workspace 中已有的 key_files
+                workspace_path = os.environ.get('AGENT_WORKSPACE_PATH', '')
+                key_files = []
+                # 优先使用调用方显式注入的大纲（避免并发任务下全局环境变量串扰）
+                user_outline = (getattr(self, "_hitl_user_outline", "") or "").strip()
+                if workspace_path:
+                    from pathlib import Path
+                    workspace_path_obj = Path(workspace_path)
+                    
+                    # 回退：未注入时再从 workspace 读取用户确认大纲
+                    if not user_outline:
+                        user_outline_file = workspace_path_obj / '.user_outline'
+                        if user_outline_file.exists():
+                            with open(user_outline_file, 'r', encoding='utf-8') as f:
+                                user_outline = f.read().strip()
+                
+                    self.logger.info(f"Human in the loop Phase 2: 读取用户确认大纲，长度 {len(user_outline)} 字符")
+                    
+                    # 读取已有的 key_files
+                    file_analysis_path = workspace_path_obj / "doc_analysis" / "file_analysis.jsonl"
+                    if file_analysis_path.exists():
+                        with open(file_analysis_path, 'r', encoding='utf-8') as f:
+                            for line in f:
+                                try:
+                                    file_info = json.loads(line.strip())
+                                    if file_info.get('file_path'):
+                                        key_files.append({
+                                            'file_path': file_info.get('file_path'),
+                                            'desc': file_info.get('core_content', '')[:200]
+                                        })
+                                except:
+                                    continue
+                        self.logger.info(f"Human in the loop Phase 2: 加载了 {len(key_files)} 个已有文件")
+                
+                # 构建包含用户大纲的任务内容，明确指示 WriterAgent 跳过大纲生成步骤
+                task_content = f"""【重要】这是 Human in the loop 阶段2，用户已确认大纲，请严格按照以下要求执行：
+
+1. 【跳过大纲生成】不要自己生成大纲，直接使用下面用户确认的大纲
+2. 【直接进行文件分类】调用 search_result_classifier 工具时，必须使用下面的用户确认大纲作为 outline 参数
+3. 【按大纲写作】严格按照用户确认的大纲章节结构进行写作
+
+用户确认的大纲：
+{user_outline}
+
+用户原始查询：{user_query}"""
+                
+                # 直接调用 WriterAgent
+                result = self.assign_subjective_task_to_writer(
+                    task_content=task_content,
+                    user_query=user_query,
+                    key_files=key_files
+                )
+                
+                execution_time = time.time() - start_time
+                
+                return AgentResponse(
+                    success=result.get("success", False),
+                    result=result.get("data"),
+                    error=result.get("error"),
+                    reasoning_trace=[],
+                    iterations=1,
+                    execution_time=execution_time,
+                    agent_name=self.config.agent_name
+                )
 
             # Execute the planning task using ReAct pattern
             result = self._execute_react_loop(

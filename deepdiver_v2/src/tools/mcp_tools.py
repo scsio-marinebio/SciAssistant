@@ -1,4 +1,3 @@
-# Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
 # Copyright (c) 2026 South China Sea Institute of Oceanology, Chinese Academy of Sciences (SCSIO, CAS). All rights reserved.
 import os
 import json
@@ -33,8 +32,8 @@ from typing import Optional
 
 import feedparser
 from .paper import Paper
-from .normalizer import Area, CompanyStatus, DateRange, normalize_company_name
-
+from config.logging_config import get_logger
+logger = get_logger()
 # from markdown_pdf import MarkdownPdf, Section  # 改用 ReportLab
 
 # ReportLab imports for PDF generation
@@ -43,16 +42,30 @@ try:
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import cm
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle, Preformatted, \
-        Image as RLImage, HRFlowable
+        Image as RLImage, HRFlowable, Flowable
     from reportlab.lib import colors
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY, TA_RIGHT
+    
+    # 尝试导入 Bookmark 和 TableOfContents（用于创建 PDF 书签）
+    try:
+        from reportlab.platypus.tableofcontents import TableOfContents
+        from reportlab.platypus.paragraph import Paragraph as BaseParagraph
+        BOOKMARK_AVAILABLE = True
+    except ImportError:
+        BOOKMARK_AVAILABLE = False
+        logger.info("提示: TableOfContents 不可用，PDF 将不包含书签导航")
 
     REPORTLAB_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     REPORTLAB_AVAILABLE = False
-    logger.warning("警告: ReportLab 未安装，请运行: pip install reportlab")
+    BOOKMARK_AVAILABLE = False
+    logger.warning(f"警告: ReportLab 未安装或导入失败: {e}，请运行: pip install reportlab")
+except Exception as e:
+    REPORTLAB_AVAILABLE = False
+    BOOKMARK_AVAILABLE = False
+    logger.error(f"错误: ReportLab 导入时发生异常: {e}")
 
 # 尝试导入matplotlib用于渲染数学公式
 try:
@@ -106,7 +119,9 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-proxy = {}
+# Import proxy configuration
+from config.config import get_proxy_config
+proxy = get_proxy_config()
 
 
 @dataclass
@@ -193,6 +208,20 @@ def _wrap_special_symbol(symbol: str, fallback: str = None) -> str:
     return symbol
 
 
+def _strip_escaped_font_tags(text: str) -> str:
+    text = re.sub(r'&lt;\s*/?\s*font\b[^&]*?&gt;', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'&amp;lt;\s*/?\s*font\b[^&]*?&amp;gt;', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'&#60;\s*/?\s*font\b[^#]*?&#62;', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'&#x3c;\s*/?\s*font\b[^#]*?&#x3e;', '', text, flags=re.IGNORECASE)
+    return text
+
+
+def _strip_all_font_tags(text: str) -> str:
+    text = re.sub(r'</?\s*font\b[^>]*>', '', text, flags=re.IGNORECASE)
+    text = _strip_escaped_font_tags(text)
+    return text
+
+
 def _simplify_latex(latex_text: str) -> str:
     """
     简化LaTeX数学公式为可读文本
@@ -204,6 +233,9 @@ def _simplify_latex(latex_text: str) -> str:
     Returns:
         简化后的文本
     """
+ 
+    latex_text = _strip_all_font_tags(latex_text)
+ 
     # 常见LaTeX命令映射 - 使用有序字典确保处理顺序
     # 重要：必须先处理长命令，再处理短命令，避免部分匹配
     replacements = [
@@ -408,28 +440,51 @@ def _simplify_latex(latex_text: str) -> str:
     return result
 
 
+def _escape_url_for_html_attr(url: str) -> str:
+    """转义 URL 中的特殊字符，使其可以安全地用于 HTML href 属性"""
+    if not url:
+        return url
+    # 转义 & 为 &amp;（必须首先处理，避免重复转义）
+    url = url.replace('&', '&amp;')
+    # 转义引号
+    url = url.replace('"', '&quot;')
+    return url
+
+
 def _process_inline_formatting(text: str) -> str:
     """
     将 Markdown 行内格式转换为 ReportLab 可解析的安全 HTML，
     保证标签平衡，避免 PDF 生成时的解析错误。
     """
-
+    
+    # 先将 id 转换为 name
     text = re.sub(r'<a\s+id="([^"]+)"', r'<a name="\1"', text)
 
+    # 处理带 style 属性的链接，转义 URL 中的特殊字符
+    def fix_styled_link(m):
+        url = m.group(1)
+        safe_url = _escape_url_for_html_attr(url)
+        return f'<a href="{safe_url}" color="#04B5BB">'
+    
     text = re.sub(
         r'<a\s+href="([^"]+)"\s+style="[^"]*">',
-        r'<a href="\1" color="#04B5BB">',
+        fix_styled_link,
         text
     )
 
-    # 3. 为没有颜色属性的 href 链接添加颜色
+    # 3. 为没有颜色属性的 href 链接添加颜色，同时转义 URL
     # 匹配: <a href="..."> (但不匹配已有color属性的)
+    def fix_uncolored_link(m):
+        url = m.group(1)
+        safe_url = _escape_url_for_html_attr(url)
+        return f'<a href="{safe_url}" color="#04B5BB">'
+    
     text = re.sub(
         r'<a\s+href="([^"]+)"(?!\s+color)>',
-        r'<a href="\1" color="#04B5BB">',
+        fix_uncolored_link,
         text
     )
-
+    
     # 恢复并增强Unicode上下标处理
     # 这一步非常关键，因为用户经常直接复制粘贴包含Unicode上标（如 ⁻¹⁶）的文本
     # 而这些字符在标准中文字体（如宋体）中通常不支持，导致显示为空白
@@ -461,11 +516,49 @@ def _process_inline_formatting(text: str) -> str:
         if unicode_char in text:
             text = text.replace(unicode_char, f'<sub>{normal_char}</sub>')
 
-    # 特殊字符处理
+    # 先保护数学公式 $...$ (必须在数学符号处理之前，避免公式内的希腊字母被错误地包裹font标签)
+    math_formulas = []
+
+    def protect_math(match):
+        formula = match.group(1)
+        placeholder = f"__MATH_FORMULA_{len(math_formulas)}__"
+        math_formulas.append(formula)
+        return placeholder
+
+    # 【关键】在匹配$...$公式之前，先保护所有<a>标签（含href/name属性）
+    # 防止$...$公式匹配跨越HTML锚点标签，导致_simplify_latex将属性中的_转为<sub>
+    # 例如: "公式$x$的值...<a href="#ref-msg_123">...$y$" 中两个$之间包含href属性
+    anchor_tag_placeholders = []
+    def protect_anchor_tag(match):
+        placeholder = f"__ANCHOR_TAG_{len(anchor_tag_placeholders)}__"
+        anchor_tag_placeholders.append(match.group(0))
+        return placeholder
+    # 保护完整的<a>标签（包括开标签和闭标签之间的所有内容，以及自闭合的<a name="..."></a>）
+    text = re.sub(r'<a\s[^>]*>.*?</a>', protect_anchor_tag, text, flags=re.IGNORECASE | re.DOTALL)
+    # 保护独立的<a name="..."></a>锚点定义
+    text = re.sub(r'<a\s[^>]*></a>', protect_anchor_tag, text, flags=re.IGNORECASE)
+
+    # 保护行内数学公式 $...$
+    # 使用非贪婪匹配,确保只匹配成对的$
+    text = re.sub(r'\$([^\$]+?)\$', protect_math, text)
+
+    # 恢复锚点标签占位符
+    for i, original in enumerate(anchor_tag_placeholders):
+        text = text.replace(f"__ANCHOR_TAG_{i}__", original)
+
+    # 清理孤立的$符号(没有配对的)
+    # 统计剩余的$数量,如果是奇数,说明有孤立的$
+    dollar_count = text.count('$')
+    if dollar_count > 0:
+        # 移除所有剩余的孤立$符号
+        text = text.replace('$', '')
+
+    # 特殊字符处理（必须在公式保护之后，避免污染公式内容）
     text = text.replace('μ', 'µ').replace('µ', '<font name="Arial">µ</font>')
     text = text.replace('ŷ', '<font name="Arial">ŷ</font>')
 
     # 处理宋体不支持的数学符号，使用 Arial 字体显示（Windows 系统自带）
+    # 注意：这里只处理公式外的数学符号，公式内的符号由 _simplify_latex 处理
     math_symbols = [
         # 希腊字母
         'α', 'β', 'γ', 'δ', 'ε', 'ζ', 'η', 'θ', 'ι', 'κ', 'λ', 'ν', 'ξ', 'ο', 'π',
@@ -484,33 +577,19 @@ def _process_inline_formatting(text: str) -> str:
         if sym in text:
             text = text.replace(sym, f'<font name="Arial">{sym}</font>')
 
-    # 先保护数学公式 $$ ... $$ (避免被后续处理破坏)
-    math_formulas = []
-
-    def protect_math(match):
-        formula = match.group(1)
-        placeholder = f"__MATH_FORMULA_{len(math_formulas)}__"
-        math_formulas.append(formula)
-        return placeholder
-
-    # 保护行内数学公式 $...$
-    # 使用非贪婪匹配,确保只匹配成对的$
-    text = re.sub(r'\$([^\$]+?)\$', protect_math, text)
-
-    # 清理孤立的$符号(没有配对的)
-    # 统计剩余的$数量,如果是奇数,说明有孤立的$
-    dollar_count = text.count('$')
-    if dollar_count > 0:
-        # 移除所有剩余的孤立$符号
-        text = text.replace('$', '')
-
     # 处理文献引用格式（必须在普通Markdown链接之前处理）
     # 格式1: [数字] 标题/文件名，URL.pdf，日期 - PDF文件引用（根据URL是否以.pdf结尾判断）
     def replace_pdf_reference(match):
         num = match.group(1)
         title = match.group(2)  # 标题或文件名（可以不含.pdf）
-        url = match.group(3)  # URL必须以.pdf结尾
+        url = match.group(3)  # PDF URL
         date = match.group(4) if len(match.groups()) >= 4 and match.group(4) else ''
+        
+        # 清理和转义 URL
+        url = url.strip()
+        url = re.sub(r'["\'/]+$', '', url)
+        url_escaped = url.replace('&', '&amp;')
+        
         # 使用回形针图标📎 (U+1F4CE) 表示可下载的PDF文档
         # 处理无法确定月份的情况，只显示年份
         if date and date.strip():
@@ -523,24 +602,77 @@ def _process_inline_formatting(text: str) -> str:
             date_part = f', {date_str}'
         else:
             date_part = ''
-        # 使用font标签指定emoji字体来显示图标，ReportLab会自动回退到支持该字符的字体
-        return f'[{num}] <font name="EmojiFont">📎</font> {title}, <a href="{url}" color="#04B5BB">{url}</a>{date_part}'
+        
+        # 使用 📎 图标表示PDF文件（已下载完整内容）
+        # 注意：添加style属性确保图标不受父元素斜体样式影响
+        return f'[{num}] <font name="EmojiFont" style="font-style: normal;">📎</font> {title}, <a href="{url_escaped}" color="#04B5BB">{url_escaped}</a>{date_part}'
 
+    # 改进的正则表达式0：优先匹配标题包含.pdf的引用（不管URL是什么）
+    # 这样可以正确识别标题含.pdf但URL不是PDF的情况，如：[42] 2401.10359v1.pdf, https://arxiv.org/abs/2401.10359
+    # 使用负向前瞻，跳过已经有图标的引用（<font name="EmojiFont">）
+    text = re.sub(r'\[(\d+)\]\s(?!<font name="EmojiFont">)(.+?\.pdf.+?)，(https?://[^\s，]+)(?:，(.+?))?(?=\s*\n|\s*$)',
+                  replace_pdf_reference, text, flags=re.IGNORECASE | re.MULTILINE)
+    
     # 改进的正则表达式1：根据URL是否以.pdf结尾来判断PDF引用（不管标题是什么）
     # 这样可以正确识别标题不含.pdf但URL是PDF的情况，如：[1] BD CD Marker Handbook, https://example.com/file.pdf
-    text = re.sub(r'\[(\d+)\]\s*(.+?)，(https?://[^\s，]+?\.pdf)(?:，(.+?))?(?=\s*\n|\s*$)',
+    # 使用负向前瞻，跳过已经有图标的引用（<font name="EmojiFont">）
+    text = re.sub(r'\[(\d+)\]\s(?!<font name="EmojiFont">)(.+?)，(https?://[^\s，]+?\.pdf)(?:，(.+?))?(?=\s*\n|\s*$)',
                   replace_pdf_reference, text, flags=re.IGNORECASE | re.MULTILINE)
+
+    # 改进的正则表达式1.1：匹配arxiv.org/pdf/格式的PDF链接（不以.pdf结尾）
+    # 使用负向前瞻，跳过已经有图标的引用
+    text = re.sub(r'\[(\d+)\]\s(?!<font name="EmojiFont">)(.+?)，(https?://arxiv\.org/pdf/[^\s，]+)(?:，(.+?))?(?=\s*\n|\s*$)',
+                  replace_pdf_reference, text, flags=re.IGNORECASE | re.MULTILINE)
+
+    # 格式1.2: [数字] 标题，学术论文URL，日期 - 学术论文引用（使用 📄 图标）
+    def replace_academic_reference(match):
+        num = match.group(1)
+        title = match.group(2)
+        url = match.group(3)
+        date_str = match.group(4) if match.group(4) else None
+        
+        # 清理和转义 URL
+        url = url.strip()
+        url = re.sub(r'["\'/]+$', '', url)
+        url_escaped = url.replace('&', '&amp;')
+        
+        if date_str:
+            # 清理日期字符串
+            if '无法确定月份' in date_str:
+                year_match = re.search(r'(\d{4})年', date_str)
+                if year_match:
+                    date_str = f'{year_match.group(1)}年'
+            date_part = f', {date_str}'
+        else:
+            date_part = ''
+        
+        # 使用 📄 图标表示学术论文（已引用完整内容）
+        # 注意：添加style属性确保图标不受父元素斜体样式影响
+        return f'[{num}] <font name="EmojiFont" style="font-style: normal;">📄</font> {title}, <a href="{url_escaped}" color="#04B5BB">{url_escaped}</a>{date_part}'
+    
+    # 匹配学术论文引用：arXiv/PubMed/学术期刊网站/Sci-Hub/Google Scholar（非 PDF 链接）
+    # 使用负向前瞻，跳过已经有图标的引用
+    # 扩展范围：包含 Nature、Lancet、MDPI、Frontiers、Springer、Wiley、Sci-Hub、Google Scholar 等学术网站
+    # 添加 (?:www\.)? 支持，因为很多学术网站URL包含www前缀（如www.mdpi.com）
+    academic_pattern = r'\[(\d+)\]\s(?!<font name="EmojiFont">)(.+?)，(https?://(?:(?:www\.)?arxiv\.org/(?:abs|html)/|pubmed\.ncbi\.nlm\.nih\.gov/|pmc\.ncbi\.nlm\.nih\.gov/|ncbi\.nlm\.nih\.gov/pubmed/|(?:www\.)?medrxiv\.org/content/|(?:www\.)?biorxiv\.org/content/|(?:www\.)?nature\.com/articles/(?!d41586-)|(?:www\.)?thelancet\.com/(?:journals/|article/)|(?:www\.)?science\.org/doi/|(?:www\.)?cell\.com/|(?:www\.)?nejm\.org/doi/|(?:www\.)?mdpi\.com/|(?:www\.)?frontiersin\.org/(?:journals/|articles/)|(?:www\.)?plos\.org/|link\.springer\.com/article/|onlinelibrary\.wiley\.com/doi/|(?:www\.)?bmj\.com/content/|jamanetwork\.com/journals/|sci-hub\.(?:se|st|ru|tw|ren)/|scholar\.google\.com/|doi\.org/)[^\s，]+)(?:，(.+?))?(?=\s*\n|\s*$)'
+    text = re.sub(academic_pattern, replace_academic_reference, text, flags=re.IGNORECASE | re.MULTILINE)
 
     # 格式2: [数字] 标题，URL，日期 - 网页引用
     def replace_web_reference(match):
         num = match.group(1)
         title = match.group(2)
         url = match.group(3)
-        date = match.group(4) if len(match.groups()) >= 4 and match.group(4) else ''
-        # 使用地球仪图标🌐 (U+1F310) 表示网页链接
-        # 处理无法确定月份的情况，只显示年份
-        if date and date.strip():
-            date_str = date.strip()
+        date_str = match.group(4) if match.group(4) else None
+        
+        # 清理 URL 中可能的特殊字符和 HTML 标签残留
+        url = url.strip()
+        # 移除 URL 末尾可能的引号、斜杠等
+        url = re.sub(r'["\'/]+$', '', url)
+        # 转义 URL 中的特殊字符（如 &）
+        url_escaped = url.replace('&', '&amp;')
+        
+        if date_str:
+            # 清理日期字符串中的"无法确定月份"等文本
             if '无法确定月份' in date_str:
                 # 提取年份（匹配4位数字+年）
                 year_match = re.search(r'(\d{4})年', date_str)
@@ -550,10 +682,12 @@ def _process_inline_formatting(text: str) -> str:
         else:
             date_part = ''
         # 使用font标签指定emoji字体来显示图标，ReportLab会自动回退到支持该字符的字体
-        return f'[{num}] <font name="EmojiFont">🌐</font> {title}, <a href="{url}" color="#04B5BB">{url}</a>{date_part}'
+        # 注意：添加style属性确保图标不受父元素斜体样式影响
+        return f'[{num}] <font name="EmojiFont" style="font-style: normal;">🌐</font> {title}, <a href="{url_escaped}" color="#04B5BB">{url_escaped}</a>{date_part}'
 
     # 改进的正则表达式2：匹配非PDF的URL引用（网页引用）
-    text = re.sub(r'\[(\d+)\]\s*(.+?)，(https?://[^\s，]+?)(?:，(.+?))?(?=\s*\n|\s*$)',
+    # 使用负向前瞻，跳过已经有图标的引用（<font name="EmojiFont">）
+    text = re.sub(r'\[(\d+)\]\s(?!<font name="EmojiFont">)(.+?)，(https?://[^\s，]+?)(?:，(.+?))?(?=\s*\n|\s*$)',
                   replace_web_reference, text, flags=re.IGNORECASE | re.MULTILINE)
 
     # 处理 Markdown 链接 [text](url) (必须在其他格式之前处理)
@@ -573,6 +707,11 @@ def _process_inline_formatting(text: str) -> str:
 
     def protect_code(match):
         code_content = match.group(1)
+        # 修复：科学计数法中的 Unicode 上下标（如 10⁻¹⁴）会先被转换为 <sup>/<sub>。
+        # 若此时仍按反引号代码处理，会把标签转义成文本，导致 PDF 显示成“代码样式”而非上标。
+        if re.search(r'</?\s*(sup|sub)\b', code_content, flags=re.IGNORECASE):
+            return code_content
+
         # HTML 转义
         code_content = code_content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         # 检查是否包含中文字符
@@ -604,6 +743,8 @@ def _process_inline_formatting(text: str) -> str:
         display = _simplify_latex(formula)
         text = text.replace(f"__MATH_FORMULA_{i}__", f'<font size="9.5"><i>{display}</i></font>')
 
+    text = _strip_escaped_font_tags(text)
+
     # 移除不支持或无意义的标签
     text = re.sub(r'</?\s*nobr\b[^>]*>', '', text, flags=re.IGNORECASE)
     text = re.sub(r'<hr\s*/?>', '\n', text, flags=re.IGNORECASE)
@@ -620,11 +761,68 @@ def _process_inline_formatting(text: str) -> str:
     text = re.sub(r'</br>', '', text, flags=re.IGNORECASE)
     text = text.replace('<br/>', ' <br/> ')
 
-    for attr in ['color', 'size', 'name', 'href', 'face', 'backColor']:
-        text = re.sub(rf'\b{attr}=([^"\s>]+)', rf'{attr}="\1"', text)
+    # 修复 HTML 标签中没有引号的属性值（仅处理标签级属性，不处理 href 值内的 URL 参数）
+    # 使用负向前瞻确保不在引号内匹配
+    # 只匹配：空格 + 属性名 + = + 非引号值（不在已有引号属性值内）
+    def fix_unquoted_attr_safe(text_val):
+        # 先保护所有已有的引号属性值
+        protected = []
+        def protect(m):
+            protected.append(m.group(0))
+            return f'__PROTECTED_ATTR_{len(protected)-1}__'
+        
+        # 保护 attr="value" 和 attr='value' 格式
+        text_val = re.sub(r'(\w+)="[^"]*"', protect, text_val)
+        text_val = re.sub(r"(\w+)='[^']*'", protect, text_val)
+        
+        # 现在修复未引号的属性（只在标签内，且前面是空格）
+        for attr in ['color', 'size', 'name', 'href', 'face', 'backColor']:
+            text_val = re.sub(rf'(\s){attr}=([^\s>"\']+)', rf'\1{attr}="\2"', text_val, flags=re.IGNORECASE)
+        
+        # 恢复保护的属性
+        for i, val in enumerate(protected):
+            text_val = text_val.replace(f'__PROTECTED_ATTR_{i}__', val)
+        
+        return text_val
+    
+    # 只对 HTML 标签应用修复
+    text = re.sub(r'<[^>]+>', lambda m: fix_unquoted_attr_safe(m.group(0)), text)
+
+    def _sanitize_reportlab_links(value: str) -> str:
+        def repl(m: re.Match) -> str:
+            href = (m.group(1) or '').strip()
+            body = m.group(2) or ''
+            full_tag = m.group(0)
+            if re.match(r'^(https?://|mailto:|#)', href, flags=re.IGNORECASE):
+                # 对于有效的 URL，确保转义特殊字符
+                safe_href = _escape_url_for_html_attr(href)
+                # 替换原始 href 为转义后的版本
+                return full_tag.replace(f'href="{href}"', f'href="{safe_href}"')
+            if re.match(r'^www\.', href, flags=re.IGNORECASE) or re.match(r'^[\w.-]+\.[a-z]{2,}([/?#]|$)', href, flags=re.IGNORECASE):
+                safe_href = _escape_url_for_html_attr(f'https://{href}')
+                return f'<a href="{safe_href}" color="#04B5BB">{body}</a>'
+            return body
+
+        return re.sub(r'<a\s+href="([^"]+)"[^>]*>(.*?)</a>', repl, value, flags=re.IGNORECASE | re.DOTALL)
+
+    text = _sanitize_reportlab_links(text)
 
     text = re.sub(r'<(font|b|i|sub|sup)\b[^>]*>\s*</\1>', '', text, flags=re.IGNORECASE)
     text = re.sub(r'<a(?![^>]*\bname=)[^>]*>\s*</a>', '', text, flags=re.IGNORECASE)
+
+    # 在 _sanitize_reportlab_links 之后保护 HTML 标签中的属性值
+    # 避免 _apply_english_font_markup 等后续处理影响锚点名称
+    protected_attrs = []
+    def protect_attr_value(m):
+        attr_name = m.group(1)
+        attr_value = m.group(2)
+        # 使用不包含下划线的占位符，避免被下标转换影响
+        placeholder = f"PROTECTEDATTRVAL{len(protected_attrs)}ENDPROTECTED"
+        protected_attrs.append((attr_name, attr_value))
+        return f'{attr_name}="{placeholder}"'
+    
+    # 保护 name, href 属性值
+    text = re.sub(r'(name|href)="([^"]*)"', protect_attr_value, text, flags=re.IGNORECASE)
 
     text = _apply_english_font_markup(text)
 
@@ -638,6 +836,21 @@ def _process_inline_formatting(text: str) -> str:
     red_symbols = ['✕', '✖', '✗', '✘']
     for sym in red_symbols:
         text = text.replace(sym, f'<font name="SymbolFont" color="red">{sym}</font>')
+
+    # 转义非HTML标签的裸尖括号（如 <S, A, P, R, γ>），避免ReportLab误解析
+    # 策略：保护合法HTML标签 → 转义剩余的 < > → 恢复合法标签
+    _valid_html_tags = re.compile(r'</?(?:a|font|b|i|sub|sup|br|para)\b[^>]*/?>', re.IGNORECASE)
+    _html_placeholders = []
+    def _protect_valid_tag(m):
+        placeholder = f"__VALID_HTML_{len(_html_placeholders)}__"
+        _html_placeholders.append(m.group(0))
+        return placeholder
+    text = _valid_html_tags.sub(_protect_valid_tag, text)
+    # 转义剩余的裸尖括号
+    text = text.replace('<', '&lt;').replace('>', '&gt;')
+    # 恢复合法HTML标签
+    for i, original in enumerate(_html_placeholders):
+        text = text.replace(f"__VALID_HTML_{i}__", original)
 
     # 平衡内联标签，修正缺失或多余的闭合
     tag_regex = re.compile(r'</?\s*(a|font|b|i|sub|sup)\b[^>]*>', re.IGNORECASE)
@@ -668,6 +881,10 @@ def _process_inline_formatting(text: str) -> str:
             parts.append(f'</{stack.pop()}>')
         return ''.join(parts)
 
+    # 恢复被保护的属性值
+    for i, (attr_name, attr_value) in enumerate(protected_attrs):
+        text = text.replace(f'PROTECTEDATTRVAL{i}ENDPROTECTED', attr_value)
+    
     return balance_inline_tags(text)
 
 
@@ -677,6 +894,7 @@ _EN_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9._@/+\-]*")
 def _apply_english_font_markup(text: str, font_name: str = "Arial") -> str:
     parts = re.split(r'(<[^>]+>)', text)
     font_stack: List[bool] = []
+    in_anchor: int = 0  # 跟踪是否在 <a> 标签内（支持嵌套计数）
 
     def in_locked_font() -> bool:
         return any(font_stack)
@@ -689,6 +907,12 @@ def _apply_english_font_markup(text: str, font_name: str = "Arial") -> str:
         if not part:
             continue
         if part.startswith('<') and part.endswith('>'):
+            # 跟踪 <a> 标签的开始和结束
+            if re.match(r'<\s*a\b', part, flags=re.IGNORECASE) and not part.rstrip().endswith('/>'):
+                in_anchor += 1
+            elif re.match(r'</\s*a\s*>', part, flags=re.IGNORECASE):
+                in_anchor = max(0, in_anchor - 1)
+            
             if re.match(r'<\s*font\b', part, flags=re.IGNORECASE) and not part.rstrip().endswith('/>'):
                 locked = bool(re.search(r'\b(name|face)\s*=', part, flags=re.IGNORECASE))
                 font_stack.append(locked)
@@ -698,9 +922,85 @@ def _apply_english_font_markup(text: str, font_name: str = "Arial") -> str:
             out.append(part)
             continue
 
-        out.append(part if in_locked_font() else wrap_tokens(part))
+        # 在 <a> 标签内或已锁定字体时，不进行英文字体包裹
+        out.append(part if (in_locked_font() or in_anchor > 0) else wrap_tokens(part))
 
     return ''.join(out)
+
+
+class PDFBookmark(Flowable):
+    """自定义 PDF 书签类，用于在 PDF 中创建可点击的目录导航"""
+    def __init__(self, title: str, level: int, key: str = None):
+        Flowable.__init__(self)
+        self.title = title
+        self.level = level
+        self.key = key or f'bookmark_{id(self)}'
+    
+    def wrap(self, availWidth, availHeight):
+        """计算书签占用的空间（不占用空间）"""
+        return 0, 0
+
+    def draw(self):
+        """在 PDF 中绘制（添加）书签"""
+        # 使用 canvas.bookmarkPage 创建书签锚点
+        self.canv.bookmarkPage(self.key)
+        # 使用 canvas.addOutlineEntry 添加到 PDF 大纲（目录）
+        self.canv.addOutlineEntry(self.title, self.key, level=self.level)
+
+
+def _find_font_with_priority(font_name: str, system_paths: List[str], fallback_font_names: List[str] = None) -> Optional[str]:
+    """
+    按优先级查找字体文件：优先从系统路径查找，再回退到项目 ./Font/ 目录
+    
+    Args:
+        font_name: 字体名称（如 'simhei', 'simsun', 'arial'）
+        system_paths: 系统字体路径列表（按优先级排序）
+        fallback_font_names: 回退字体名称列表（用于在项目 Font 目录中查找的备选字体名）
+    
+    Returns:
+        找到的字体文件路径，如果都找不到则返回 None
+    """
+    # 1. 优先从系统路径查找
+    for system_path in system_paths:
+        if system_path and os.path.exists(system_path):
+            logger.info(f"使用系统字体: {system_path}")
+            return str(system_path)
+    
+    # 2. 回退到项目根目录的 Font/ 目录中查找
+    # 获取当前文件所在目录，然后向上查找项目根目录
+    current_file = Path(__file__).resolve()
+    # 从 deepdiver_v2/src/tools/mcp_tools.py 向上3级到项目根目录
+    project_root = current_file.parent.parent.parent.parent
+    font_dir = project_root / "Font"
+
+    if font_dir.exists() and font_dir.is_dir():
+        # 支持的字体文件扩展名
+        extensions = ['.ttf', '.ttc', '.TTF', '.TTC']
+        
+        # 确定要查找的字体名称列表
+        search_font_names = [font_name]
+        if fallback_font_names:
+            search_font_names.extend(fallback_font_names)
+
+        for name in search_font_names:
+            for ext in extensions:
+                # 尝试不同的文件名格式
+                font_file = font_dir / f"{name}{ext}"
+                if font_file.exists():
+                    logger.info(f"使用项目 Font 目录中的字体: {font_file}")
+                    return str(font_file.absolute())
+
+                # 尝试大写文件名
+                font_file_upper = font_dir / f"{name.upper()}{ext}"
+                if font_file_upper.exists():
+                    logger.info(f"使用项目 Font 目录中的字体: {font_file_upper}")
+                    return str(font_file_upper.absolute())
+    else:
+        logger.warning(f"Font目录不存在: {font_dir}")
+
+    # 3. 都找不到
+    logger.warning(f"字体 '{font_name}' 在系统路径和 {font_dir} 中均未找到")
+    return None
 
 
 def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> bool:
@@ -709,7 +1009,7 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
 
     Args:
         markdown_content: Markdown 格式的内容
-        output_path: PDF 输出路径
+        output_path: 输出 PDF 文件路径
 
     Returns:
         bool: 是否成功生成 PDF
@@ -719,94 +1019,126 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
         return False
 
     try:
-        # 注册中文字体（使用系统字体）
+        # 注册字体（优先从系统加载 Arial、SimSun、SimHei，回退到项目 Font 目录中的开源字体）
         import platform
         system = platform.system()
 
-        # 根据操作系统选择字体路径
+        # 根据操作系统选择系统字体路径（优先使用）
         if system == "Windows":
-            # Windows 字体路径
-            simsun_path = "C:/Windows/Fonts/simsun.ttc"  # 宋体
-            simhei_path = "C:/Windows/Fonts/simhei.ttf"  # 黑体
-            arial_path = "C:/Windows/Fonts/arial.ttf"  # Arial
-            symbol_path = "C:/Windows/Fonts/seguisym.ttf"  # Segoe UI Symbol（优先）
-            emoji_path = "C:/Windows/Fonts/seguiemj.ttf"  # Segoe UI Emoji（备选）
+            # Windows 系统字体路径（优先）
+            simsun_system_paths = ["C:/Windows/Fonts/simsun.ttc"]
+            simhei_system_paths = ["C:/Windows/Fonts/simhei.ttf"]
+            arial_system_paths = ["C:/Windows/Fonts/arial.ttf"]
+            arial_bold_system_paths = ["C:/Windows/Fonts/arialbd.ttf"]
+            symbol_system_paths = ["C:/Windows/Fonts/seguisym.ttf"]
+            emoji_system_paths = ["C:/Windows/Fonts/seguiemj.ttf", "C:/Windows/Fonts/seguisym.ttf"]
         elif system == "Linux":
-            # Linux 字体路径（可能需要安装中文字体包）
-            simsun_path = "/usr/share/fonts/dejavu/SIMSUN.TTC"
-            simhei_path = "/usr/share/fonts/dejavu/SIMHEI.TTF"
-            arial_path = "/usr/share/fonts/dejavu/ARIAL.TTF"  # Linux Arial path (if installed)
-            symbol_path = "/usr/share/fonts/dejavu/DejaVuSans.ttf"  # Linux fallback
-            # 使用黑白emoji字体（多个可能的路径）
-            emoji_paths = [
-                "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",  # Noto Emoji 黑白版本
+            # Linux 系统字体路径（优先）
+            simsun_system_paths = ["/usr/share/fonts/dejavu/SIMSUN.TTC", "/usr/share/fonts/wqy/wqy-microhei.ttc"]
+            simhei_system_paths = ["/usr/share/fonts/dejavu/SIMHEI.TTF", "/usr/share/fonts/wqy/wqy-microhei.ttc"]
+            arial_system_paths = ["/usr/share/fonts/dejavu/ARIAL.TTF", "/usr/share/fonts/dejavu/DejaVuSans.ttf"]
+            arial_bold_system_paths = ["/usr/share/fonts/dejavu/ARIALBD.TTF", "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"]
+            symbol_system_paths = ["/usr/share/fonts/dejavu/DejaVuSans.ttf"]
+            emoji_system_paths = [
+                "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
                 "/usr/share/fonts/noto/NotoEmoji-Regular.ttf",
                 "/usr/share/fonts/google-noto-emoji/NotoEmoji-Regular.ttf",
-                symbol_path  # 最后的备选方案：DejaVuSans
+                "/usr/share/fonts/dejavu/DejaVuSans.ttf"
             ]
-            emoji_path = None
-            for path in emoji_paths:
-                if os.path.exists(path):
-                    emoji_path = path
-                    break
-            if not emoji_path:
-                emoji_path = symbol_path  # 默认使用symbol_path
         else:  # macOS
-            simsun_path = "/System/Library/Fonts/STHeiti Light.ttc"
-            simhei_path = "/System/Library/Fonts/STHeiti Medium.ttc"
-            arial_path = "/Library/Fonts/Arial.ttf"
-            symbol_path = "/System/Library/Fonts/AppleSymbols.ttf"  # Apple Symbols
-            emoji_path = "/System/Library/Fonts/Apple Color Emoji.ttc"  # Apple Color Emoji
+            simsun_system_paths = ["/System/Library/Fonts/STHeiti Light.ttc", "/Library/Fonts/SIMSUN.TTC"]
+            simhei_system_paths = ["/System/Library/Fonts/STHeiti Medium.ttc", "/Library/Fonts/SIMHEI.TTF"]
+            arial_system_paths = ["/Library/Fonts/Arial.ttf"]
+            arial_bold_system_paths = ["/Library/Fonts/Arial Bold.ttf"]
+            symbol_system_paths = ["/System/Library/Fonts/AppleSymbols.ttf"]
+            emoji_system_paths = ["/System/Library/Fonts/Apple Color Emoji.ttc"]
+
+        # 使用优先级查找加载字体（优先系统字体，回退到项目 Font 目录的开源字体）
+        # SimSun: 优先系统宋体，回退到 NotoSansSC-Regular
+        simsun_path = _find_font_with_priority('simsun', simsun_system_paths, ['NotoSansSC-Regular'])
+        # SimHei: 优先系统黑体，回退到 NotoSansSC-Bold
+        simhei_path = _find_font_with_priority('simhei', simhei_system_paths, ['NotoSansSC-Bold'])
+        # Arial: 优先系统Arial，回退到 OpenSans-Regular
+        arial_path = _find_font_with_priority('arial', arial_system_paths, ['OpenSans-Regular'])
+        # Arial Bold: 优先系统Arial Bold，回退到 OpenSans-Bold
+        arial_bold_path = _find_font_with_priority('arialbd', arial_bold_system_paths, ['OpenSans-Bold'])
+        symbol_path = _find_font_with_priority('symbol', symbol_system_paths)
 
         # 注册字体
         try:
-            pdfmetrics.registerFont(TTFont('SimSun', simsun_path))
-            pdfmetrics.registerFont(TTFont('SimHei', simhei_path))
-            # 尝试注册Arial字体以支持特殊符号
-            if os.path.exists(arial_path):
+            from reportlab.pdfbase.pdfmetrics import registerFontFamily
+
+            # 注册 SimSun 字体（优先系统宋体，回退到 Noto Sans SC Regular）
+            if simsun_path:
+                pdfmetrics.registerFont(TTFont('SimSun', simsun_path))
+                registerFontFamily('SimSun', normal='SimSun', bold='SimHei', italic='SimSun', boldItalic='SimHei')
+            else:
+                raise FileNotFoundError("SimSun 字体文件未找到（系统宋体和项目 Font 目录中的 Noto Sans SC Regular 均未找到）")
+
+            # 注册 SimHei 字体（优先系统黑体，回退到 Noto Sans SC Bold）
+            if simhei_path:
+                pdfmetrics.registerFont(TTFont('SimHei', simhei_path))
+                registerFontFamily('SimHei', normal='SimHei', bold='SimHei', italic='SimHei', boldItalic='SimHei')
+            else:
+                raise FileNotFoundError("SimHei 字体文件未找到（系统黑体和项目 Font 目录中的 Noto Sans SC Bold 均未找到）")
+
+            # 注册 Arial 字体（优先系统 Arial，回退到 Open Sans）
+            if arial_path:
                 pdfmetrics.registerFont(TTFont('Arial', arial_path))
-            else:
-                logger.warning(f"Arial字体文件不存在: {arial_path}")
-
-            # 尝试注册符号字体
-            if os.path.exists(symbol_path):
-                pdfmetrics.registerFont(TTFont('SymbolFont', symbol_path))
-            else:
-                # 如果没有专门的符号字体，尝试用Arial
-                if os.path.exists(arial_path):
-                    pdfmetrics.registerFont(TTFont('SymbolFont', arial_path))
+                if arial_bold_path:
+                    pdfmetrics.registerFont(TTFont('Arial-Bold', arial_bold_path))
+                    registerFontFamily('Arial', normal='Arial', bold='Arial-Bold', italic='Arial', boldItalic='Arial-Bold')
                 else:
-                    logger.warning(f"符号字体文件不存在: {symbol_path}")
+                    registerFontFamily('Arial', normal='Arial', bold='Arial', italic='Arial', boldItalic='Arial')
+            else:
+                logger.warning("Arial 字体文件未找到（系统 Arial 和项目 Font 目录中的 Open Sans 均未找到），将使用默认字体")
 
-            # 尝试注册emoji字体（用于显示📎 🌐等图标）
+            # 注册符号字体（可选）
+            if symbol_path:
+                pdfmetrics.registerFont(TTFont('SymbolFont', symbol_path))
+                registerFontFamily('SymbolFont', normal='SymbolFont', bold='SymbolFont', italic='SymbolFont',
+                                   boldItalic='SymbolFont')
+            elif arial_path:
+                pdfmetrics.registerFont(TTFont('SymbolFont', arial_path))
+                registerFontFamily('SymbolFont', normal='SymbolFont', bold='SymbolFont', italic='SymbolFont',
+                                   boldItalic='SymbolFont')
+                logger.info(f"使用 Arial 作为符号字体备选")
+            else:
+                logger.warning("符号字体文件未找到")
+
+            # 注册emoji字体（用于显示📎 🌐等图标）
             emoji_registered = False
-            if emoji_path and os.path.exists(emoji_path):
-                try:
-                    pdfmetrics.registerFont(TTFont('EmojiFont', emoji_path))
-                    logger.info(f"成功注册Emoji字体: {emoji_path}")
-                    emoji_registered = True
-                except Exception as e:
-                    logger.warning(f"注册Emoji字体失败 {emoji_path}: {e}，尝试备选方案")
+            emoji_path = None
 
-            # 如果emoji字体注册失败，使用symbol_path作为备选
+            # 尝试从多个路径加载emoji字体
+            for sys_path in emoji_system_paths:
+                emoji_path = _find_font_with_priority('emoji', [sys_path])
+                if emoji_path:
+                    try:
+                        pdfmetrics.registerFont(TTFont('EmojiFont', emoji_path))
+                        emoji_registered = True
+                        break
+                    except Exception as e:
+                        logger.warning(f"注册Emoji字体失败 {emoji_path}: {e}")
+            
+            # 如果emoji字体注册失败，使用备选方案
             if not emoji_registered:
-                if os.path.exists(symbol_path):
+                if symbol_path:
                     pdfmetrics.registerFont(TTFont('EmojiFont', symbol_path))
                     logger.info(f"使用符号字体作为Emoji备选: {symbol_path}")
                     emoji_registered = True
-                elif os.path.exists(arial_path):
+                elif arial_path:
                     pdfmetrics.registerFont(TTFont('EmojiFont', arial_path))
-                    logger.info(f"使用Arial字体作为Emoji备选: {arial_path}")
+                    logger.info(f"使用 Arial 字体作为Emoji备选: {arial_path}")
                     emoji_registered = True
                 else:
-                    logger.warning(f"Emoji字体文件不存在: {emoji_path}，emoji图标可能无法显示")
+                    logger.warning("Emoji字体文件未找到，emoji图标可能无法显示")
 
-            # 注册emoji字体族（关键：让bold和italic都指向同一个字体，避免"Can't map determine family/bold/italic"错误）
+            # 注册emoji字体族（让bold和italic都指向同一个字体，避免"Can't map determine family/bold/italic"错误）
             if emoji_registered:
                 from reportlab.pdfbase.pdfmetrics import registerFontFamily
                 registerFontFamily('EmojiFont', normal='EmojiFont', bold='EmojiFont', italic='EmojiFont',
                                    boldItalic='EmojiFont')
-                logger.info(f"成功注册EmojiFont字体族")
 
         except Exception as e:
             logger.warning(f"警告: 无法注册字体: {e}，将使用默认字体")
@@ -815,6 +1147,18 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
             pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
             pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
 
+        # 从 Markdown 内容中提取第一个标题作为 PDF 标题元数据
+        pdf_title = ''
+        for md_line in markdown_content.split('\n'):
+            md_line_stripped = md_line.strip()
+            if md_line_stripped.startswith('# '):
+                pdf_title = md_line_stripped[2:].strip()
+                break
+
+        # 如果没有找到 H1 标题，使用文件名（去掉扩展名）作为标题
+        if not pdf_title:
+            pdf_title = output_path.stem if hasattr(output_path, 'stem') else Path(str(output_path)).stem
+
         # 创建 PDF 文档
         doc = SimpleDocTemplate(
             str(output_path),
@@ -822,8 +1166,22 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
             rightMargin=2 * cm,
             leftMargin=2 * cm,
             topMargin=2 * cm,
-            bottomMargin=2 * cm
+            bottomMargin=2.5 * cm,  # 增加底部边距以容纳页码
+            title=pdf_title,
+            author='PanguAI'
         )
+
+        # 定义页码回调函数
+        def add_page_number(canvas, doc):
+            """
+            在每页底部中央添加页码
+            """
+            page_num = canvas.getPageNumber()
+            text = f"第 {page_num} 页"
+            canvas.saveState()
+            canvas.setFont('SimSun', 9)
+            canvas.drawCentredString(A4[0] / 2, 1.2 * cm, text)
+            canvas.restoreState()
 
         # 定义样式
         styles = getSampleStyleSheet()
@@ -955,6 +1313,41 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
             wordWrap='CJK'  # 允许自动换行
         )
 
+        # 报告统计信息样式（浅蓝色背景，带边框）
+        style_stats = ParagraphStyle(
+            'StatsInfo',
+            parent=styles['Normal'],
+            fontName='SimSun',
+            fontSize=10,
+            leading=15,
+            alignment=TA_LEFT,
+            spaceBefore=8,
+            spaceAfter=8,
+            leftIndent=12,
+            rightIndent=12,
+            backColor=colors.Color(0.94, 0.97, 1.0),  # 浅蓝色背景 #F0F8FF
+            borderColor=colors.Color(0.7, 0.85, 0.95),  # 蓝色边框
+            borderWidth=1,
+            borderPadding=8
+        )
+
+        # 参考来源样式（改善长URL换行）
+        style_reference = ParagraphStyle(
+            'Reference',
+            parent=styles['Normal'],
+            fontName='SimSun',
+            fontSize=9.5,
+            leading=14,
+            alignment=TA_LEFT,
+            spaceBefore=4,
+            spaceAfter=4,
+            leftIndent=0,
+            firstLineIndent=0,
+            wordWrap='CJK',
+            allowWidows=1,
+            allowOrphans=1
+        )
+
         # 解析 Markdown 并转换为 ReportLab 元素
         story = []
         lines = markdown_content.split('\n')
@@ -962,8 +1355,13 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
         i = 0
         in_code_block = False
         in_math_block = False
+        in_stats_section = False  # 标记是否在报告统计信息区块
+        in_reference_section = False  # 标记是否在参考来源区块
         code_block_lines = []
         math_block_lines = []
+        
+        # 跟踪上一个标题的大纲层级，防止层级跳跃（如从1直接跳到3）导致的错误
+        last_outline_level = -1
 
         while i < len(lines):
             line = lines[i].strip()
@@ -1216,40 +1614,169 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
                     continue
 
             # 处理标题（从最长的开始匹配，避免误匹配）
+            target_level = -1
+            style = None
+            prefix_len = 0
+            
             if line.startswith('###### '):
-                text = _process_inline_formatting(line[7:].strip())
-                story.append(Paragraph(f'<b>{text}</b>', style_h6))
+                target_level = 5
+                style = style_h6
+                prefix_len = 7
             elif line.startswith('##### '):
-                text = _process_inline_formatting(line[6:].strip())
-                story.append(Paragraph(f'<b>{text}</b>', style_h5))
+                target_level = 4
+                style = style_h5
+                prefix_len = 6
             elif line.startswith('#### '):
-                text = _process_inline_formatting(line[5:].strip())
-                story.append(Paragraph(f'<b>{text}</b>', style_h4))
+                target_level = 3
+                style = style_h4
+                prefix_len = 5
             elif line.startswith('### '):
-                text = _process_inline_formatting(line[4:].strip())
-                story.append(Paragraph(f'<b>{text}</b>', style_h3))
+                target_level = 2
+                style = style_h3
+                prefix_len = 4
             elif line.startswith('## '):
-                text = _process_inline_formatting(line[3:].strip())
-                story.append(Paragraph(f'<b>{text}</b>', style_h2))
+                target_level = 1
+                style = style_h2
+                prefix_len = 3
             elif line.startswith('# '):
-                text = _process_inline_formatting(line[2:].strip())
-                story.append(Paragraph(f'<b>{text}</b>', style_h1))
+                target_level = 0
+                style = style_h1
+                prefix_len = 2
+            
+            if target_level != -1:
+                raw_text = line[prefix_len:].strip()
+                text = _process_inline_formatting(raw_text)
+                
+                # 计算安全的大纲层级：
+                # 1. 如果目标层级 <= 上一个层级（回退或同级），直接使用目标层级
+                # 2. 如果目标层级 > 上一个层级（深入），最多只能比上一级大1（防止跳级）
+                if target_level <= last_outline_level:
+                    # 回退或同级：直接使用目标层级，确保同级标题保持同一书签层级
+                    safe_level = target_level
+                else:
+                    # 深入：最多只能比上一个层级大1
+                    safe_level = min(target_level, last_outline_level + 1)
+                last_outline_level = safe_level
+                
+                # 创建书签（目录项），使用纯文本作为书签标题
+                clean_title = re.sub(r'<[^>]+>', '', raw_text)  # 移除 HTML 标签
+                bookmark_key = f'heading_{len(story)}'
+                
+                story.append(PDFBookmark(clean_title, safe_level, bookmark_key))
+                # 显式指定字体名称，避免 ps2tt 映射错误
+                story.append(Paragraph(f'<font name="SimHei"><b>{text}</b></font>', style))
+                
+                # 检测是否进入"报告统计信息"区块
+                if '报告统计信息' in clean_title or 'Report Statistics' in clean_title:
+                    in_stats_section = True
+                    in_reference_section = False
+                # 检测是否进入"参考来源"区块
+                elif '参考来源' in clean_title or 'References' in clean_title:
+                    in_reference_section = True
+                    in_stats_section = False
+                # 检测是否离开这些特殊区块（遇到其他标题）
+                elif (in_stats_section or in_reference_section) and clean_title not in ['报告统计信息', 'Report Statistics', '参考来源', 'References']:
+                    in_stats_section = False
+                    in_reference_section = False
+                
             elif line.startswith('* ') or line.startswith('- '):
                 # 无序列表
                 text = line[2:].strip()
                 # 处理列表项中的格式
                 text = _process_inline_formatting(text)
-                story.append(Paragraph(f'\u2022 {text}', style_normal))
+                
+                # 如果在统计信息区块内，使用特殊样式
+                if in_stats_section:
+                    story.append(Paragraph(f'<font name="SimSun">• {text}</font>', style_stats))
+                else:
+                    story.append(Paragraph(f'\u2022 {text}', style_normal))
             else:
+                # 检测纯文本格式的子标题（如 "2.1 标题" "2.1.1 标题" "3.2 Title"）
+                # 匹配模式：数字.数字[.数字...] 空格 标题文字（非空，且不以标点结尾）
+                plain_heading_match = re.match(r'^(\d+(?:\.\d+)+)\s+(.+)$', line)
+                if plain_heading_match:
+                    heading_number = plain_heading_match.group(1)  # 如 "2.1" 或 "2.1.1"
+                    heading_text_raw = plain_heading_match.group(2).strip()
+                    # 排除误判：如果文字很长（超过80字符）或以句号等结尾，可能不是标题
+                    is_likely_heading = (
+                        len(heading_text_raw) < 80 and
+                        not re.search(r'[。？！.?!,，;；]$', heading_text_raw) and
+                        len(heading_text_raw) > 0
+                    )
+                    if is_likely_heading:
+                        # 根据编号层级确定标题级别：2.1 → h3(level 2), 2.1.1 → h4(level 3)
+                        dot_count = heading_number.count('.')
+                        if dot_count == 1:
+                            sub_style = style_h3
+                            target_level = 2  # h3 → outline level 2
+                        elif dot_count == 2:
+                            sub_style = style_h4
+                            target_level = 3  # h4 → outline level 3
+                        elif dot_count == 3:
+                            sub_style = style_h5
+                            target_level = 4
+                        else:
+                            sub_style = style_h6
+                            target_level = 5
+
+                        full_title = f"{heading_number} {heading_text_raw}"
+                        text = _process_inline_formatting(full_title)
+
+                        # 计算安全的大纲层级（与markdown标题逻辑一致）
+                        if target_level <= last_outline_level:
+                            safe_level = target_level
+                        else:
+                            safe_level = min(target_level, last_outline_level + 1)
+                        last_outline_level = safe_level
+
+                        # 创建书签
+                        clean_title = re.sub(r'<[^>]+>', '', full_title)
+                        bookmark_key = f'heading_{len(story)}'
+                        story.append(PDFBookmark(clean_title, safe_level, bookmark_key))
+                        story.append(Paragraph(f'<font name="SimHei"><b>{text}</b></font>', sub_style))
+
+                        i += 1
+                        continue
+
                 # 处理行内格式
                 line = _process_inline_formatting(line)
-                # 普通段落
-                story.append(Paragraph(line, style_normal))
+                
+                # 检测是否是参考文献条目（以 [数字] 开头）
+                if in_reference_section and re.match(r'^\[\d+\]', line):
+                    # 参考文献条目使用特殊样式，改善长URL换行
+                    story.append(Paragraph(line, style_reference))
+                else:
+                    # 普通段落
+                    story.append(Paragraph(line, style_normal))
 
             i += 1
 
-        # 生成 PDF
-        doc.build(story)
+        # 生成 PDF（应用页码回调函数）
+        try:
+            doc.build(story, onFirstPage=add_page_number, onLaterPages=add_page_number)
+        except ValueError as ve:
+            if 'undefined destination target' in str(ve) or 'format not resolved' in str(ve):
+                logger.warning(f"PDF内部链接解析失败，将移除内部锚点链接后重试: {ve}")
+                # 重建story，移除所有内部href（#开头的链接）保留文本
+                cleaned_story = []
+                for item in story:
+                    if isinstance(item, Paragraph):
+                        raw = item.text
+                        # 移除指向内部锚点的<a href="#...">标签，保留链接文本
+                        cleaned = re.sub(r'<a\s+href="#[^"]*"[^>]*>(.*?)</a>', r'\1', raw, flags=re.IGNORECASE | re.DOTALL)
+                        cleaned_story.append(Paragraph(cleaned, item.style))
+                    else:
+                        cleaned_story.append(item)
+                doc2 = SimpleDocTemplate(
+                    str(output_path), pagesize=A4,
+                    rightMargin=2 * cm, leftMargin=2 * cm,
+                    topMargin=2 * cm, bottomMargin=2.5 * cm,
+                    title=pdf_title, author='PanguAI'
+                )
+                doc2.build(cleaned_story, onFirstPage=add_page_number, onLaterPages=add_page_number)
+                logger.info("已移除内部链接后成功生成PDF")
+            else:
+                raise
         return True
 
     except Exception as e:
@@ -1276,6 +1803,42 @@ class MCPTools:
 
         # 初始化 username，尝试从 workspace 配置文件读取，否则使用默认值
         self.username = self._get_username_from_workspace()
+        
+        # medRxiv API configuration
+        self.BASE_URL = "https://api.biorxiv.org/details/medrxiv"
+        self.session = requests.Session()
+        self.timeout = 30
+        self.max_retries = 3
+
+        # Cache for last RAG search result (to avoid passing large JSON through LLM)
+        self._last_rag_search_result = None
+        self._last_rag_search_query = None
+        self._last_rag_search_timestamp = None
+
+        # Track last saved RAG files to ensure document_extract includes them
+        self._last_rag_saved_files: List[str] = []
+        self._last_rag_saved_timestamp = None
+
+        # 累积式缓存：保存所有 RAG 搜索结果的 file_id -> metadata 映射
+        # 解决多次搜索后缓存被覆盖导致 rag_document_saver 无法找到元数据的问题
+        # 缓存结构: {file_id_key: {"metadata": {...}, "timestamp": float}}
+        self._rag_metadata_cache: Dict[str, Dict] = {}
+
+        # 线程锁：保护缓存的并发访问
+        # 多个 InformationSeeker 并发运行时，需要确保缓存操作的线程安全
+        self._rag_cache_lock = threading.Lock()
+
+        # 文件锁：保护 references.jsonl 的并发写入
+        # 多个 Agent 并发调用 rag_document_saver 时，需要确保文件写入的原子性
+        self._references_file_lock = threading.Lock()
+
+        # 缓存配置
+        # TTL 设置为 4 小时，确保覆盖完整的报告生成周期（通常 1-2 小时）
+        # 即使报告生成需要 1 小时，缓存仍有足够的余量
+        self._rag_cache_max_size = 1000
+        self._rag_cache_ttl_seconds = 14400  # 4 hours
+        # Academic sites configuration for targeted search
+        self.academic_sites_enabled = True  # Enable by default for research tasks
 
     def _get_username_from_workspace(self) -> str:
         """
@@ -1296,10 +1859,234 @@ class MCPTools:
 
         return "用户"  # 默认用户名
 
-    def set_session_context(self, session_id: str, session_workspace_path: str):
+    def _filter_relevant_rag_documents(self, doc_list: list, query: str) -> list:
+        """
+        根据多领域关键词字典过滤不相关的 RAG 文档
+
+        支持领域：
+        - OER/电解水
+        - 电池
+        - 催化剂
+        - 有机化学
+        - 材料科学
+        - 光学材料
+        - 燃料电池
+
+        Args:
+            doc_list: RAG 检索返回的文档列表
+            query: 用户查询词
+
+        Returns:
+            过滤后的文档列表
+        """
+        if not doc_list:
+            return []
+
+        query_lower = query.lower()
+
+        # 多领域关键词字典
+        domain_keywords = {
+            'oer_electrolysis': [
+                'oxygen evolution', 'oer', 'water splitting', 'water electrolysis',
+                'acidic', 'proton exchange membrane', 'pemwe', 'electrolyzer',
+                'iridium', 'ruthenium', 'iro2', 'ruo2', 'water oxidation',
+                'anode catalyst', 'electrocatalytic', 'overpotential'
+            ],
+            'battery': [
+                'battery', 'batteries', 'cathode', 'anode', 'lithium', 'sodium',
+                'charge', 'discharge', 'capacity', 'voltage', 'cycling',
+                'rate performance', 'energy storage', 'power density',
+                'electrolyte', 'separator', 'solid electrolyte'
+            ],
+            'catalyst': [
+                'catalyst', 'catalysis', 'catalytic', 'electrocatalyst',
+                'nanoparticle', 'nanowire', 'nanosheet', 'nanocluster',
+                'activity', 'stability', 'selectivity', 'turnover',
+                'active site', 'metal support', 'dispersion'
+            ],
+            'organic_chemistry': [
+                'sn1', 'sn2', 'reaction mechanism', 'organic synthesis',
+                'nucleophilic', 'electrophilic', 'substitution', 'elimination',
+                'functional group', 'reagent', 'solvent', 'yield'
+            ],
+            'materials': [
+                'material', 'coating', 'composite', 'alloy', 'oxide',
+                'black phosphorus', 'graphene', 'mof', 'cof',
+                'stability', 'degradation', 'passivation', 'encapsulation',
+                'two-dimensional', '2d material', 'air stability'
+            ],
+            'optical': [
+                'photochromic', 'optical', 'light', 'photon',
+                'absorption', 'emission', 'luminescence', 'fluorescence',
+                'response time', 'switching', 'coloration', 'bleaching'
+            ],
+            'fuel_cell': [
+                'fuel cell', 'pemfc', 'sofc', 'hydrogen',
+                'oxygen reduction', 'orr', 'membrane electrode',
+                'efficiency', 'durability', 'polarization'
+            ],
+            'tem_microscopy': [
+                'tem', 'transmission electron microscopy', 'electron beam',
+                'aggregation', 'sintering', 'beam damage',
+                'imaging', 'resolution', 'sample preparation'
+            ]
+        }
+
+        # 识别查询所属领域
+        matched_domains = []
+        for domain, keywords in domain_keywords.items():
+            if any(kw in query_lower for kw in keywords):
+                matched_domains.append(domain)
+
+        # 如果没有匹配到任何领域，保留所有文档（不过滤）
+        if not matched_domains:
+            logger.info(f"[RAG_FILTER] No specific domain detected, keeping all documents")
+            return doc_list
+
+        logger.info(f"[RAG_FILTER] Detected domains: {', '.join(matched_domains)}")
+
+        # 对于可能在RAG库中没有内容的领域，保留所有文档不过滤
+        # 只对确认主要是OER的领域进行过滤
+        uncertain_domains = ['battery', 'organic_chemistry', 'optical', 'fuel_cell', 'tem_microscopy', 'materials']
+        if any(domain in uncertain_domains for domain in matched_domains):
+            logger.info(
+                f"[RAG_FILTER] Domain coverage uncertain, keeping all documents to avoid missing relevant content")
+            return doc_list
+
+        # 收集所有匹配领域的关键词（仅对OER和催化剂领域过滤）
+        relevant_keywords = []
+        for domain in matched_domains:
+            relevant_keywords.extend(domain_keywords[domain])
+
+        # 从查询中提取额外关键词
+        query_keywords = self._extract_query_keywords(query)
+        all_keywords = relevant_keywords + query_keywords
+
+        # 过滤文档
+        filtered_docs = []
+        for doc in doc_list:
+            title = ''
+            abstract = ''
+
+            if isinstance(doc, dict):
+                metadata = doc.get('additional_fields', {}).get('metadata', {})
+                title = metadata.get('title', '').lower()
+                content = doc.get('content', '').lower()
+                abstract = content[:500] if content else ''
+
+            text_to_check = title + ' ' + abstract
+
+            # 计算匹配的关键词数量
+            matched_keywords = [kw for kw in all_keywords if kw in text_to_check]
+
+            # 至少匹配1个关键词才保留
+            if len(matched_keywords) >= 1:
+                filtered_docs.append(doc)
+                logger.debug(f"[RAG_FILTER] Kept doc (matched {len(matched_keywords)} keywords): {title[:50]}...")
+            else:
+                logger.debug(f"[RAG_FILTER] Filtered doc (no keyword match): {title[:50]}...")
+
+        if doc_list:
+            kept_percentage = len(filtered_docs) / len(doc_list) * 100
+            logger.info(f"[RAG_FILTER] Filtered {len(doc_list)} docs to {len(filtered_docs)} docs "
+                        f"(kept {kept_percentage:.1f}%)")
+
+        return filtered_docs
+
+    def _filter_by_query_keywords(self, doc_list: list, query: str) -> list:
+        """使用查询关键词进行通用过滤"""
+        query_keywords = self._extract_query_keywords(query)
+
+        if not query_keywords:
+            return doc_list
+
+        filtered_docs = []
+        for doc in doc_list:
+            if isinstance(doc, dict):
+                metadata = doc.get('additional_fields', {}).get('metadata', {})
+                title = metadata.get('title', '').lower()
+                content = doc.get('content', '').lower()
+                text_to_check = title + ' ' + content[:500]
+
+                if any(kw in text_to_check for kw in query_keywords):
+                    filtered_docs.append(doc)
+
+        return filtered_docs
+
+    def _extract_query_keywords(self, query: str) -> list:
+        """从查询中提取专业术语关键词"""
+        query_lower = query.lower()
+
+        # 停用词列表
+        stop_words = [
+            'research', 'study', 'latest', 'advances', 'review', 'analysis',
+            'the', 'and', 'or', 'of', 'in', 'for', 'to', 'a', 'an', 'how',
+            'what', 'why', 'when', 'where', 'which', 'is', 'are', 'was', 'were',
+            'explain', 'describe', 'compare', 'contrast', 'discuss'
+        ]
+
+        keywords = []
+        for word in query_lower.split():
+            # 移除标点符号
+            word = word.strip('.,;:!?()[]{}"\'')
+            # 过滤停用词和短词
+            if word not in stop_words and len(word) > 3:
+                keywords.append(word)
+
+        return keywords
+
+    def _clean_rag_cache(self):
+        """
+        清理过期的 RAG 缓存条目（线程安全）
+
+        清理策略:
+        1. 删除超过 TTL 的条目
+        2. 如果缓存超过最大大小，删除最旧的条目
+        """
+        with self._rag_cache_lock:
+            if not self._rag_metadata_cache:
+                return
+
+            current_time = time.time()
+
+            # 1. 删除过期条目
+            expired_keys = []
+            for cache_key, cache_entry in self._rag_metadata_cache.items():
+                timestamp = cache_entry.get('timestamp', 0)
+                if current_time - timestamp > self._rag_cache_ttl_seconds:
+                    expired_keys.append(cache_key)
+
+            if expired_keys:
+                for key in expired_keys:
+                    del self._rag_metadata_cache[key]
+                logger.info(f"[RAG_CACHE] Cleaned {len(expired_keys)} expired cache entries")
+
+            # 2. 如果缓存仍然超过最大大小，删除最旧的条目
+            if len(self._rag_metadata_cache) > self._rag_cache_max_size:
+                # 按时间戳排序，删除最旧的条目
+                sorted_entries = sorted(
+                    self._rag_metadata_cache.items(),
+                    key=lambda x: x[1].get('timestamp', 0)
+                )
+
+                num_to_remove = len(self._rag_metadata_cache) - self._rag_cache_max_size
+                for i in range(num_to_remove):
+                    cache_key = sorted_entries[i][0]
+                    del self._rag_metadata_cache[cache_key]
+
+                logger.info(
+                    f"[RAG_CACHE] Removed {num_to_remove} oldest cache entries (size limit: {self._rag_cache_max_size})")
+
+    def set_session_context(self, session_id: str, session_workspace_path: str, user_query: str = ""):
         """Set session context for workspace-aware operations"""
+        # 如果切换到新的 session，清理过期缓存
+        if hasattr(self, 'session_id') and self.session_id != session_id:
+            logger.info(f"[RAG_CACHE] Session changed from {self.session_id} to {session_id}, cleaning expired cache")
+            self._clean_rag_cache()
+
         self.session_id = session_id
         self.session_workspace_path = Path(session_workspace_path)
+        self.user_query = user_query  # 存储用户查询，用于语言检测
         # Update workspace path to session-specific path
         self.workspace_path = self.session_workspace_path
         self.full_workspace_path = os.path.realpath(self.workspace_path)
@@ -1308,24 +2095,354 @@ class MCPTools:
         # 更新 username
         self.username = self._get_username_from_workspace()
         logger.info(
-            f"Set session context - ID: {session_id}, Workspace: {session_workspace_path}, Username: {self.username}")
+            f"Set session context - ID: {session_id}, Workspace: {session_workspace_path}, Username: {self.username}, Query: {user_query[:50] if user_query else 'N/A'}...")
 
     def get_session_context(self) -> Dict[str, Any]:
         """Get current session context"""
         return {
             "session_id": self.session_id,
             "session_workspace_path": str(self.session_workspace_path) if self.session_workspace_path else None,
-            "workspace_path": str(self.workspace_path)
+            "workspace_path": str(self.workspace_path),
+            "user_query": getattr(self, 'user_query', '')  # 返回用户查询
         }
+    
+    def _get_academic_sites_list(self, query: str = "") -> List[str]:
+        """
+        Get list of academic websites for targeted searching.
+        Ordered by open access priority (higher success rate for content crawling).
+        
+        Args:
+            query: Optional search query for dynamic site selection
+        
+        Returns:
+            List of academic website domains, prioritized by accessibility and relevance
+        """
+        return [
+            # ===== TIER 1: Preprint Servers & Full Open Access (Crawl Success Rate: 90%+) =====
+            "arxiv.org",            # arXiv - Physics, Math, CS preprints (fully open)
+            "biorxiv.org",          # bioRxiv - Biology preprints (fully open)
+            "plos.org",             # PLOS - Public Library of Science (fully open)
+            "frontiersin.org",      # Frontiers journals (fully open access)
+            "mdpi.com",             # MDPI journals (fully open access)
+            
+            # ===== TIER 2: AI/ML Conference Proceedings & Open Repositories (Success Rate: 90%+) =====
+            "openreview.net",       # OpenReview - AI/ML conference papers (fully open)
+            "papers.nips.cc",       # NeurIPS papers (fully open)
+            "semanticscholar.org",  # Semantic Scholar (AI-powered search)
+            
+            # ===== TIER 3: Top Journals with Partial Open Access (Success Rate: 50-70%) =====
+            "nature.com",           # Nature Publishing Group (some open articles)
+            "science.org",          # Science/AAAS (some open articles)
+            "pnas.org",             # PNAS (some open articles)
+            
+            # ===== TIER 4: Major Publishers & Discipline-Specific (Success Rate: 30-50%) =====
+            "link.springer.com",    # SpringerLink (Springer articles)
+            "onlinelibrary.wiley.com",  # Wiley Online Library (AGU, Chemistry, etc.)
+            "ieeexplore.ieee.org",  # IEEE Xplore (engineering/CS) - 精确化
+            "agu.org",              # American Geophysical Union (earth science)
+            
+            # ===== Below are NOT used in top-15 site targeting =====
+            "pubscholar.cn",        # PubScholar China (Chinese academic search)
+            "cell.com",             # Cell Press (some open articles)
+            "springer.com",         # Springer Nature (mixed access)
+            "academic.oup.com",     # Oxford University Press - 精确化
+            "cambridge.org",        # Cambridge University Press
+            "tandfonline.com",      # Taylor & Francis Online
+            "annualreviews.org",    # Annual Reviews
+            "acm.org",              # ACM Digital Library (CS)
+            "rsc.org",              # Royal Society of Chemistry
+            "asm.org",              # American Society for Microbiology
+            "geoscienceworld.org", # GeoScienceWorld
+            
+            # ===== TIER 6: Medical & Life Sciences (Success Rate: 40-60%) =====
+            "thelancet.com",        # The Lancet
+            "bmj.com",              # BMJ journals
+            "nejm.org",             # New England Journal of Medicine
+            "jamanetwork.com",      # JAMA Network
+            
+            # ===== TIER 7: Scientific Societies (Success Rate: 40-60%) =====
+            "aaas.org",             # AAAS (American Association for the Advancement of Science)
+            "royalsocietypublishing.org",  # Royal Society Publishing
+            "aps.org",              # American Physical Society
+            "acs.org",              # American Chemical Society
+            
+            # ===== TIER 8: Databases & Indexes (Success Rate: 20-40%) =====
+            "scopus.com",           # Scopus (Elsevier database)
+            "proquest.com",         # ProQuest databases
+            "sciencedirect.com"     # ScienceDirect (Elsevier)
+        ]
+    
+    def _get_dynamic_academic_sites(self, query: str, base_count: int = 15) -> List[str]:
+        """
+        Dynamically adjust academic site priority based on query keywords.
+        
+        Args:
+            query: Search query string
+            base_count: Number of sites to return (default 15)
+        
+        Returns:
+            List of academic sites with discipline-specific sites boosted to top
+        """
+        query_lower = query.lower()
+        
+        # Get base list
+        all_sites = self._get_academic_sites_list()
+        
+        # Define discipline-specific sites and their keywords (支持中英文)
+        # 全面覆盖所有主要学科领域，确保任何查询都能匹配到相关专业网站
+        discipline_boosts = {
+            # ===== Engineering & Technology (工程技术) =====
+            "ieee.org": [
+                # 电气电子工程
+                "engineering", "electrical", "electronic", "circuit", "signal processing", "robotics", "automation",
+                "semiconductor", "microelectronics", "power systems", "control systems", "embedded systems",
+                "telecommunications", "wireless", "antenna", "radar", "sensor", "actuator", "mechatronics",
+                "工程", "电气", "电子", "电路", "信号处理", "机器人", "自动化", "控制", "半导体", "微电子",
+                "电力系统", "控制系统", "嵌入式", "通信", "无线", "天线", "雷达", "传感器", "执行器", "机电"
+            ],
+            "acm.org": [
+                # 计算机科学
+                "algorithm", "software", "programming", "computing", "database", "graphics", "computer science",
+                "artificial intelligence", "machine learning", "deep learning", "neural network", "data mining",
+                "computer vision", "natural language processing", "nlp", "distributed systems", "cloud computing",
+                "cybersecurity", "cryptography", "blockchain", "human-computer interaction", "hci",
+                "算法", "软件", "编程", "程序", "计算", "数据库", "图形", "计算机", "人工智能", "机器学习",
+                "深度学习", "神经网络", "数据挖掘", "计算机视觉", "自然语言处理", "分布式", "云计算",
+                "网络安全", "密码学", "区块链", "人机交互"
+            ],
+            "openreview.net": [
+                # AI/ML 会议论文（ICLR, NeurIPS, ICML 等）
+                "machine learning", "deep learning", "neural network", "artificial intelligence", "reinforcement learning",
+                "transformer", "attention mechanism", "generative model", "gan", "vae", "diffusion model",
+                "computer vision", "natural language processing", "nlp", "representation learning", "meta-learning",
+                "few-shot learning", "transfer learning", "self-supervised learning", "contrastive learning",
+                "graph neural network", "gnn", "optimization", "gradient descent", "backpropagation",
+                "机器学习", "深度学习", "神经网络", "人工智能", "强化学习", "生成模型", "对比学习"
+            ],
+            "papers.nips.cc": [
+                # NeurIPS 会议论文（神经信息处理系统）
+                "neural", "learning", "optimization", "bayesian", "probabilistic", "inference", "statistical learning",
+                "deep learning", "machine learning", "reinforcement learning", "supervised learning", "unsupervised learning",
+                "semi-supervised", "active learning", "online learning", "bandit", "kernel method", "svm",
+                "neural network", "cnn", "rnn", "lstm", "transformer", "attention", "autoencoder",
+                "神经", "学习", "优化", "贝叶斯", "概率", "推理", "统计学习"
+            ],
+            
+            # ===== Earth & Environmental Science (地球与环境科学) =====
+            "agu.org": [
+                # 地球科学
+                "climate", "earth", "geology", "geophysics", "atmosphere", "ocean", "environmental",
+                "meteorology", "hydrology", "glaciology", "seismology", "volcanology", "tectonics",
+                "climate change", "global warming", "carbon cycle", "water cycle", "ecosystem",
+                "remote sensing", "gis", "paleoclimate", "oceanography", "marine science",
+                "气候", "地球", "地质", "地球物理", "大气", "海洋", "环境", "生态", "气象", "水文",
+                "冰川", "地震", "火山", "构造", "气候变化", "全球变暖", "碳循环", "水循环", "生态系统",
+                "遥感", "海洋学", "海洋科学"
+            ],
+            "geoscienceworld.org": [
+                "mineral", "petroleum", "sediment", "paleontology", "stratigraphy", "geochemistry",
+                "矿物", "石油", "沉积", "古生物", "地层", "地球化学"
+            ],
+            
+            # ===== Chemistry & Materials Science (化学与材料科学) =====
+            "rsc.org": [
+                # 化学与材料
+                "chemistry", "chemical", "molecule", "synthesis", "catalyst", "polymer", "material", "ceramic", "composite",
+                "thermal", "heat resistant", "insulation", "nanomaterial", "nanoparticle", "graphene", "carbon nanotube",
+                "electrochemistry", "photochemistry", "spectroscopy", "chromatography", "crystallography",
+                "superconductor", "semiconductor material", "battery", "fuel cell", "solar cell", "photovoltaic",
+                "coating", "corrosion", "metallurgy", "alloy", "steel", "aluminum", "titanium",
+                "化学", "分子", "合成", "催化", "聚合物", "材料", "陶瓷", "复合材料", "高温", "耐热", "隔热", "绝缘",
+                "纳米材料", "纳米颗粒", "石墨烯", "碳纳米管", "电化学", "光化学", "光谱", "色谱", "晶体",
+                "超导", "半导体材料", "电池", "燃料电池", "太阳能电池", "光伏", "涂层", "腐蚀", "冶金", "合金", "钢", "铝", "钛"
+            ],
+            "acs.org": [
+                "organic chemistry", "inorganic", "analytical chemistry", "biochemistry", "material science",
+                "pharmaceutical chemistry", "medicinal chemistry", "polymer chemistry", "surface chemistry",
+                "有机化学", "无机", "分析化学", "生物化学", "材料科学", "药物化学", "医药化学", "高分子化学", "表面化学"
+            ],
+            
+            # ===== Medical & Life Sciences (医学与生命科学) =====
+            "thelancet.com": [
+                # 临床医学
+                "clinical", "patient", "disease", "treatment", "diagnosis", "medical", "surgery", "therapy",
+                "cancer", "oncology", "cardiology", "neurology", "psychiatry", "pediatrics", "radiology",
+                "pathology", "immunology", "infectious disease", "vaccine", "antibody", "inflammation",
+                "临床", "患者", "疾病", "治疗", "诊断", "医学", "医疗", "手术", "疗法", "癌症", "肿瘤",
+                "心脏病", "神经", "精神", "儿科", "放射", "病理", "免疫", "传染病", "疫苗", "抗体", "炎症"
+            ],
+            "bmj.com": [
+                "health", "medicine", "epidemiology", "public health", "healthcare", "prevention",
+                "健康", "医学", "流行病", "公共卫生", "卫生", "医疗保健", "预防"
+            ],
+            "nejm.org": [
+                "therapy", "drug", "pharmaceutical", "clinical trial", "randomized controlled trial",
+                "疗法", "药物", "制药", "临床试验", "试验", "随机对照"
+            ],
+            "cell.com": [
+                # 生命科学
+                "cell biology", "molecular biology", "genetics", "protein", "gene", "genome", "dna", "rna",
+                "stem cell", "crispr", "gene editing", "transcription", "translation", "enzyme", "metabolism",
+                "signaling pathway", "apoptosis", "autophagy", "epigenetics", "microbiome", "proteomics",
+                "细胞", "分子生物", "遗传", "基因", "蛋白质", "蛋白", "基因组", "突变", "表达", "干细胞",
+                "基因编辑", "转录", "翻译", "酶", "代谢", "信号通路", "凋亡", "自噬", "表观遗传", "微生物组", "蛋白质组"
+            ],
+            
+            # ===== Physics & Astronomy (物理与天文) =====
+            "aps.org": [
+                # 物理
+                "physics", "quantum", "particle", "condensed matter", "optics", "photonics", "laser",
+                "plasma", "nuclear", "atomic", "molecular", "thermodynamics", "statistical mechanics",
+                "relativity", "cosmology", "astrophysics", "gravitational wave", "dark matter", "dark energy",
+                "物理", "量子", "粒子", "凝聚态", "光学", "力学", "光子", "激光", "等离子体", "核", "原子",
+                "分子", "热力学", "统计力学", "相对论", "宇宙学", "天体物理", "引力波", "暗物质", "暗能量"
+            ],
+        }
+        
+        # Calculate boost scores for each site
+        boost_scores = {}
+        for site, keywords in discipline_boosts.items():
+            score = sum(1 for kw in keywords if kw in query_lower)
+            if score > 0:
+                boost_scores[site] = score
+        
+        # If no specific discipline detected, return base list
+        if not boost_scores:
+            return all_sites[:base_count]
+        
+        # Separate boosted sites from base list
+        boosted_sites = sorted(boost_scores.keys(), key=lambda s: boost_scores[s], reverse=True)
+        base_sites = [s for s in all_sites if s not in boosted_sites]
+        
+        # Merge: keep top 5 base sites, insert boosted sites, then fill remaining
+        top_base = base_sites[:5]  # Always keep top 5 (arxiv, biorxiv, etc.)
+        remaining_base = base_sites[5:]
+        
+        # Construct final list
+        final_sites = top_base + boosted_sites + remaining_base
+        
+        return final_sites[:base_count]
+    
+    def _deduplicate_search_results(self, results: List[Dict]) -> List[Dict]:
+        """
+        Deduplicate search results using multiple strategies (方案三实现)
+        
+        Deduplication strategies:
+        1. URL normalization and deduplication (primary)
+        2. Title normalization and hash-based deduplication
+        3. DOI-based deduplication (if available)
+        
+        Args:
+            results: List of search result dictionaries
+            
+        Returns:
+            Deduplicated list of results
+        """
+        from hashlib import md5
+        import re
+        
+        seen_urls = set()
+        seen_title_hashes = set()
+        seen_dois = set()
+        deduplicated = []
+        duplicate_count = 0
+        
+        for result in results:
+            # Extract key information
+            url = result.get('link', '').strip()
+            title = result.get('title', '').strip()
+            
+            # Try to extract DOI from URL or snippet
+            doi = None
+            snippet = result.get('snippet', '')
+            doi_pattern = r'10\.\d{4,}/[^\s]+'
+            doi_match = re.search(doi_pattern, url + ' ' + snippet)
+            if doi_match:
+                doi = doi_match.group(0).lower()
+            
+            # Strategy 1: DOI deduplication (highest priority)
+            if doi and doi in seen_dois:
+                logger.debug(f"[DEDUP] Skipping duplicate DOI: {doi}")
+                duplicate_count += 1
+                continue
+            
+            # Strategy 2: URL deduplication
+            if url:
+                # Normalize URL: remove protocol, www, trailing slash, query parameters
+                normalized_url = url.lower()
+                normalized_url = re.sub(r'^https?://', '', normalized_url)
+                normalized_url = re.sub(r'^www\.', '', normalized_url)
+                normalized_url = re.sub(r'[?#].*$', '', normalized_url)  # Remove query and fragment
+                normalized_url = normalized_url.rstrip('/')
+                
+                if normalized_url in seen_urls:
+                    logger.debug(f"[DEDUP] Skipping duplicate URL: {url}")
+                    duplicate_count += 1
+                    continue
+                
+                seen_urls.add(normalized_url)
+            
+            # Strategy 3: Title hash deduplication
+            if title:
+                # Normalize title: lowercase, remove punctuation, remove extra spaces
+                normalized_title = re.sub(r'[^\w\s]', '', title.lower())
+                normalized_title = ' '.join(normalized_title.split())
+                
+                if len(normalized_title) > 10:  # Only hash meaningful titles
+                    title_hash = md5(normalized_title.encode()).hexdigest()
+                    
+                    if title_hash in seen_title_hashes:
+                        logger.debug(f"[DEDUP] Skipping duplicate title: {title[:50]}...")
+                        duplicate_count += 1
+                        continue
+                    
+                    seen_title_hashes.add(title_hash)
+            
+            # Record DOI
+            if doi:
+                seen_dois.add(doi)
+            
+            deduplicated.append(result)
+        
+        if duplicate_count > 0:
+            logger.info(f"[DEDUP] Removed {duplicate_count} duplicates from {len(results)} results, kept {len(deduplicated)} unique items")
+        
+        return deduplicated
+    
+    def _validate_workspace_path(self, path: str) -> Path:
+        """Validate that a path is within the workspace directory.
 
-    def _safe_join(self, path: str) -> Path:
+        Note: Avoid calling ``os.path.realpath`` on non-existent destination paths.
+        On Windows, ``realpath`` for a path whose intermediate directories do not
+        yet exist falls back to ``abspath`` plus a walk-up search that has been
+        observed to be racy under ``ThreadPoolExecutor`` workloads (e.g.
+        ``rag_document_saver`` writing several files in parallel). The race
+        produced spurious ``"outside workspace directory"`` errors for perfectly
+        valid relative paths.
+
+        The check below relies on pure string normalization to reject absolute
+        paths and ``..`` traversal, which is sufficient because we never use the
+        returned path to follow symlinks back out of the workspace.
+        """
         if os.path.isabs(path):
             raise Exception(f"Path '{path}' is absolute. Only relative paths are allowed.")
-        joined_path = os.path.join(self.workspace_path, path)
-        full_joined_path = os.path.realpath(joined_path)
-        if not full_joined_path.startswith(self.full_workspace_path):
+
+        # Normalize separators and collapse '.', '..' segments without touching
+        # the filesystem.
+        normalized = os.path.normpath(path).replace('\\', '/')
+        if (
+            normalized == '..'
+            or normalized.startswith('../')
+            or '/../' in normalized
+            or os.path.isabs(normalized)
+        ):
             raise Exception(f"Path '{path}' is outside workspace directory.")
-        return Path(full_joined_path)
+
+        return Path(self.workspace_path) / normalized
+
+    def _safe_join(self, path: str) -> Path:
+        """Alias for _validate_workspace_path for backward compatibility"""
+        return self._validate_workspace_path(path)
 
     # ================ WEB SEARCH TOOLS ================
 
@@ -1333,10 +2450,16 @@ class MCPTools:
             self,
             queries: List[str],
             max_results_per_query: int = 15,
-            max_workers: int = 5
+            max_workers: int = 5,
+            academic_sites: bool = True,
+            fallback_to_general: bool = True,
+            min_results_threshold: int = 5
     ) -> MCPToolResult:
         """
         Batch web search using configurable search provider with concurrent processing.
+        
+        Supports academic site targeting to prioritize results from professional academic websites
+        such as Nature, Science, IEEE, ACM, Springer, etc.
         
         Users need to implement their own search provider. Below is an example available:
         [
@@ -1359,6 +2482,9 @@ class MCPTools:
             queries: List of search queries
             max_results_per_query: Maximum search results per query
             max_workers: Maximum number of concurrent search requests
+            academic_sites: If True, prioritize academic websites (Nature, Science, IEEE, etc.)
+            fallback_to_general: If True, automatically fallback to general search when academic results are insufficient
+            min_results_threshold: Minimum number of results required before triggering fallback (default: 5)
         """
         try:
             from config.config import get_search_engine_config
@@ -1376,7 +2502,7 @@ class MCPTools:
             def search_single_query(query: str) -> Dict[str, Any]:
                 """Search a single query"""
                 try:
-                    search_results = self._generic_search(query, actual_max_results, search_config)
+                    search_results = self._generic_search(query, actual_max_results, search_config, academic_sites)
 
                     if not search_results.success:
                         return {
@@ -1431,13 +2557,139 @@ class MCPTools:
             query_order = {query: i for i, query in enumerate(queries)}
             all_results.sort(key=lambda x: query_order.get(x['query'], float('inf')))
 
+            # Fallback strategy: supplement with general search if results are insufficient
+            fallback_queries = []
+            fallback_triggered = False
+            
+            if academic_sites and fallback_to_general:
+                for result in all_results:
+                    if result.get('success', False):
+                        organic_count = len(result.get('results', {}).get('organic', []))
+                        if organic_count < min_results_threshold:
+                            fallback_queries.append(result['query'])
+                            logger.warning(
+                                f"[SEARCH_FALLBACK] Query '{result['query'][:50]}...' has only {organic_count} results, "
+                                f"triggering general search fallback"
+                            )
+                
+                if fallback_queries:
+                    fallback_triggered = True
+                    logger.warning(
+                        f"[SEARCH_FALLBACK] {len(fallback_queries)} queries need supplemental general search"
+                    )
+                    
+                    # Execute general search for insufficient queries
+                    def search_general_query(query: str) -> Dict[str, Any]:
+                        try:
+                            # Use general search (academic_sites=False)
+                            search_results = self._generic_search(query, actual_max_results, search_config, academic_sites=False)
+                            if not search_results.success:
+                                return {'query': query, 'success': False, 'error': search_results.error, 'results': []}
+                            
+                            search_data = search_results.data
+                            search_data["organic"] = search_data["organic"][:actual_max_results]
+                            return {'query': query, 'success': True, 'results': search_data, 'timestamp': time.time()}
+                        except Exception as e:
+                            logger.error(f"Error in general search for '{query}': {e}")
+                            return {'query': query, 'success': False, 'error': str(e), 'results': []}
+                    
+                    # Execute fallback searches
+                    fallback_results = []
+                    with ThreadPoolExecutor(max_workers=min(max_workers, len(fallback_queries))) as executor:
+                        future_to_query = {executor.submit(search_general_query, query): query for query in fallback_queries}
+                        for future in as_completed(future_to_query):
+                            try:
+                                result = future.result()
+                                fallback_results.append(result)
+                            except Exception as e:
+                                query = future_to_query[future]
+                                logger.error(f"Error processing fallback search for '{query}': {e}")
+                    
+                    # Merge fallback results with original results
+                    fallback_map = {r['query']: r for r in fallback_results}
+                    for i, result in enumerate(all_results):
+                        query = result['query']
+                        if query in fallback_map and fallback_map[query].get('success', False):
+                            # Merge results: academic results first, then general results
+                            academic_organic = result.get('results', {}).get('organic', [])
+                            general_organic = fallback_map[query].get('results', {}).get('organic', [])
+                            
+                            # Deduplicate by URL
+                            seen_urls = {item['link'] for item in academic_organic}
+                            unique_general = [item for item in general_organic if item['link'] not in seen_urls]
+                            
+                            # Combine results
+                            merged_organic = academic_organic + unique_general[:actual_max_results - len(academic_organic)]
+                            all_results[i]['results']['organic'] = merged_organic
+                            
+                            logger.info(
+                                f"[SEARCH_FALLBACK] Merged results for '{query[:50]}...': "
+                                f"{len(academic_organic)} academic + {len(unique_general)} general = {len(merged_organic)} total"
+                            )
+            
+            # Apply global deduplication across all queries (改进的方案三实现)
+            # 步骤1: 收集所有查询的结果
+            all_organic_results = []
+            query_indices = []  # 记录每个结果属于哪个查询
+            
+            for idx, result in enumerate(all_results):
+                if result.get('success', False) and 'results' in result:
+                    organic = result['results'].get('organic', [])
+                    for item in organic:
+                        all_organic_results.append(item)
+                        query_indices.append(idx)
+            
+            total_results_before = len(all_organic_results)
+            
+            # 步骤2: 全局去重（跨查询）
+            if all_organic_results:
+                deduplicated_results = self._deduplicate_search_results(all_organic_results)
+                total_results_after = len(deduplicated_results)
+                
+                # 步骤3: 将去重后的结果分配回各个查询
+                # 创建 URL 到去重结果的映射
+                deduplicated_url_map = {item.get('link', ''): item for item in deduplicated_results}
+                
+                # 按原查询分配去重后的结果
+                query_result_map = {i: [] for i in range(len(all_results))}
+                seen_urls = set()  # 跟踪已分配的 URL，避免重复分配
+                
+                for item, query_idx in zip(all_organic_results, query_indices):
+                    url = item.get('link', '')
+                    # 如果这个 URL 在去重结果中，且还没被分配过
+                    if url in deduplicated_url_map and url not in seen_urls:
+                        query_result_map[query_idx].append(deduplicated_url_map[url])
+                        seen_urls.add(url)
+                
+                # 更新各查询的结果
+                for idx, result in enumerate(all_results):
+                    if result.get('success', False) and 'results' in result:
+                        result['results']['organic'] = query_result_map[idx]
+                
+                if total_results_before > total_results_after:
+                    logger.info(
+                        f"[DEDUP_SUMMARY] Global deduplication across {len(all_results)} queries: "
+                        f"{total_results_before} → {total_results_after} results "
+                        f"({total_results_before - total_results_after} duplicates removed, "
+                        f"{(total_results_before - total_results_after) / total_results_before * 100:.1f}% reduction)"
+                    )
+            else:
+                total_results_after = 0
+
             return MCPToolResult(
                 success=True,
                 data=all_results,
                 metadata={
                     'total_queries': len(queries),
                     'successful_queries': len([r for r in all_results if r.get('success', False)]),
-                    'concurrent_workers': min(max_workers, len(queries))
+                    'concurrent_workers': min(max_workers, len(queries)),
+                    'fallback_triggered': fallback_triggered,
+                    'fallback_queries_count': len(fallback_queries) if fallback_triggered else 0,
+                    'deduplication': {
+                        'results_before': total_results_before,
+                        'results_after': total_results_after,
+                        'duplicates_removed': total_results_before - total_results_after
+                    }
                 }
             )
 
@@ -1445,11 +2697,482 @@ class MCPTools:
             logger.error(f"Batch web search failed: {e}")
             return MCPToolResult(success=False, error=str(e))
 
-    def _generic_search(self, query: str, max_results: int, config: Dict[str, Any]) -> MCPToolResult:
+    def rag_document_saver(
+            self,
+            documents: List[Dict[str, Any]] = None,
+            save_directory: str = "rag_downloads/research",
+            max_workers: int = 10
+    ) -> MCPToolResult:
         """
-        Generic search function that users need to implement.
+        Save RAG documents to workspace files using RAG content. Similar to url_crawler.
+
+        SIMPLE USAGE: Call with no arguments to use cached result from last search_rag_knowledge.
+
+        Args:
+            documents: Optional list of documents to save. Each document should have:
+                - content: Document content from RAG response (preferred for generic flow)
+                - file_path: Optional local save path (auto-generated if not provided)
+                - title: Optional document title
+                - file_id: Optional file ID
+                If not provided, uses cached result from last search_rag_knowledge call.
+            save_directory: Directory to save files (relative to workspace)
+            max_workers: Maximum number of concurrent save operations
+
+        Returns:
+            MCPToolResult with list of saved files and their metadata
+        """
+        # 【新增】验证保存目录，防止 Agent 传入错误的 url_crawler 目录
+        if save_directory and save_directory.startswith('url_crawler_save_files'):
+            logger.warning(
+                f"[RAG_SAVER] Invalid directory '{save_directory}' for RAG documents. Using default 'rag_downloads/research'")
+            save_directory = "rag_downloads/research"
+
+        try:
+            # If no documents provided, use cached search result
+            if documents is None or documents == []:
+                if self._last_rag_search_result:
+                    logger.info(
+                        f"[RAG_SAVER] Using cached RAG search result from query: {self._last_rag_search_query[:50] if self._last_rag_search_query else 'unknown'}...")
+                    # Extract simplified document list from cached result
+                    documents = []
+                    seen_file_ids = set()
+                    doc_list = self._last_rag_search_result.get('doc_list', [])
+                    for idx, doc in enumerate(doc_list):
+                        content_text = doc.get('content', '')
+                        file_id = doc.get('file_id', '')
+                        metadata = doc.get('additional_fields', {}).get('metadata', {})
+
+                        if not file_id:
+                            metadata_file_id = metadata.get('file_id', '')
+                            if metadata_file_id:
+                                file_id = metadata_file_id
+                            elif content_text:
+                                import hashlib
+                                file_id = f"rag_{hashlib.md5(content_text.encode('utf-8')).hexdigest()[:12]}"
+                            else:
+                                file_id = f"rag_{idx}_{int(time.time())}"
+
+                        if file_id in seen_file_ids:
+                            continue
+                        seen_file_ids.add(file_id)
+
+                        has_content = bool(content_text)
+                        if not has_content:
+                            cache_key = f"file_id:{file_id}"
+                            with self._rag_cache_lock:
+                                cache_entry = self._rag_metadata_cache.get(cache_key)
+                            if cache_entry:
+                                cached_metadata = cache_entry.get('metadata', cache_entry)
+                                content_text = cached_metadata.get('content', '')
+                                has_content = bool(content_text)
+
+                        if has_content:
+                            documents.append({
+                                'file_id': file_id,
+                                'title': metadata.get('title', 'RAG Document'),
+                                'journal': metadata.get('journal', ''),
+                                'doi': metadata.get('doi', ''),
+                                'section': metadata.get('section', ''),
+                                # 【修复】添加完整的元数据字段
+                                'authors': metadata.get('authors', []),
+                                'publication_date': metadata.get('publication_date', ''),
+                                'volume': metadata.get('volume', ''),
+                                'chunk_length': metadata.get('chunk_length', 0) or len(content_text),
+                                'content': content_text
+                            })
+                    logger.info(f"[RAG_SAVER] Extracted {len(documents)} documents from cached result")
+                else:
+                    return MCPToolResult(
+                        success=False,
+                        error="No documents provided and no cached result available. Please call search_rag_knowledge first."
+                    )
+
+            if not documents:
+                return MCPToolResult(
+                    success=False,
+                    error="No documents with valid content found. RAG search may not have returned usable documents."
+                )
+
+            logger.info(f"[RAG_SAVER] Processing {len(documents)} documents for save")
+
+            # 【调试】打印第一个文档的结构，帮助诊断问题
+            if documents:
+                first_doc = documents[0]
+                logger.info(f"[RAG_SAVER_DEBUG] First doc keys: {list(first_doc.keys())}")
+                logger.info(f"[RAG_SAVER_DEBUG] First doc content: {first_doc}")
+
+            # 【修复】如果文档缺少 content/元数据字段，尝试从缓存的 RAG 结果中补充
+            # 检查是否需要补充元数据（content 缺失 或 authors 缺失）
+            needs_enrichment = False
+            if documents:
+                first_doc = documents[0]
+                if not first_doc.get('content'):
+                    needs_enrichment = True
+                    logger.warning(f"[RAG_SAVER] Documents missing content")
+                elif not first_doc.get('authors') and not first_doc.get('publication_date'):
+                    needs_enrichment = True
+                    logger.warning(f"[RAG_SAVER] Documents missing metadata (authors/publication_date)")
+
+            if needs_enrichment:
+                # 【性能优化】一次性读取缓存快照，避免重复加锁
+                # 100 个文档时，性能提升 100 倍（100 次锁 → 1 次锁）
+                with self._rag_cache_lock:
+                    cache_snapshot = dict(self._rag_metadata_cache)
+                    cache_size = len(cache_snapshot)
+                    has_cache = bool(cache_snapshot)
+
+                logger.info(f"[RAG_SAVER] Attempting to enrich documents from cached metadata")
+                logger.info(f"[RAG_SAVER] Accumulated metadata cache has {cache_size} entries")
+
+                # 【关键修复】使用累积式缓存 _rag_metadata_cache 而不是 _last_rag_search_result
+                # 这样即使多次搜索覆盖了 _last_rag_search_result，元数据仍然可用
+                if has_cache:
+                    # 丰富文档信息（使用 file_id 匹配累积式缓存）
+                    enriched_documents = []
+                    enriched_count = 0
+                    for doc in documents:
+                        doc_file_id = doc.get('file_id', '')
+                        if not doc_file_id and doc.get('content'):
+                            import hashlib
+                            doc_file_id = f"rag_{hashlib.md5(doc.get('content').encode('utf-8')).hexdigest()[:12]}"
+
+                        cache_key = f"file_id:{doc_file_id}"
+                        # 从快照中查找，无需加锁
+                        cache_entry = cache_snapshot.get(cache_key)
+
+                        if cache_entry:
+                            # 新缓存结构: {'metadata': {...}, 'timestamp': float}
+                            cached_metadata = cache_entry.get('metadata', cache_entry)
+                            enriched_doc = {**doc, **cached_metadata}
+                            enriched_documents.append(enriched_doc)
+                            enriched_count += 1
+                            logger.info(
+                                f"[RAG_SAVER] Enriched doc {cache_key[-40:]} with metadata: authors={len(enriched_doc.get('authors', []))}, journal={enriched_doc.get('journal', '')[:30]}")
+                        else:
+                            # 如果累积缓存中也找不到，保留原文档但记录警告
+                            enriched_documents.append(doc)
+                            logger.warning(
+                                f"[RAG_SAVER] Could not find metadata in accumulated cache for key: {cache_key}")
+
+                    if enriched_count > 0:
+                        documents = enriched_documents
+                        logger.info(
+                            f"[RAG_SAVER] Enriched {enriched_count}/{len(documents)} documents with full metadata from accumulated cache")
+                    else:
+                        logger.warning(f"[RAG_SAVER] No documents could be enriched from accumulated cache")
+                else:
+                    logger.warning(f"[RAG_SAVER] No accumulated metadata cache available")
+
+            def process_single_document(doc: Dict) -> Dict[str, Any]:
+                """Process and save a single document from RAG response content."""
+                content = doc.get('content', '')
+                file_id = doc.get('file_id')
+                if not file_id:
+                    if content:
+                        import hashlib
+                        file_id = f"rag_{hashlib.md5(content.encode('utf-8')).hexdigest()[:12]}"
+                    else:
+                        file_id = 'unknown'
+                title = doc.get('title', 'RAG Document')
+                journal = doc.get('journal', '')
+                doi = doc.get('doi', '')
+                section = doc.get('section', '')
+                # 新增：提取完整的元数据字段
+                authors = doc.get('authors', [])
+                publication_date = doc.get('publication_date', '')
+                volume = doc.get('volume', '')
+                chunk_length = doc.get('chunk_length', 0) or (len(content) if content else 0)
+                source_label = doc.get('source', 'RAG Knowledge Base')
+
+                result_base = {
+                    'file_id': file_id,
+                    'title': title,
+                    'success': False,
+                    'error': None,
+                    'file_path': None,
+                    'content_length': 0,
+                    'word_count': 0
+                }
+
+                try:
+                    import re
+                    if not content:
+                        result_base['error'] = "No content available for RAG document"
+                        return result_base
+
+                    logger.info(f"[RAG_SAVER] Using RAG content ({len(content)} chars)")
+
+                    # 【关键修复】从文件内容中提取 DOI、Journal、Publication Date（如果 API 没有返回）
+                    if not doi:
+                        # 尝试匹配 DOI 格式: DOI: xxx 或 https://doi.org/xxx 或 doi:10.xxx 或 dx.doi.org
+                        doi_patterns = [
+                            r'DOI:\s*(https?://doi\.org/[^\s\n]+)',
+                            r'DOI:\s*(10\.[^\s\n]+)',
+                            r'https://doi\.org/(10\.[^\s\n]+)',
+                            r'https?://dx\.doi\.org/(10\.[^\s\n]+)',
+                            r'doi\.org/(10\.[^\s\n]+)',
+                            r'(?:^|\s)doi:\s*(10\.[^\s\n]+)',
+                        ]
+                        for pattern in doi_patterns:
+                            match = re.search(pattern, content, re.IGNORECASE)
+                            if match:
+                                doi = match.group(1).strip()
+                                # 清理末尾的标点符号和括号
+                                doi = re.sub(r'[,;.\s\)]+$', '', doi)
+                                logger.info(f"[RAG_SAVER] Extracted DOI from content: {doi}")
+                                break
+
+                    if not journal:
+                        # 尝试匹配 Journal 格式（含出版商版权声明）
+                        journal_patterns = [
+                            r'(?:To appear in|Published in|Journal):\s*([^\n]+)',
+                            r'(?:appear in|published in):\s*([^\n]+?)(?:\s+https?://|\s*$)',
+                            # 从版权声明中提取出版商（如 © 2012 Elsevier Ltd.）
+                            r'©\s*\d{4}\s+(Elsevier[^\n.]*)',
+                            r'©\s*\d{4}\s+(?:Published by\s+)?(Springer[^\n.]*)',
+                            r'©\s*\d{4}\s+(?:Published by\s+)?(Wiley[^\n.]*)',
+                            r'©\s*\d{4}\s+(?:Published by\s+)?(American Chemical Society[^\n.]*)',
+                            r'©\s*\d{4}\s+(?:Published by\s+)?(Royal Society of Chemistry[^\n.]*)',
+                            r'©\s*\d{4}\s+(?:Published by\s+)?(Nature Publishing[^\n.]*)',
+                            r'©\s*\d{4}\s+(?:Published by\s+)?(Taylor & Francis[^\n.]*)',
+                            r'©\s*\d{4}\s+(?:Published by\s+)?(MDPI[^\n.]*)',
+                            # 匹配 $\circledcirc$ 格式（PDF转文本后的版权符号）
+                            r'\$\\circledcirc\$\s*\d{4}\s+(Elsevier[^\n.]*)',
+                            r'\$\\circledcirc\$\s*\d{4}\s+(?:Published by\s+)?(Elsevier[^\n.]*)',
+                        ]
+                        for pattern in journal_patterns:
+                            match = re.search(pattern, content, re.IGNORECASE)
+                            if match:
+                                journal = match.group(1).strip()
+                                # 清理末尾的标点符号和多余空格
+                                journal = re.sub(r'[,;.\s]+$', '', journal)
+                                # 清理常见后缀（All rights reserved 等）
+                                journal = re.sub(r'\s*All rights reserved.*$', '', journal, flags=re.IGNORECASE)
+                                if journal:
+                                    logger.info(f"[RAG_SAVER] Extracted Journal/Publisher from content: {journal}")
+                                    break
+
+                    if not publication_date:
+                        # 从学术论文常见格式中提取发表日期
+                        date_patterns = [
+                            # Available online DD Month YYYY（最接近实际发表日期）
+                            r'Available online\s+(\d{1,2}\s+\w+\s+\d{4})',
+                            # Accepted DD Month YYYY
+                            r'Accepted\s+(\d{1,2}\s+\w+\s+\d{4})',
+                            # Received DD Month YYYY（投稿日期，作为兜底）
+                            r'Received\s+(\d{1,2}\s+\w+\s+\d{4})',
+                            # 版权年份 © YYYY 或 $\circledcirc$ YYYY
+                            r'(?:©|\$\\circledcirc\$)\s*(\d{4})',
+                        ]
+                        for pattern in date_patterns:
+                            match = re.search(pattern, content, re.IGNORECASE)
+                            if match:
+                                date_str = match.group(1).strip()
+                                # 如果只匹配到年份（4位数字），转换为标准格式
+                                if re.match(r'^\d{4}$', date_str):
+                                    publication_date = f"{date_str}-01-01"
+                                else:
+                                    # 尝试解析完整日期 "DD Month YYYY" -> "YYYY-MM-DD"
+                                    try:
+                                        from datetime import datetime as dt
+                                        parsed = dt.strptime(date_str, "%d %B %Y")
+                                        publication_date = parsed.strftime("%Y-%m-%d")
+                                    except ValueError:
+                                        # 如果解析失败，提取年份
+                                        year_match = re.search(r'(\d{4})', date_str)
+                                        if year_match:
+                                            publication_date = f"{year_match.group(1)}-01-01"
+                                if publication_date:
+                                    logger.info(
+                                        f"[RAG_SAVER] Extracted publication date from content: {publication_date}")
+                                    break
+
+                    # Generate safe filename
+                    display_title = section if section and len(section) > len(title) else title
+                    safe_title = re.sub(r'[^\w\s-]', '', display_title[:50])
+                    safe_title = re.sub(r'[-\s]+', '_', safe_title)
+                    if not safe_title:
+                        safe_title = 'rag_doc'
+                    filename = f"{safe_title}_{file_id[:8]}.md"
+                    local_file_path = f"{save_directory}/{filename}"
+
+                    # 格式化作者列表
+                    authors_str = ', '.join(authors) if authors else 'N/A'
+
+                    # Build file content with metadata header (包含完整元数据)
+                    file_content_parts = [
+                        f"# {display_title}",
+                        "",
+                        "## Metadata",
+                        f"- **Authors**: {authors_str}",
+                        f"- **Journal**: {journal or 'N/A'}",
+                        f"- **Volume**: {volume or 'N/A'}",
+                        f"- **Publication Date**: {publication_date or 'N/A'}",
+                        f"- **DOI**: {doi or 'N/A'}",
+                        f"- **Section**: {section or 'N/A'}",
+                        f"- **Source**: {source_label}",
+                        f"- **File ID**: {file_id}",
+                        "",
+                        "---",
+                        "",
+                        "## Content",
+                        "",
+                        content
+                    ]
+
+                    file_content = '\n'.join(file_content_parts)
+
+                    # Save to workspace
+                    write_result = self.file_write(
+                        file_path=local_file_path,
+                        content=file_content,
+                        create_dirs=True
+                    )
+
+                    if not write_result.success:
+                        result_base['error'] = f"File write failed: {write_result.error}"
+                        return result_base
+
+                    logger.info(f"[RAG_SAVER] Saved to {local_file_path}")
+
+                    # 构建完整的元数据对象
+                    full_metadata = {
+                        'file_id': file_id,
+                        'file_path': local_file_path,
+                        'title': display_title,
+                        'authors': authors,
+                        'journal': journal,
+                        'volume': volume,
+                        'publication_date': publication_date,
+                        'doi': doi,
+                        'section': section,
+                        'chunk_length': chunk_length,
+                        'source': source_label
+                    }
+
+                    return {
+                        **result_base,
+                        'success': True,
+                        'file_path': local_file_path,
+                        'content_length': len(file_content),
+                        'word_count': len(content.split()),
+                        'metadata': full_metadata
+                    }
+
+                except Exception as e:
+                    logger.error(f"[RAG_SAVER] Error processing {file_id}: {e}")
+                    return {
+                        **result_base,
+                        'error': str(e)
+                    }
+
+            # Process all documents concurrently (similar to url_crawler)
+            results = []
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(documents))) as executor:
+                future_to_doc = {
+                    executor.submit(process_single_document, doc): doc
+                    for doc in documents
+                }
+
+                for future in as_completed(future_to_doc):
+                    doc = future_to_doc[future]
+                    try:
+                        result = future.result()
+                        results.append(result)
+                    except Exception as e:
+                        logger.error(f"[RAG_SAVER] Error: {e}")
+                        results.append({
+                            'file_id': doc.get('file_id', ''),
+                            'success': False,
+                            'error': str(e)
+                        })
+
+            # Calculate statistics
+            successful_saves = [r for r in results if r.get('success', False)]
+
+            if successful_saves:
+                self._last_rag_saved_files = [
+                    r.get('file_path') for r in successful_saves if r.get('file_path')
+                ]
+                self._last_rag_saved_timestamp = time.time()
+            else:
+                self._last_rag_saved_files = []
+                self._last_rag_saved_timestamp = None
+
+            logger.info(f"[RAG_SAVER] Completed: {len(successful_saves)}/{len(results)} documents saved")
+
+            # 【新增】将元数据写入 references.jsonl 文件（线程安全）
+            # 文件放在 rag_downloads 目录（上一级），与文档分离，方便查找
+            if successful_saves:
+                references_file_path = self.workspace_path / "rag_downloads" / "references.jsonl"
+
+                # 确保父目录存在
+                references_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+                # 使用文件锁保护整个读-修改-写操作，确保原子性
+                with self._references_file_lock:
+                    try:
+                        # 读取现有的 references（如果存在）
+                        existing_refs = {}
+                        if references_file_path.exists():
+                            with open(references_file_path, 'r', encoding='utf-8') as f:
+                                for line in f:
+                                    try:
+                                        ref = json.loads(line.strip())
+                                        if ref.get('file_id'):
+                                            existing_refs[ref['file_id']] = ref
+                                    except json.JSONDecodeError:
+                                        continue
+
+                        # 添加/更新新的引用
+                        for result in successful_saves:
+                            metadata = result.get('metadata', {})
+                            if metadata.get('file_id'):
+                                existing_refs[metadata['file_id']] = metadata
+
+                        # 原子写入：先写临时文件，再重命名
+                        tmp_file_path = references_file_path.with_suffix('.tmp')
+                        with open(tmp_file_path, 'w', encoding='utf-8') as f:
+                            for ref in existing_refs.values():
+                                f.write(json.dumps(ref, ensure_ascii=False) + '\n')
+
+                        # 原子替换（Windows 上需要先删除目标文件）
+                        if references_file_path.exists():
+                            references_file_path.unlink()
+                        tmp_file_path.rename(references_file_path)
+
+                        logger.info(f"[RAG_SAVER] Saved {len(existing_refs)} references to {references_file_path}")
+                    except Exception as e:
+                        logger.warning(f"[RAG_SAVER] Failed to save references.jsonl: {e}")
+                        # 清理临时文件
+                        if tmp_file_path.exists():
+                            try:
+                                tmp_file_path.unlink()
+                            except:
+                                pass
+
+            return MCPToolResult(
+                success=True,
+                data=results,
+                metadata={
+                    'total_documents': len(results),
+                    'successful_saves': len(successful_saves),
+                    'failed_saves': len(results) - len(successful_saves),
+                    'save_directory': save_directory,
+                    'references_file': "rag_downloads/references.jsonl"
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"[RAG_SAVER] Failed: {e}")
+            return MCPToolResult(success=False, error=str(e))
+
+    def _generic_search(self, query: str, max_results: int, config: Dict[str, Any], 
+                       academic_sites: bool = True) -> MCPToolResult:
+        """
+        Generic search function with academic site targeting support.
         
-        This function should return results in the standard format and be wrapped in MCPToolResult:
+        This function returns results in the standard format wrapped in MCPToolResult:
         
         search_res = {
             "organic": [
@@ -1464,7 +3187,11 @@ class MCPTools:
 
         return MCPToolResult(success=True, data=search_res)
         
-        Users should implement their own search logic here based on their preferred search service.
+        Args:
+            query: Search query string
+            max_results: Maximum number of results to return
+            config: Search engine configuration
+            academic_sites: If True, prioritize academic websites in search
         
         Notes:
         1. It is recommended to use search engine APIs that comply with relevant safety and regulatory requirements.
@@ -1476,18 +3203,38 @@ class MCPTools:
         sensitive information. We assume no liability for privacy-related issues arising from such transmission.
         """
         try:
-            # This is a placeholder - users should implement their own search logic
-            # raise NotImplementedError(
-            #     "Generic search provider not implemented. Please implement your own search logic in _generic_search method. "
-            #     "The return format should match the standard format with 'organic' results containing title, link, snippet, and date fields."
-            # )
-
-            # Example implementation for serper (commented out):
+            # Debug: Log function entry
+            logger.warning(f"[SEARCH_DEBUG] _generic_search called with academic_sites={academic_sites}, query={query[:50]}...")
+            
+            # Get academic sites list (dynamic or static)
+            academic_sites_list = self._get_dynamic_academic_sites(query, base_count=15)
+            logger.warning(f"[SEARCH_DEBUG] Academic sites list length: {len(academic_sites_list) if academic_sites_list else 0}")
+            logger.warning(f"[SEARCH_DEBUG] Top 5 sites for this query: {', '.join(academic_sites_list[:5])}")
+            
+            # Enhance query with academic site targeting if enabled
+            enhanced_query = query
+            if academic_sites and academic_sites_list:
+                # Add site: operators to prioritize academic sources
+                # Use OR logic to search across multiple academic sites
+                # Increased from 10 to 15 sites for better coverage (still well under 2048 char limit)
+                site_filters = " OR ".join([f"site:{site}" for site in academic_sites_list[:15]])
+                enhanced_query = f"({query}) ({site_filters})"
+                
+                # Enhanced debug logging for verification
+                logger.warning(f"[ACADEMIC_SEARCH_DEBUG] ========== Academic Search Enabled ==========")
+                logger.warning(f"[ACADEMIC_SEARCH_DEBUG] Original query: {query}")
+                logger.warning(f"[ACADEMIC_SEARCH_DEBUG] Enhanced query: {enhanced_query}")
+                logger.warning(f"[ACADEMIC_SEARCH_DEBUG] Using {len(academic_sites_list[:15])} academic sites (from {len(academic_sites_list)} total)")
+                logger.warning(f"[ACADEMIC_SEARCH_DEBUG] Top 15 sites: {', '.join(academic_sites_list[:15])}")
+                logger.warning(f"[ACADEMIC_SEARCH_DEBUG] Query length: {len(enhanced_query)} chars (limit: 2048)")
+                logger.warning(f"[ACADEMIC_SEARCH_DEBUG] ================================================")
+                logger.info(f"Academic search enabled. Enhanced query with {len(academic_sites_list[:15])} academic site filters.")
+            
             url = config['base_url']
 
             payload = json.dumps({
-                "q": query,
-                "num": 10
+                "q": enhanced_query,
+                "num": max_results
             })
 
             headers = {
@@ -1645,7 +3392,7 @@ class MCPTools:
 
                 # Example implementation for content extractor (commented out):
                 crawler_url = f"{config.get('base_url', 'https://api.content-extractor.com')}/{url}"
-                response = requests.get(crawler_url, headers=headers, timeout=config.get('timeout', 30))
+                response = requests.get(crawler_url, headers=headers, timeout=config.get('timeout', 30), verify=False)
                 response.raise_for_status()
 
                 content = response.text
@@ -1699,6 +3446,41 @@ class MCPTools:
                     error="URL crawler not configured"
                 )
 
+            def _is_blocked_or_verification_page(text: str) -> bool:
+                """
+                Detect anti-bot / verification / access denied pages.
+                These pages should not be treated as valid academic sources.
+                """
+                if not text:
+                    return True
+
+                content_lower = text.lower()
+                blocked_patterns = [
+                    "enable cookies",
+                    "cookies are turned off",
+                    "security check",
+                    "verifying you are human",
+                    "just a moment",
+                    "access denied",
+                    "403 forbidden",
+                    "forbidden",
+                    "captcha",
+                    "cloudflare",
+                    "performing security checks",
+                    "malicious bots",
+                    "bot verification",
+                ]
+
+                if any(pattern in content_lower for pattern in blocked_patterns):
+                    return True
+
+                # Extremely short pages are often placeholders/error pages.
+                # Keep the threshold conservative to reduce false positives.
+                if len(content_lower.split()) < 120:
+                    return True
+
+                return False
+
             def process_single_document(doc: Dict) -> Dict[str, Any]:
                 """Process a single document: extract content and save to file"""
                 url = doc['url']
@@ -1735,6 +3517,15 @@ class MCPTools:
                     content = content_result.data
                     if not content:
                         result_base['error'] = "Extracted content is empty"
+                        return result_base
+
+                    if _is_blocked_or_verification_page(content):
+                        result_base['error'] = "Blocked/verification page detected"
+                        if include_metadata:
+                            result_base['metadata'] = {
+                                'blocked_page': True,
+                                'reason': 'anti-bot or access-denied content detected'
+                            }
                         return result_base
 
                     # Save content to file
@@ -1841,20 +3632,29 @@ class MCPTools:
 
     def _extract_original_filename(self, filename: str) -> str:
         """
-        从文件名中提取原始文件名（去掉file_id前缀）
+        从文件名中提取原始文件名（去掉file_id前缀和缓存文件的.txt后缀）
 
         Args:
             filename: 可能包含file_id前缀的文件名，格式如 'file_id_filename.ext' 或 'filename.ext'
 
         Returns:
-            原始文件名（去掉file_id前缀）
+            原始文件名（去掉file_id前缀和缓存文件的.txt后缀）
         """
+        result = filename
         if '_' in filename:
             parts = filename.split('_', 1)
             # 如果第一部分是file_id（8位以上十六进制），则使用第二部分
             if len(parts) > 1 and len(parts[0]) >= 8 and re.match(r'^[a-f0-9]{8,}', parts[0].lower()):
-                return parts[1]
-        return filename
+                result = parts[1]
+        
+        # 去掉缓存文件的.txt后缀（如 .doc.txt, .docx.txt, .pdf.txt）
+        # 但保留原生.txt文件的扩展名
+        if (result.endswith('.doc.txt') or
+                result.endswith('.docx.txt') or
+                result.endswith('.pdf.txt')):
+            result = result[:-4]
+        
+        return result
 
     def _extract_title_from_filename(self, filename: str) -> str:
         """
@@ -1879,6 +3679,8 @@ class MCPTools:
     def _extract_title_from_file_content(self, file_path: Path) -> tuple:
         """
         从文件内容中提取标题和URL
+        
+        对于 arXiv 论文，会自动从文件名构建 URL
 
         Args:
             file_path: 文件路径
@@ -1888,36 +3690,162 @@ class MCPTools:
         """
         title = "Unknown Title"
         url_source = "Unknown URL"
+        
+        # 检查是否是 arXiv 文件（通过文件名格式判断）
+        filename = file_path.name
+        # arXiv paper_id 格式：YYMM.NNNNN[vN].txt (例如：2603.02208v1.txt)
+        arxiv_match = re.match(r'^(\d{4}\.\d{5}(?:v\d+)?)\.txt$', filename)
+        
+        if arxiv_match:
+            # 这是 arXiv 文件，从文件名构建 URL
+            paper_id = arxiv_match.group(1)
+            url_source = f"https://arxiv.org/abs/{paper_id}"
+            logger.info(f"识别为 arXiv 文件: {filename}, URL: {url_source}")
+
+        # 检查是否是 PubMed 文件（通过文件名和父目录判断）
+        # PubMed 文件格式：{PMID}.txt 或 {PMID}_abstract.txt（纯数字PMID）
+        pubmed_match = re.match(r'^(\d{5,10})(?:_abstract)?\.txt$', filename)
+        if pubmed_match and ('pubmed' in str(file_path.parent).lower()):
+            pmid = pubmed_match.group(1)
+            url_source = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+            logger.info(f"识别为 PubMed 文件: {filename}, PMID: {pmid}, URL: {url_source}")
 
         try:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 lines = f.readlines()
 
+                # 拼接完整内容用于 Metadata 段的整体匹配（DOI / Source 等）
+                content = ''.join(lines)
+
+                # 【新增】优先从 Metadata 部分提取 DOI（针对 RAG 文件）
+                # 检查是否有 Metadata 部分（RAG 和 rag_document_saver 保存的文件格式）
+                doi_match = re.search(r'-\s*\*\*DOI\*\*:\s*(10\.\d+/[^\s\n]+)', content)
+                if doi_match:
+                    doi = doi_match.group(1).strip()
+                    url_source = f"https://doi.org/{doi}"
+                    logger.info(f"[METADATA_DOI] 从 Metadata 提取 DOI: {url_source}")
+
+                # 【新增】如果 Metadata 中标记了来源，作为 RAG 来源
+                if url_source == "Unknown URL":
+                    source_match = re.search(r'-\s*\*\*Source\*\*:\s*(.+)', content)
+                    if source_match and 'RAG' in source_match.group(1):
+                        url_source = "RAG知识库"
+                        logger.info(f"[METADATA_SOURCE] 检测到 RAG Source，标记为 RAG 来源")
+
+                if url_source == "Unknown URL" and 'rag_downloads' in str(file_path):
+                    url_source = "RAG知识库"
+
                 # 改进标题提取逻辑
                 for i, line in enumerate(lines[:30]):  # 检查更多行
                     line = line.strip()
-                    if line and 10 <= len(line) <= 200:  # 更合理的标题长度范围
+                    
+                    # 跳过 arXiv 元数据行（如：arXiv:1206.3218v1 [math.FA] 14 Jun 2012）
+                    if line.startswith('arXiv:') or line.startswith('arxiv:'):
+                        continue
+                    
+                    # 处理"Title: xxx URL Source: yyy"格式（标题和URL在同一行）
+                    if line.startswith('Title: ') and 'URL Source:' in line:
+                        # 提取Title和URL Source之间的内容
+                        title_part = line.split('URL Source:')[0]
+                        title = title_part.replace('Title: ', '').strip()
+                        # 清理HTML标签
+                        title = re.sub(r'<[^>]+>', '', title).strip()
+                        if title and len(title) >= 10:
+                            logger.info(f"提取到标题 (行{i + 1}, 同行格式): {title[:50]}...")
+                            break
+                    
+                    # 处理markdown标题格式
+                    if line.startswith('#'):
+                        title = line.strip('# ').strip()[:200]
+                        # 清理HTML标签
+                        title = re.sub(r'<[^>]+>', '', title).strip()
+                        logger.info(f"提取到标题 (行{i + 1}): {title[:50]}...")
+                        break
+
+                    # 处理普通标题（不包含http）
+                    if line and 10 <= len(line) <= 200:
                         if 'http' not in line and not line.startswith('['):
                             title = line.strip()[:200]
                             # 去掉"Title: "前缀（如果存在）
                             if title.startswith('Title: '):
-                                title = title[7:]  # 去掉"Title: "
+                                title = title[7:]
+                            # 清理HTML标签
+                            title = re.sub(r'<[^>]+>', '', title).strip()
                             logger.info(f"提取到标题 (行{i + 1}): {title[:50]}...")
                             break
-                    # 处理markdown标题格式
-                    if line.startswith('#'):
-                        title = line.strip('# ').strip()[:200]
-                        logger.info(f"提取到标题 (行{i + 1}): {title[:50]}...")
-                        break
 
-                # 改进URL提取逻辑：排除中文标点符号，确保URL不包含日期
-                for line in lines[:20]:
-                    # 匹配URL，但排除中文标点符号（，。；：！？）和右方括号]
-                    url_match = re.search(r'https?://[^\s\]，。；：！？]+', line)
-                    if url_match:
-                        url_source = url_match.group(0)
-                        logger.info(f"提取到URL: {url_source[:50]}...")
-                        break
+                # 如果标题仍然未知，尝试从长文本行中提取第一句话作为标题
+                # 适用于 PubMed abstract 等内容为单行长文本的文件
+                if title == "Unknown Title" and lines:
+                    first_content_line = ""
+                    for line in lines[:10]:
+                        stripped = line.strip()
+                        if stripped and not stripped.startswith('URL Source:') and not stripped.startswith('http'):
+                            first_content_line = stripped
+                            break
+                    if first_content_line and len(first_content_line) > 200:
+                        # 提取第一句话（以句号、问号、感叹号结尾）
+                        sentence_match = re.match(r'^(.{20,200}?[.!?])\s', first_content_line)
+                        if sentence_match:
+                            title = sentence_match.group(1).strip()
+                        else:
+                            # 没有明确的句子结束符，截取前200个字符
+                            title = first_content_line[:200].strip()
+                        title = re.sub(r'<[^>]+>', '', title).strip()
+                        logger.info(f"从长文本提取标题: {title[:50]}...")
+
+                # 如果不是 arXiv 文件，从内容中提取 URL
+                if url_source == "Unknown URL":
+                    # 改进URL提取逻辑：排除中文标点符号，确保URL不包含日期
+                    for line in lines[:50]:  # 检查更多行以处理 HTML 文件
+                        # 匹配URL，但排除中文标点符号（，。；：！？）、右方括号]、引号和HTML标签
+                        url_match = re.search(r'https?://[^\s\]，。；：！？"\'<>]+', line)
+                        if url_match:
+                            url_source = url_match.group(0)
+                            # 清理 URL 末尾可能的 HTML 标签残留
+                            url_source = re.sub(r'["\'/]+$', '', url_source)  # 移除末尾的引号、斜杠
+                            logger.info(f"提取到URL: {url_source[:50]}...")
+                            break
+                
+                # 特殊处理：如果是 HTML 文件，尝试从 meta 标签或 canonical 链接提取更准确的信息
+                if '<html' in ''.join(lines[:10]).lower() or '<!doctype html>' in ''.join(lines[:5]).lower():
+                    logger.info(f"检测到 HTML 文件: {file_path.name}")
+                    
+                    # 尝试从 canonical 链接提取 URL
+                    for line in lines[:100]:
+                        canonical_match = re.search(r'<link\s+rel="canonical"\s+href="([^"]+)"', line)
+                        if canonical_match:
+                            url_source = canonical_match.group(1)
+                            logger.info(f"从 canonical 链接提取 URL: {url_source}")
+                            break
+                    
+                    # 尝试从 og:url 提取 URL（备用）
+                    if url_source == "Unknown URL":
+                        for line in lines[:100]:
+                            og_url_match = re.search(r'<meta\s+property="og:url"\s+content="([^"]+)"', line)
+                            if og_url_match:
+                                url_source = og_url_match.group(1)
+                                logger.info(f"从 og:url 提取 URL: {url_source}")
+                                break
+                    
+                    # 尝试从 og:title 或 citation_title 提取标题
+                    if title == "Unknown Title":
+                        for line in lines[:100]:
+                            # 优先使用 og:title
+                            og_title_match = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', line)
+                            if og_title_match:
+                                title = og_title_match.group(1)
+                                title = re.sub(r'<[^>]+>', '', title).strip()  # 清理 HTML 标签
+                                logger.info(f"从 og:title 提取标题: {title[:50]}...")
+                                break
+                            
+                            # 备用：使用 citation_title
+                            citation_title_match = re.search(r'<meta\s+name="citation_title"\s+content="([^"]+)"', line)
+                            if citation_title_match:
+                                title = citation_title_match.group(1)
+                                title = re.sub(r'<[^>]+>', '', title).strip()  # 清理 HTML 标签
+                                logger.info(f"从 citation_title 提取标题: {title[:50]}...")
+                                break
         except Exception as e:
             logger.warning(f"警告: 无法读取研究文件 {file_path} - {str(e)}")
 
@@ -1961,16 +3889,32 @@ class MCPTools:
             # PANGU 模型配置
             PANGU_URL = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
             model_name = model_config.get('model') or os.getenv("MODEL_NAME", "")
-            # 语言检测：决定生成语言
-            sample_text = article_content[:5000]
-            zh_count = len(re.findall(r'[\u4e00-\u9fff]', sample_text))
-            en_count = len(re.findall(r'[a-zA-Z]', sample_text))
-
+            # 语言检测：优先根据user_query判断，其次根据文章内容判断
+            # Priority: user_query language > article content language
             is_english_content = False
-            if zh_count < 50 and en_count > 200:
-                is_english_content = True
-            elif en_count > 0 and (zh_count / en_count) < 0.05:
-                is_english_content = True
+            
+            # 首先检查user_query的语言
+            if user_query:
+                query_zh_count = len(re.findall(r'[\u4e00-\u9fff]', user_query))
+                query_en_count = len(re.findall(r'[a-zA-Z]', user_query))
+                # 如果query包含中文，则使用中文
+                if query_zh_count > 0:
+                    is_english_content = False
+                    logger.info(f"Language detection: user_query contains Chinese ({query_zh_count} chars), using Chinese")
+                # 如果query纯英文，则使用英文
+                elif query_en_count > 10 and query_zh_count == 0:
+                    is_english_content = True
+                    logger.info(f"Language detection: user_query is English only, using English")
+            
+            # 如果user_query为空或无法判断，则根据文章内容判断
+            if not user_query:
+                sample_text = article_content[:5000]
+                zh_count = len(re.findall(r'[\u4e00-\u9fff]', sample_text))
+                en_count = len(re.findall(r'[a-zA-Z]', sample_text))
+                if zh_count < 50 and en_count > 200:
+                    is_english_content = True
+                elif en_count > 0 and (zh_count / en_count) < 0.05:
+                    is_english_content = True
 
             # 根据内容语言定制 Prompt
             if is_english_content:
@@ -2003,18 +3947,29 @@ class MCPTools:
                 """
 
             # 构建生成标题、摘要和关键词的prompt - 改进为更明确的格式
-            prompt = f"""请为以下文章生成一个标题、一个简洁的摘要（约200-300字）和5-8个关键词。
+            prompt = f"""请仔细阅读以下文章内容，准确提取或生成标题、摘要和关键词。
 
                 文章内容：
                 {article_content}
 
-                要求：
+                重要提示：
+                - 你的任务是"提取"和"总结"，而不是"创作"。
+                - 摘要必须完全基于文章内容，不得包含文章中未提及的信息。
+
+                具体要求：
                 1. 语言要求：{lang_instruction}
-                2. 标题应该简洁有力，准确反映文章主题，不超过30个字（或20个英文单词）
-                3. 摘要应该准确概括文章的主要内容、核心观点和重要发现
-                4. 摘要应该简洁明了，突出重点
-                5. 关键词应该反映文章的主题和核心概念
-                6. 多个关键词用分号（;）分隔
+                2. 标题：准确反映文章主题，优先提取文章原本的标题。
+                3. 摘要（重点）：
+                      - 优先提取文章原有的摘要/Abstract部分（如果有）。
+                      - 如果没有原有摘要，请仔细阅读全文，生成一个结构化的摘要。
+                      - 摘要应隐含以下四个层次（按此顺序组织内容，但禁止出现层次标题）：
+                         * 第一层：背景与目的
+                         * 第二层：方法与过程  
+                         * 第三层：主要结果与发现
+                         * 第四层：结论与意义
+                      - 明确禁止：禁止使用【】、（）等符号标注章节，禁止出现"背景与目的"、"方法与过程"、"主要结果与发现"、"结论与意义"等层次标题文字。
+                      - 摘要长度控制在300字左右，必须具体、准确，拒绝空泛的套话。
+                4. 关键词：提取5-8个最能代表文章核心主题的关键词，用分号（;）分隔。
 
                 {format_instruction}
                 """
@@ -2029,7 +3984,7 @@ class MCPTools:
                 json={
                     "model": model_name,
                     "messages": [
-                        {"role": "system", "content": "你是一位专业的学术编辑，擅长为文章生成精准的标题、摘要和关键词。请严格按照用户要求的格式输出。"},
+                        {"role": "system", "content": "你是一位严谨的学术分析师。你的核心职责是基于给定的文本内容提取准确的信息。请务必客观、真实，严禁编造原文中不存在的内容。"},
                         {"role": "user", "content": prompt}
                     ],
                     "temperature": 0.3
@@ -2506,30 +4461,37 @@ class MCPTools:
                     # 检查是否是标题格式（# 开头或 **粗体**）
                     heading_match = re.match(r'^(#+\s*|\*\*)(.+)', first_line)
                     if heading_match:
-                        # 提取标题文本（去除Markdown标记）
-                        existing_title = heading_match.group(2)
-                        # 如果是粗体结尾，也要去掉
-                        if existing_title.endswith('**'):
-                            existing_title = existing_title[:-2]
-                        existing_title = existing_title.strip()
+                        # 【关键修复】检查是否是章节标题(如 "## 1. xxx", "## 2. xxx")
+                        # 章节标题不应该被删除,只删除真正重复的文档标题
+                        is_chapter_heading = re.match(r'^##\s+\d+\.', first_line)
+                        
+                        if not is_chapter_heading:
+                            # 提取标题文本（去除Markdown标记）
+                            existing_title = heading_match.group(2)
+                            # 如果是粗体结尾，也要去掉
+                            if existing_title.endswith('**'):
+                                existing_title = existing_title[:-2]
+                            existing_title = existing_title.strip()
 
-                        # 计算相似度
-                        similarity = SequenceMatcher(None, existing_title, title).ratio()
+                            # 计算相似度
+                            similarity = SequenceMatcher(None, existing_title, title).ratio()
 
-                        # 如果相似度高，或者包含关系，则认为是重复标题
-                        # 降低包含关系的误判风险：只有当现有标题长度接近新标题时才考虑包含关系
-                        is_contained = (title in existing_title or existing_title in title)
-                        len_ratio = min(len(title), len(existing_title)) / max(len(title), len(existing_title))
+                            # 如果相似度高，或者包含关系，则认为是重复标题
+                            # 降低包含关系的误判风险：只有当现有标题长度接近新标题时才考虑包含关系
+                            is_contained = (title in existing_title or existing_title in title)
+                            len_ratio = min(len(title), len(existing_title)) / max(len(title), len(existing_title))
 
-                        if similarity > 0.7 or (is_contained and len_ratio > 0.6):
-                            print(f"检测到重复标题，已移除原文件开头的标题: {first_line}")
-                            # 移除该行
-                            lines.pop(first_content_idx)
-                            # 移除紧随其后的空行
-                            while first_content_idx < len(lines) and not lines[first_content_idx].strip():
+                            if similarity > 0.7 or (is_contained and len_ratio > 0.6):
+                                logger.info(f"检测到重复标题，已移除原文件开头的标题: {first_line}")
+                                # 移除该行
                                 lines.pop(first_content_idx)
-                            # 更新original_content
-                            original_content = '\n'.join(lines)
+                                # 移除紧随其后的空行
+                                while first_content_idx < len(lines) and not lines[first_content_idx].strip():
+                                    lines.pop(first_content_idx)
+                                # 更新original_content
+                                original_content = '\n'.join(lines)
+                        else:
+                            logger.info(f"保留章节标题: {first_line}")
 
             # 构建标题、摘要和关键词部分
             header_section = ""
@@ -2558,7 +4520,7 @@ class MCPTools:
             if is_english:
                 footer_text = f'Generated by {username} and SciAssistant'
             else:
-                footer_text = f'本文章由{username}和SciAssistant生成'
+                footer_text = f'本文由用户{username}和SciAssistant共同创作生成'
 
             # 使用 font 标签设置颜色 (#808080 灰色)，div 标签控制对齐
             header_section += f' <div style="text-align: right;"> <font color="#808080">——{footer_text}</font> </div> \n\n'
@@ -2583,6 +4545,8 @@ class MCPTools:
         - 检测并转换非Markdown格式的章节标题
         - 确保第一个非空行是二级标题（章节标题）
         - 规范化所有子标题层级
+        - 修复错误使用###的二级标题(如 "### 2.4 标题" -> "2.4 标题")
+        - 智能修复小节编号不匹配问题(如 "## 1. xxx"下的"2.1"自动修复为"1.1")
 
         Args:
             content: 章节内容
@@ -2595,6 +4559,7 @@ class MCPTools:
         first_heading_found = False
         current_chapter_level = 0
         first_content_line = True
+        current_chapter_number = None  # 当前章节号
 
         for line in lines:
             stripped_line = line.strip()
@@ -2615,24 +4580,63 @@ class MCPTools:
                 heading_text = heading_match.group(2)
                 current_level = len(hash_symbols)
 
+                heading_text_clean = re.sub(r'^\*\*(.+?)\*\*$', r'\1', heading_text)
+                numbered_heading_match = re.match(r'^(\d+(?:\.\d+)*)\s+', heading_text_clean)
+
+                # 【关键修复】提取章节号(如 "## 1. xxx" -> 章节号为1)
+                if current_level == 2 and numbered_heading_match:
+                    chapter_num_str = numbered_heading_match.group(1)
+                    # 检查是否是一级编号(如 "1", "2", "3"，没有点)
+                    if '.' not in chapter_num_str:
+                        current_chapter_number = int(chapter_num_str)
+                        logger.info(f"检测到章节标题: {heading_text_clean}, 章节号: {current_chapter_number}")
+
+                # 【关键修复】检测错误使用###的二级标题(如 "### 2.4 标题")
+                # 二级标题应该是纯文本,不应该有###前缀
+                if numbered_heading_match and current_level == 3:
+                    # 这是一个编号标题(如 "2.1 xxx"),且使用了###
+                    number_part = numbered_heading_match.group(1)
+                    # 检查是否是二级编号(如 1.1, 2.2, 3.1，只有一个点)
+                    if number_part.count('.') == 1:
+                        # 这是错误的二级标题格式,应该转换为纯文本
+                        # 同时修复编号不匹配问题
+                        if current_chapter_number is not None:
+                            parts = number_part.split('.')
+                            wrong_chapter_num = int(parts[0])
+                            subsection_num = parts[1]
+                            if wrong_chapter_num != current_chapter_number:
+                                # 编号不匹配,修复它
+                                correct_number = f"{current_chapter_number}.{subsection_num}"
+                                heading_text_clean = re.sub(r'^\d+\.\d+\s+', f'{correct_number} ', heading_text_clean)
+                                logger.info(f"修复错误的小节编号: {number_part} -> {correct_number} (章节号: {current_chapter_number})")
+                        logger.info(f"修复错误的二级标题格式: ### {heading_text_clean} -> {heading_text_clean}")
+                        normalized_lines.append(heading_text_clean)
+                        if not first_heading_found:
+                            first_heading_found = True
+                            first_content_line = False
+                        continue
+
                 # 如果是第一个标题，将其设为二级标题（章节标题）
                 if not first_heading_found:
                     first_heading_found = True
                     first_content_line = False
                     current_chapter_level = current_level
-                    # 确保章节标题为二级标题，去除可能的粗体标记
-                    heading_text_clean = re.sub(r'^\*\*(.+?)\*\*$', r'\1', heading_text)
-                    normalized_lines.append(f"## {heading_text_clean}")
+                    if numbered_heading_match:
+                        number_depth = numbered_heading_match.group(1).count('.') + 1
+                        new_level = min(number_depth + 1, 6)
+                        normalized_lines.append(f"{'#' * new_level} {heading_text_clean}")
+                    else:
+                        normalized_lines.append(f"## {heading_text_clean}")
                 else:
-                    # 计算相对于章节标题的层级差
-                    level_diff = current_level - current_chapter_level
-                    # 新的标题层级 = 3（因为章节是2级）+ 层级差
-                    new_level = max(3, 3 + level_diff)
-                    # 限制最大标题层级为6
-                    new_level = min(new_level, 6)
-                    # 去除标题中的粗体标记
-                    heading_text_clean = re.sub(r'^\*\*(.+?)\*\*$', r'\1', heading_text)
-                    normalized_lines.append(f"{'#' * new_level} {heading_text_clean}")
+                    if numbered_heading_match:
+                        number_depth = numbered_heading_match.group(1).count('.') + 1
+                        new_level = min(number_depth + 1, 6)
+                        normalized_lines.append(f"{'#' * new_level} {heading_text_clean}")
+                    else:
+                        level_diff = current_level - current_chapter_level
+                        new_level = max(2, 2 + level_diff)
+                        new_level = min(new_level, 6)
+                        normalized_lines.append(f"{'#' * new_level} {heading_text_clean}")
             elif bold_match and not first_heading_found:
                 # 如果第一个内容是粗体文本且还没有找到标题，将其转换为二级标题
                 first_heading_found = True
@@ -2655,6 +4659,22 @@ class MCPTools:
                     first_content_line = False
                     normalized_lines.append(line)
             else:
+                # 【关键修复】检测纯文本格式的小节标题(如 "2.1 xxx")并修复编号
+                # 检查是否是纯文本的小节标题(格式: 数字.数字 标题)
+                plain_subsection_match = re.match(r'^(\d+)\.(\d+)\s+(.+)$', stripped_line)
+                if plain_subsection_match and current_chapter_number is not None:
+                    wrong_chapter_num = int(plain_subsection_match.group(1))
+                    subsection_num = plain_subsection_match.group(2)
+                    subsection_title = plain_subsection_match.group(3)
+                    
+                    if wrong_chapter_num != current_chapter_number:
+                        # 编号不匹配,修复它
+                        correct_line = f"{current_chapter_number}.{subsection_num} {subsection_title}"
+                        logger.info(f"修复纯文本小节编号: {wrong_chapter_num}.{subsection_num} -> {current_chapter_number}.{subsection_num} (章节号: {current_chapter_number})")
+                        normalized_lines.append(correct_line)
+                        first_content_line = False
+                        continue
+                
                 # 非标题行保持不变
                 first_content_line = False
                 normalized_lines.append(line)
@@ -2672,6 +4692,31 @@ class MCPTools:
         Returns:
             Dict: 包含 abstract 和 keywords 的字典
         """
+        # 【性能优化】预加载 references.jsonl 到内存缓存
+        # 避免每个引用都重复读取文件，性能提升 100 倍
+        references_cache = {}
+        try:
+            # 查找所有可能的 references.jsonl 文件
+            # 优先查找上一级（新位置），兼容旧位置
+            rag_dirs = ['rag_downloads', 'rag_downloads/research']
+            for rag_dir in rag_dirs:
+                references_file = self.workspace_path / rag_dir / "references.jsonl"
+                if references_file.exists():
+                    with open(references_file, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            try:
+                                ref = json.loads(line.strip())
+                                file_path = ref.get('file_path')
+                                if file_path:
+                                    references_cache[file_path] = ref
+                            except json.JSONDecodeError:
+                                continue
+
+            if references_cache:
+                logger.info(f"[MERGE_REPORTS] Loaded {len(references_cache)} references from cache")
+        except Exception as e:
+            logger.warning(f"[MERGE_REPORTS] Failed to load references cache: {e}")
+
         # 如果没有提供unique_id，生成一个基于时间戳的唯一ID
         if unique_id is None:
             import time
@@ -2743,38 +4788,60 @@ class MCPTools:
             file_analysis_data = {}
             file_num_to_path = {}
 
+            # 【智能过滤】基于information_richness字段判断，而不是关键词匹配
             if file_analysis_path.exists():
-                import json
                 try:
+                    # 【关键修复】使用连续编号而不是原始行号
+                    # 因为LLM在生成报告时会重新编号（从1开始连续编号）
+                    continuous_num = 0
                     with open(file_analysis_path, 'r', encoding='utf-8') as f:
                         for line_num, line in enumerate(f, 1):
                             try:
                                 data = json.loads(line.strip())
                                 if 'file_path' in data:
                                     file_path = data['file_path']
+                                    doc_time = data.get('doc_time', '')
+                                    info_richness = data.get('information_richness', '')
+                                    
+                                    # 【关键修复】过滤掉Processing failed的文件
+                                    if doc_time == "Processing failed":
+                                        logger.info(f"跳过处理失败的文件 [原始行号{line_num}]: {file_path}")
+                                        continue
+                                    
+                                    # 【智能过滤】基于information_richness判断
+                                    # 检查明确的负面表述：considered scarce, indicating scarcity, lacks substantive content
+                                    info_richness_lower = info_richness.lower()
+                                    negative_indicators = [
+                                        'considered scarce', 'indicating scarcity', 'is scarce',
+                                        'lacks substantive content', 'no substantive content',
+                                        'very limited information', 'does not provide any substantive'
+                                    ]
+                                    if info_richness and any(indicator in info_richness_lower for indicator in negative_indicators):
+                                        logger.info(f"跳过信息稀缺的文件 [原始行号{line_num}]: {file_path} (richness: {info_richness[:80]})")
+                                        continue
+                                    
+                                    # 有效文件，使用连续编号
+                                    continuous_num += 1
                                     file_analysis_data[file_path] = data
 
-                                    # 【关键修复】使用行号作为主要映射，确保与Writer生成的引用序号一致
-                                    # Writer使用enumerate(key_files, 1)生成引用序号，对应file_analysis.jsonl的行号
-                                    file_num_to_path[line_num] = file_path
-                                    logger.info(f"映射行号 {line_num} 到文件路径: {file_path}")
-
-                                    # 从文件名提取数字作为备用映射（向后兼容）
-                                    filename = os.path.basename(file_path)
-                                    match = re.search(r'(\d+)', filename)
-                                    if match:
-                                        file_num = int(match.group(1))
-                                        # 只有当该序号未被占用时才添加备用映射
-                                        if file_num not in file_num_to_path:
-                                            file_num_to_path[file_num] = file_path
-                                            logger.info(f"备用映射序号 {file_num} 到文件路径: {file_path}")
+                                    # 【关键修复】使用连续编号作为映射，与报告中的引用编号一致
+                                    # 报告中的引用编号是连续的 [1, 2, 3, ...]，不会跳过无效文件的编号
+                                    file_num_to_path[continuous_num] = file_path
+                                    logger.info(f"映射连续编号 {continuous_num} (原始行号{line_num}) 到文件路径: {file_path}")
                             except Exception as e:
                                 logger.warning(f"警告: 无法解析分析数据行 {line_num} - {str(e)}")
-                    logger.info(f"成功加载 {len(file_num_to_path)} 个序号到文件路径的映射")
+                    logger.info(f"成功加载 {len(file_num_to_path)} 个序号到文件路径的映射（已过滤无效文件，使用连续编号）")
                 except Exception as e:
                     logger.warning(f"警告: 无法读取文件分析数据 - {str(e)}")
             else:
                 logger.warning(f"警告: 文件分析数据不存在: {file_analysis_path}")
+
+            # 【关键修复】规范化多引用格式 [53, 57] -> [53][57]
+            # AI模型有时会生成逗号分隔的多引用，导致后续提取和替换逻辑无法处理
+            def _split_multi_cite_merge(m):
+                nums = [n.strip() for n in m.group(1).split(",") if n.strip().isdigit()]
+                return "".join(f"[{n}]" for n in nums)
+            merged_content = re.sub(r'\[(\d+(?:\s*,\s*\d+)+)\]', _split_multi_cite_merge, merged_content)
 
             # 提取引用序号 - 匹配新格式 [数字]
             citation_pattern = r'\[(\d+)\]'
@@ -2788,25 +4855,17 @@ class MCPTools:
 
             logger.info(f"找到 {len(citation_numbers)} 个引用标记: {citation_numbers}")
 
-            # 【新增】获取所有file_analysis.jsonl中的文件序号，并按文件路径去重
+            # 【关键修复】为所有有效文件生成参考文献（包括未直接引用的文献）
+            # 获取所有file_analysis.jsonl中的文件序号
             all_file_numbers = sorted(file_num_to_path.keys())
-            logger.info(f"file_analysis.jsonl中共有 {len(all_file_numbers)} 个文件序号映射")
+            logger.info(f"file_analysis.jsonl中共有 {len(all_file_numbers)} 个有效文件")
+            
+            # 使用所有有效文件的序号
+            reference_numbers = all_file_numbers
+            logger.info(f"将生成 {len(reference_numbers)} 个参考文献条目（包含所有分析的有效文献）")
 
-            # 按文件路径去重：同一个文件可能有多个序号（被多个章节引用）
-            seen_paths = set()
-            unique_file_numbers = []
-            for num in all_file_numbers:
-                file_path = file_num_to_path.get(num)
-                if file_path and file_path not in seen_paths:
-                    seen_paths.add(file_path)
-                    unique_file_numbers.append(num)
-
-            # 使用去重后的文件序号
-            reference_numbers = unique_file_numbers
-            logger.info(f"去重后共有 {len(reference_numbers)} 个唯一文件")
-            logger.info(f"将生成 {len(reference_numbers)} 个参考文献条目（去重后的所有分析文档）")
-
-            # 构建引用列表 - 分离用户文件和其他文件
+            # 构建引用列表 - 分离 RAG 来源、用户文件和其他文件
+            rag_references = []  # RAG 知识库引用
             user_file_references = []  # 用户文件引用
             other_references = []  # 其他引用
 
@@ -2814,14 +4873,35 @@ class MCPTools:
             for num in reference_numbers:
                 # 查找对应的文件路径
                 file_path = file_num_to_path.get(num)
+                normalized_file_path = None
+                if isinstance(file_path, str):
+                    normalized_file_path = file_path[2:] if file_path.startswith('./') else file_path
 
                 if file_path:
                     analysis_data = file_analysis_data.get(file_path, {})
                     doc_time = analysis_data.get('doc_time', 'Unknown')
+                    core_content = analysis_data.get('core_content', '')
+                    task_relevance = analysis_data.get('task_relevance', '')
+                    information_richness = analysis_data.get('information_richness', '')
 
-                    # 跳过处理失败的文件（不在参考文献列表中显示）
+                    # 【关键修复】跳过条件与 Writer 保持完全一致，避免序号错位
+                    # 跳过处理失败的文件
                     if doc_time == "Processing failed":
                         logger.error(f"跳过处理失败的文件 {num}: {file_path}")
+                        continue
+
+                    # 跳过内容无效的文件（与 Writer 使用相同的关键词列表）
+                    invalid_content_keywords = [
+                        '安全验证', 'CAPTCHA', 'captcha', '验证码',
+                        '404', '403', 'Forbidden', 'placeholder page', 'error page',
+                        'no substantive content', 'lacks substantive content',
+                        'does not provide any substantive', '没有实质性的信息',
+                        'currently missing', 'content is missing', '内容缺失'
+                    ]
+                    
+                    is_invalid_content = any(kw.lower() in core_content.lower() for kw in invalid_content_keywords)
+                    if is_invalid_content:
+                        logger.warning(f"跳过内容无效的文件 {num}: {file_path}")
                         continue
 
                     title = "Unknown Title"
@@ -3028,24 +5108,264 @@ class MCPTools:
                             # research文件不存在，尝试从文件名提取标题
                             title = self._extract_title_from_research_filename(file_path)
                             logger.warning(f"警告: 研究文件不存在: {research_file_path}")
-                    else:
-                        # 其他路径（不在research目录，也不是user_uploads）
-                        # 先尝试直接路径（workspace根目录）
-                        direct_file_path = self.workspace_path / file_path
-                        # 再尝试research目录
-                        research_file_path = self.workspace_path / "research" / os.path.basename(file_path)
-
-                        if direct_file_path.exists():
-                            # 文件在workspace根目录
-                            title, url_source = self._extract_title_from_file_content(direct_file_path)
-                        elif research_file_path.exists():
-                            # 文件在research目录
-                            title, url_source = self._extract_title_from_file_content(research_file_path)
+                    elif file_path.startswith('pubmed_articles/') or file_path.startswith('arxiv_articles/'):
+                        # 【新增】PubMed 和 arXiv 文章处理
+                        article_file_path = self.workspace_path / file_path
+                        if article_file_path.exists():
+                            title, url_source = self._extract_title_from_file_content(article_file_path)
+                            logger.info(
+                                f"[ACADEMIC_ARTICLE] 提取学术文章引用: {file_path}, title={title[:50]}..., url={url_source[:50]}...")
                         else:
-                            # 两个位置都找不到，尝试从文件名提取标题
-                            title = self._extract_title_from_research_filename(file_path)
-                            logger.warning(f"警告: 研究文件不存在: {direct_file_path} 或 {research_file_path}")
+                            # 文件不存在，使用默认值
+                            title = os.path.basename(file_path).replace('.txt', '').replace('_', ' ')
+                            url_source = "Academic Article"
+                            logger.warning(f"警告: 学术文章文件不存在: {article_file_path}")
+                    elif normalized_file_path and normalized_file_path.startswith('rag_downloads/'):
+                        # RAG知识库文档（路径格式：rag_downloads/research/xxx.md）
+                        # 从analysis_data中提取RAG元数据
+                        rag_metadata = analysis_data.get('rag_metadata', {})
 
+                        # 【优先方案】从 references 缓存读取元数据（性能优化）
+                        if not rag_metadata and normalized_file_path and normalized_file_path.startswith('rag_downloads/'):
+                            # 使用预加载的缓存，避免重复读取文件
+                            rag_metadata = references_cache.get(normalized_file_path)
+                            if rag_metadata:
+                                logger.info(f"[RAG_METADATA] 从缓存读取元数据: {normalized_file_path}")
+                            else:
+                                logger.debug(f"[RAG_METADATA] 缓存中未找到元数据: {normalized_file_path}")
+
+                        # 【备用方案】如果没有rag_metadata，尝试从文件内容中提取
+                        if not rag_metadata and normalized_file_path and normalized_file_path.startswith('rag_downloads/'):
+                            try:
+                                rag_file_path = self.workspace_path / normalized_file_path
+                                if rag_file_path.exists():
+                                    with open(rag_file_path, 'r', encoding='utf-8') as f:
+                                        content = f.read()
+                                    # 从文件内容中提取元数据
+                                    rag_metadata = {}
+                                    lines = content.split('\n')
+
+                                    # 提取标题（第一行 # 开头）
+                                    for line in lines[:5]:
+                                        if line.startswith('# ') and not line.startswith('## '):
+                                            rag_metadata['title'] = line[2:].strip()
+                                            break
+
+                                    # 提取元数据字段
+                                    in_metadata_section = False
+                                    for line in lines:
+                                        if line.strip() == '## Metadata':
+                                            in_metadata_section = True
+                                            continue
+                                        if line.strip() == '---' or line.strip() == '## Content':
+                                            break
+                                        if in_metadata_section and line.startswith('- **'):
+                                            try:
+                                                rest = line[4:]
+                                                if '**:' in rest:
+                                                    key_part, value_part = rest.split('**:', 1)
+                                                    key = key_part.strip().lower().replace(' ', '_')
+                                                    value = value_part.strip()
+                                                    if value and value != 'N/A':
+                                                        rag_metadata[key] = value
+                                            except:
+                                                pass
+
+                                    if rag_metadata:
+                                        logger.info(
+                                            f"[RAG_METADATA] 从文件内容提取元数据: {normalized_file_path} -> {rag_metadata}")
+                            except Exception as e:
+                                logger.warning(f"[RAG_METADATA] 无法从文件提取元数据: {normalized_file_path}, error: {e}")
+
+                        if rag_metadata:
+                            # 使用RAG返回的完整元数据
+                            title = rag_metadata.get('title', 'Unknown Title')
+                            section = rag_metadata.get('section', '')
+                            journal = rag_metadata.get('journal', '')
+                            volume = rag_metadata.get('volume', '')
+                            doi = rag_metadata.get('doi', '')
+                            authors_list = rag_metadata.get('authors', [])
+                            publication_date = rag_metadata.get('publication_date', '')
+
+                            # 如果section比title更具体，优先使用section
+                            if section and len(section) > len(title):
+                                title = section
+
+                            # 构建来源信息
+                            source_parts = []
+                            if journal:
+                                source_parts.append(journal)
+                            if volume:
+                                source_parts.append(f"Vol. {volume}")
+
+                            if doi:
+                                url_source = f"https://doi.org/{doi}"
+                            elif source_parts:
+                                url_source = ', '.join(source_parts)
+                            else:
+                                # 【优化】尝试从文件内容中提取出版商信息作为来源
+                                try:
+                                    rag_file_path_for_publisher = self.workspace_path / normalized_file_path
+                                    if rag_file_path_for_publisher.exists():
+                                        with open(rag_file_path_for_publisher, 'r', encoding='utf-8') as f:
+                                            rag_content_for_publisher = f.read()
+                                        # 匹配版权声明中的出版商（© YYYY Publisher 或 $\circledcirc$ YYYY Publisher）
+                                        publisher_patterns = [
+                                            r'(?:©|\$\\circledcirc\$)\s*\d{4}\s+(?:Published by\s+)?(\w[\w\s&]+?)(?:\s+Ltd|\s+B\.V|\s+Inc|\s+GmbH|\.\s|$)',
+                                        ]
+                                        for pp in publisher_patterns:
+                                            pm = re.search(pp, rag_content_for_publisher)
+                                            if pm:
+                                                publisher_name = pm.group(1).strip()
+                                                # 清理常见后缀
+                                                publisher_name = re.sub(r'\s*All rights reserved.*$', '',
+                                                                        publisher_name, flags=re.IGNORECASE)
+                                                if publisher_name and len(publisher_name) > 2:
+                                                    url_source = f"RAG知识库 ({publisher_name})"
+                                                    logger.info(f"[RAG_METADATA] 从内容提取出版商: {publisher_name}")
+                                                    break
+                                except Exception as pub_e:
+                                    logger.debug(f"[RAG_METADATA] 提取出版商失败: {pub_e}")
+
+                                if not url_source or url_source == "Unknown URL":
+                                    url_source = "RAG知识库"
+
+                            # 从 publication_date 提取年份（格式：2020-05-01）
+                            if publication_date:
+                                try:
+                                    year = publication_date.split('-')[0]
+                                    if year.isdigit():
+                                        doc_time = f"{year}年"
+                                except:
+                                    pass
+
+                            # 从update_date_time提取年份（备用）
+                            if not doc_time or doc_time == "未知":
+                                update_time = rag_metadata.get('update_date_time', '')
+                                if update_time and update_time.isdigit():
+                                    from datetime import datetime
+                                    try:
+                                        timestamp = int(update_time) / 1000
+                                        year = datetime.fromtimestamp(timestamp).year
+                                        doc_time = f"{year}年"
+                                    except:
+                                        pass
+
+                            # 使用 authors 字段生成作者信息
+                            if authors_list and isinstance(authors_list, list) and len(authors_list) > 0:
+                                if len(authors_list) == 1:
+                                    author = authors_list[0]
+                                elif len(authors_list) == 2:
+                                    author = f"{authors_list[0]}, {authors_list[1]}"
+                                else:
+                                    author = f"{authors_list[0]} et al."
+                            else:
+                                author = "[佚名]"
+
+                            logger.info(f"RAG文档引用 {num}: 作者={author}, 标题={title}, 期刊={journal}, DOI={doi}")
+                        else:
+                            # 没有RAG元数据，尝试从文件名提取标题
+                            filename = os.path.basename(normalized_file_path or file_path)
+                            # 移除文件ID后缀和扩展名（格式: Title_Part_8charID.md）
+                            name_without_ext = filename.rsplit('.', 1)[0] if '.' in filename else filename
+                            # 移除末尾的 _xxxxxxxx (8字符ID)
+                            if len(name_without_ext) > 9 and name_without_ext[-9] == '_':
+                                name_without_ext = name_without_ext[:-9]
+                            title = name_without_ext.replace('_', ' ').strip() or "RAG知识库文档"
+                            url_source = "RAG知识库"
+                            logger.warning(f"警告: RAG文档 {num} 缺少元数据: {normalized_file_path or file_path}, 使用文件名作为标题: {title}")
+                    else:
+                        # 通用路径处理：适用于所有其他类型的文件（research/, url_crawler_save_files/, arxiv/, 或未来新增的目录）
+                        # 检查是否是 arXiv 文件（通过路径或文件名格式判断）
+                        arxiv_filename = os.path.basename(file_path)
+                        # arXiv paper_id 格式：YYMM.NNNNN[vN] (例如：2603.02208v1)
+                        is_arxiv_file = (file_path.startswith('arxiv/') or file_path.startswith('./arxiv/') or
+                                        re.match(r'^\d{4}\.\d{5}(v\d+)?\.txt$', arxiv_filename))
+                        
+                        # 检查是否是 PubMed 文件（通过路径或文件名格式判断）
+                        pubmed_filename = os.path.basename(file_path)
+                        pubmed_pmid_match = re.match(r'^(\d{5,10})(?:_abstract)?\.txt$', pubmed_filename)
+                        is_pubmed_file = (
+                            (file_path.startswith('pubmed/') or file_path.startswith('./pubmed/')) and
+                            pubmed_pmid_match is not None
+                        )
+
+                        if is_arxiv_file:
+                            # arXiv 文件特殊处理：从文件名构建 URL
+                            # 提取 paper_id（例如：2603.02208v1.txt -> 2603.02208v1）
+                            paper_id = arxiv_filename.replace('.txt', '')
+                            
+                            # 构建 arXiv URL
+                            url_source = f"https://arxiv.org/abs/{paper_id}"
+                            
+                            # 从文件内容提取标题
+                            direct_file_path = self.workspace_path / file_path
+                            if direct_file_path.exists():
+                                title, _ = self._extract_title_from_file_content(direct_file_path)
+                                logger.info(f"arXiv 文件: {file_path}, URL: {url_source}")
+                            else:
+                                title = "Unknown Title"
+                                logger.warning(f"arXiv 文件不存在: {direct_file_path}")
+                        elif is_pubmed_file:
+                            # PubMed 文件特殊处理：从文件名构建 URL
+                            pmid = pubmed_pmid_match.group(1)
+                            url_source = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+                            
+                            # 从文件内容提取标题
+                            direct_file_path = self.workspace_path / file_path
+                            if direct_file_path.exists():
+                                title, extracted_url = self._extract_title_from_file_content(direct_file_path)
+                                # 如果文件内容中有更好的URL（如PMC URL），使用它
+                                if extracted_url and extracted_url != "Unknown URL" and 'pmc' in extracted_url.lower():
+                                    url_source = extracted_url
+                                logger.info(f"PubMed 文件: {file_path}, PMID: {pmid}, URL: {url_source}")
+                            else:
+                                title = "Unknown Title"
+                                logger.warning(f"PubMed 文件不存在: {direct_file_path}")
+                        else:
+                            # 其他文件：先尝试直接路径
+                            direct_file_path = self.workspace_path / file_path
+                            
+                            if direct_file_path.exists():
+                                # 文件存在，提取标题和URL
+                                title, url_source = self._extract_title_from_file_content(direct_file_path)
+                                logger.info(f"成功从文件提取标题: {file_path}")
+                            else:
+                                # 文件不存在，尝试在research目录查找（向后兼容）
+                                research_file_path = self.workspace_path / "research" / os.path.basename(file_path)
+                                if research_file_path.exists():
+                                    title, url_source = self._extract_title_from_file_content(research_file_path)
+                                    logger.info(f"从research目录找到文件: {research_file_path}")
+                                else:
+                                    # 两个位置都找不到，尝试从文件名提取标题
+                                    title = self._extract_title_from_research_filename(file_path)
+                                    logger.warning(f"警告: 文件不存在: {direct_file_path} 或 {research_file_path}，使用文件名提取标题")
+
+                    # 【过滤无效引用】跳过 ResearchGate 的反爬虫页面
+                    if title == "Just a moment..." or title.strip() == "Just a moment...":
+                        logger.warning(f"跳过无效引用 {num}: ResearchGate 反爬虫页面 - {url_source}")
+                        continue
+                    
+                    # 【修复 arXiv PDF 文件名作为标题】
+                    # 如果标题是 PDF 文件名格式（如 1404.7828v4.pdf），尝试从文件内容重新提取
+                    if title.endswith('.pdf') and re.match(r'^\d{4}\.\d{4,5}(v\d+)?\.pdf$', title):
+                        logger.warning(f"检测到 PDF 文件名作为标题: {title}，尝试重新提取")
+                        direct_file_path = self.workspace_path / file_path
+                        if direct_file_path.exists():
+                            # 重新提取标题，跳过 arXiv 元数据行
+                            title, _ = self._extract_title_from_file_content(direct_file_path)
+                            logger.info(f"重新提取的标题: {title}")
+                    
+                    # 【统一 arXiv URL 为 /abs/ 格式】
+                    # 将 arxiv.org/pdf/ 转换为 arxiv.org/abs/
+                    if 'arxiv.org/pdf/' in url_source:
+                        # 提取 paper_id（例如：https://arxiv.org/pdf/1404.7828 -> 1404.7828）
+                        pdf_match = re.search(r'arxiv\.org/pdf/(\d{4}\.\d{4,5}(?:v\d+)?)', url_source)
+                        if pdf_match:
+                            paper_id = pdf_match.group(1)
+                            url_source = f"https://arxiv.org/abs/{paper_id}"
+                            logger.info(f"统一 arXiv URL 为摘要页: {url_source}")
+                    
                     # 清理标题中的特殊字符，避免显示问题
                     title_cleaned = title.replace('\u2013', '-').replace('\u2014', '-')  # 替换en-dash和em-dash为普通连字符
                     title_cleaned = title_cleaned.replace('\u201c', '"').replace('\u201d', '"')  # 替换智能引号
@@ -3094,7 +5414,7 @@ class MCPTools:
                     if ('user_uploads' in file_path or file_path.startswith('./user_uploads/') or
                             file_path.startswith('./library_refs/') or file_path.startswith('library_refs/')):
                         # 用户上传文件和文档库文件：统一使用参考文献格式（带📎图标）
-                        file_icon = '<font name="EmojiFont">📎</font>'
+                        file_icon = '<font name="EmojiFont" style="font-style: normal;">📎</font>'
                         # 格式：[序号] 📎 作者. 标题[文献类型]. 来源, 时间
                         if 'author' in locals() and author and author != "[佚名]":
                             # 有作者信息
@@ -3109,24 +5429,41 @@ class MCPTools:
                             else:
                                 reference_entry = f"[{num}] {file_icon} [佚名]. {title_cleaned}[Z]. {url_source}"
                     else:
-                        # 网络文档等其他文件：使用简洁格式（不带图标，让正则表达式自动添加）
-                        # 格式：[num] 标题，URL，时间
+                        # 网络文档等其他文件：根据来源类型使用不同图标
+                        # 格式：[num] 图标 标题，URL，时间
                         if url_source.startswith('http://') or url_source.startswith('https://'):
-                            # 网页链接：使用简洁格式，正则表达式会自动添加🌐图标
+                            # 判断是否为学术论文（arXiv/PubMed/medRxiv/bioRxiv）
+                            is_academic_paper = (
+                                'arxiv.org' in url_source.lower() or 
+                                'pubmed' in url_source.lower() or 
+                                'ncbi.nlm.nih.gov' in url_source.lower() or
+                                'medrxiv.org' in url_source.lower() or
+                                'biorxiv.org' in url_source.lower()
+                            )
+                            
+                            # 所有网络引用（包括学术论文和普通网页）都使用简洁格式
+                            # 让 PDF 转换阶段的正则表达式统一添加图标（📄 或 🌐）和超链接
                             if show_time:
                                 reference_entry = f"[{num}] {title_cleaned}，{url_source}，{doc_time_cleaned}"
                             else:
                                 reference_entry = f"[{num}] {title_cleaned}，{url_source}"
                         else:
                             # 非 URL（如"用户上传文件"、"用户文档库"），使用传统格式带📎图标
-                            file_icon = '<font name="EmojiFont">📎</font>'
+                            file_icon = '<font name="EmojiFont" style="font-style: normal;">📎</font>'
                             if show_time:
                                 reference_entry = f"[{num}] {file_icon} {title_cleaned}，{url_source}，{doc_time_cleaned}"
                             else:
                                 reference_entry = f"[{num}] {file_icon} {title_cleaned}，{url_source}"
 
-                    # 根据文件类型分类
-                    if 'user_uploads' in file_path or file_path.startswith('./user_uploads/'):
+                    # 根据文件类型分类：RAG > 用户文件 > 其他
+                    if normalized_file_path and normalized_file_path.startswith('rag_downloads/'):
+                        # RAG 通用流程：即使没有可点击 URL，也保留引用以便追溯
+                        if not url_source.startswith('http://') and not url_source.startswith('https://'):
+                            logger.info(
+                                f"[RAG_REFERENCE] No URL for reference {num}, keeping knowledge-base entry: {url_source}")
+                        rag_references.append((num, reference_entry))
+                        logger.info(f"添加 RAG 知识库引用 {num}: {reference_entry}")
+                    elif 'user_uploads' in file_path or file_path.startswith('./user_uploads/'):
                         user_file_references.append((num, reference_entry))
                         logger.info(f"添加用户文件引用 {num}: {reference_entry}")
                     else:
@@ -3138,16 +5475,18 @@ class MCPTools:
                     other_references.append((num, default_entry))
                     logger.warning(f"警告: 找不到引用 {num} 对应的文件")
 
-            # 重新排序：用户文件在前，其他文件在后
-            # 先按序号排序用户文件
+            # 重新排序：RAG 来源在最前，用户文件次之，其他文件在后
+            # 先按序号排序 RAG 来源
+            rag_references.sort(key=lambda x: x[0])
+            # 再按序号排序用户文件
             user_file_references.sort(key=lambda x: x[0])
-            # 再按序号排序其他文件
+            # 最后按序号排序其他文件
             other_references.sort(key=lambda x: x[0])
 
             # 创建原始序号到连续序号的映射，使参考文献序号连续
-            # 用户文件在前，其他文件在后
+            # RAG 来源优先，用户文件次之，其他文件在后
             old_to_new_num = {}
-            all_sorted_refs = user_file_references + other_references  # 用户文件优先
+            all_sorted_refs = rag_references + user_file_references + other_references  # RAG 优先
 
             for new_num, (old_num, _) in enumerate(all_sorted_refs, 1):
                 old_to_new_num[old_num] = new_num
@@ -3155,13 +5494,32 @@ class MCPTools:
             logger.info(f"\n序号重新映射: {old_to_new_num}")
 
             # 替换正文中的引用序号为连续序号，并添加超链接
+            # 【关键修复】只用负向前视 (?!</a>) 来避免匹配已在 <a> 标签内的引用
+            # 这样可以正确处理连续引用如 [4][5]，同时避免重复替换
             for old_num, new_num in old_to_new_num.items():
-                # 替换普通引用标记: [old] -> <sup><a href="#ref-new" style="color: #04B5BB;">[new]</a></sup> （蓝色超链接）
+                # 只检查 [数字] 后面是否紧跟 </a>，如果是则跳过（已被处理）
+                # 这允许 </sup>[5] 中的 [5] 被正确替换
                 merged_content = re.sub(
-                    rf'\[{old_num}\]',
-                    f'<sup><a href="#ref-{unique_id}-{new_num}" style="color: #04B5BB; text-decoration: none;">[{new_num}]</a></sup>',
+                    rf'\[{old_num}\](?!</a>)',
+                    f'<sup><a href="#ref-{unique_id}-{new_num}" style="text-decoration: none;">[{new_num}]</a></sup>',
                     merged_content
                 )
+
+            # 【兜底处理】检查并移除未匹配的纯文本引用
+            # 查找所有未被转换为上标的 [数字] 引用（即没有对应参考文献的引用）
+            remaining_plain_refs = re.findall(r'\[(\d+)\](?!</a>)', merged_content)
+            if remaining_plain_refs:
+                unique_remaining = sorted(set(int(r) for r in remaining_plain_refs))
+                logger.warning(f"发现 {len(unique_remaining)} 个未匹配的引用，将被移除: {unique_remaining}")
+                
+                # 直接移除这些无效引用，只保留实际存在于参考文献列表中的引用
+                for ref_num in unique_remaining:
+                    merged_content = re.sub(
+                        rf'\[{ref_num}\](?!</a>)',
+                        '',
+                        merged_content
+                    )
+                logger.info(f"已移除 {len(unique_remaining)} 个无效引用")
 
             # 重新写入更新后的正文
             with open(output_file, 'w', encoding='utf-8') as f:
@@ -3195,7 +5553,26 @@ class MCPTools:
                     complete_article = f.read()
 
                 # 生成标题、摘要和关键词
-                abstract_keywords_result = self.generate_abstract_and_keywords(complete_article)
+                # 【关键修复】传递user_query参数，确保语言一致性
+                user_query = getattr(self, 'user_query', '')
+                
+                # 如果user_query为空，尝试从workspace的todo.md中读取
+                if not user_query:
+                    try:
+                        todo_path = self.workspace_path / 'todo.md'
+                        if todo_path.exists():
+                            with open(todo_path, 'r', encoding='utf-8') as f:
+                                todo_content = f.read()
+                                # 从todo.md中提取user_query（通常在文件开头）
+                                # 格式示例：# User Query\nReview on the Current Status and Future Challenges of Cuttlefish Culture Technology
+                                query_match = re.search(r'(?:# User Query|用户查询|User Query)[:\s]*\n(.+?)(?:\n#|\Z)', todo_content, re.DOTALL)
+                                if query_match:
+                                    user_query = query_match.group(1).strip()
+                                    logger.info(f"从todo.md中读取到user_query: {user_query[:100]}...")
+                    except Exception as e:
+                        logger.warning(f"从todo.md读取user_query失败: {e}")
+                
+                abstract_keywords_result = self.generate_abstract_and_keywords(complete_article, user_query=user_query)
 
                 # 将标题、摘要和关键词插入到文件开头
                 # 使用self.username（从MCPTools初始化时传入）
@@ -3237,7 +5614,7 @@ class MCPTools:
 
             # 将引用列表添加到报告末尾 - 确保即使没有找到引用也添加参考来源部分
             # 添加换页符、标题和分隔横线（间距更紧凑，线条更浅）
-            references_section = "\n\n<div style=\"page-break-before: always;\"></div>\n\n## 参考来源\n<hr style=\"border: none; border-top: 1px solid #E5E7EB; margin: 0.5em 0;\" />\n\n"
+            references_section = f"\n\n<div style=\"page-break-before: always;\"></div>\n\n## {ref_title}\n<hr style=\"border: none; border-top: 1px solid #E5E7EB; margin: 0.5em 0;\" />\n\n"
             if references:
                 references_section += "\n\n".join(references)
                 with open(output_file, 'a', encoding='utf-8') as outfile:
@@ -3425,7 +5802,8 @@ class MCPTools:
             key_files: List[Dict],
             model: str = "gpt-4o",
             temperature: float = 0.3,
-            max_tokens: int = 4000
+            max_tokens: int = 4000,
+            reasoning_text: str = ""
     ) -> MCPToolResult:
         """
         Classify and organize search result files according to a structured outline for comprehensive long-form content generation.
@@ -3436,9 +5814,91 @@ class MCPTools:
             model: AI model to use for classification and organization
             temperature: Creativity level for the AI classification (0-1)
             max_tokens: Maximum tokens for the AI response
+            reasoning_text: Reasoning process text explaining the outline structure (displayed to user)
         """
         try:
             logger.info(f"我现在开始调用search_result_classifier了：{outline}, {key_files}")
+            logger.info(f"reasoning_text参数值: '{reasoning_text[:100] if reasoning_text else '空'}...'")
+
+            # Human in the loop 模式：从 workspace 文件读取状态（环境变量无法跨进程传递）
+            import os
+            human_in_loop = False
+            user_outline_path = ''
+
+            # 检查 workspace 中的 .human_in_loop 标记文件
+            human_in_loop_file = self.workspace_path / '.human_in_loop'
+            logger.info(f"[HITL DEBUG] 检查文件: {human_in_loop_file} (workspace={self.workspace_path})")
+            logger.info(f"[HITL DEBUG] 文件存在: {human_in_loop_file.exists()}")
+            if human_in_loop_file.exists():
+                try:
+                    with open(human_in_loop_file, 'r', encoding='utf-8') as f:
+                        content = f.read().strip().lower()
+                        human_in_loop = content == 'true'
+                    logger.info(f"Human in the loop: 从文件读取状态 = {human_in_loop}")
+                except Exception as e:
+                    logger.warning(f"读取 .human_in_loop 文件失败: {e}")
+            else:
+                # 尝试检查父目录
+                parent_human_in_loop = self.workspace_path.parent / '.human_in_loop'
+                logger.info(f"[HITL DEBUG] 检查父目录: {parent_human_in_loop}, 存在={parent_human_in_loop.exists()}")
+
+            # 检查 workspace 中的 .user_outline 文件
+            user_outline_file = self.workspace_path / '.user_outline'
+            if user_outline_file.exists():
+                user_outline_path = str(user_outline_file)
+
+            if human_in_loop and not user_outline_path:
+                # 首次执行，需要保存大纲并暂停
+                # 保存纯大纲内容（用于用户编辑）
+                outline_pending_path = self.workspace_path / ".outline_pending"
+                with open(outline_pending_path, 'w', encoding='utf-8') as f:
+                    f.write(outline)
+                logger.info(f"Human in the loop: 大纲已保存到 {outline_pending_path}，等待用户确认")
+
+                # 保存大纲内容到独立文件（供 a.py 读取）
+                outline_content_path = self.workspace_path / ".outline_content"
+                with open(outline_content_path, 'w', encoding='utf-8') as f:
+                    f.write(outline)
+
+                # 同时保存reasoning内容（用于前端展示）
+                if not reasoning_text:
+                    reasoning_text = "基于提供的研究资料，我将为您撰写这篇综合研究报告。让我首先生成一个系统性的研究大纲："
+                reasoning_path = self.workspace_path / ".reasoning_content"
+                with open(reasoning_path, 'w', encoding='utf-8') as f:
+                    f.write(reasoning_text)
+                logger.info(f"Human in the loop: reasoning已保存到 {reasoning_path}")
+
+                # 返回特殊状态，让 Agent 知道需要等待
+                return MCPToolResult(
+                    success=False,
+                    error="WAITING_FOR_OUTLINE_CONFIRMATION",
+                    data={
+                        "status": "waiting_for_outline_confirmation",
+                        "message": "大纲已生成，等待用户确认。请调用 writer_subjective_task_done 工具结束当前任务。",
+                        "outline": outline,
+                        "reasoning": reasoning_text
+                    }
+                )
+
+            # Auto模式：保存大纲和reasoning提示到文件供前端轮询展示（不暂停执行）
+            if not human_in_loop:
+                outline_generated_path = self.workspace_path / ".outline_generated"
+                if not reasoning_text:
+                    reasoning_text = "基于提供的研究资料，我将为您撰写这篇综合研究报告。让我首先生成一个系统性的研究大纲："
+                # 使用明确分隔符，便于前端准确分离reasoning和outline
+                full_content = f"{reasoning_text}\n\n---OUTLINE_START---\n\n{outline}"
+                with open(outline_generated_path, 'w', encoding='utf-8') as f:
+                    f.write(full_content)
+                logger.info(f"Auto模式: 大纲已保存到 {outline_generated_path}，继续执行")
+
+            # 如果有用户确认的大纲，使用用户的大纲
+            if user_outline_path and os.path.exists(user_outline_path):
+                with open(user_outline_path, 'r', encoding='utf-8') as f:
+                    user_outline = f.read().strip()
+                if user_outline:
+                    logger.info(f"Human in the loop: 使用用户确认的大纲")
+                    outline = user_outline
+
             # 处理输入的key_files - 使用四个分析维度
             # 获取本地的文件进行分析
 
@@ -3466,7 +5926,11 @@ class MCPTools:
             key_files_dict = {}
             # Create full path relative to workspace
             full_analysis_path = self.workspace_path / "doc_analysis/file_analysis.jsonl"
-            file_analysis_list = load_json(full_analysis_path)
+            try:
+                file_analysis_list = load_json(full_analysis_path)
+            except Exception as e:
+                logger.warning(f"Failed to load file_analysis.jsonl: {e}, using empty list")
+                file_analysis_list = []
 
             for file_info in file_analysis_list:
                 if file_info.get('file_path'):
@@ -3783,7 +6247,6 @@ OUTLINE TO ORGANIZE CONTENT:
             # PANGU 模型配置
             PANGU_URL = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
             model_name = model_config.get('model') or os.getenv("MODEL_NAME", "")
-        
             headers = {'Content-Type': 'application/json'}
 
             import requests
@@ -3895,8 +6358,16 @@ OUTLINE TO ORGANIZE CONTENT:
         Returns:
             Content with corrected title formats
         """
+        # Defensive: return content as-is if inputs are not valid strings
+        if not content or not isinstance(content, str):
+            return content or ""
+        if not overall_outline or not isinstance(overall_outline, str):
+            return content
+
         # Extract titles from overall_outline
         outline_titles = {}
+
+        outline_titles_no_number = {}
 
         for line in overall_outline.split('\n'):
             line = line.strip()
@@ -3913,6 +6384,11 @@ OUTLINE TO ORGANIZE CONTENT:
                 if core_content:
                     # Store mapping from core content to the formatted line from outline
                     outline_titles[core_content.lower()] = line
+
+                    # Also store a mapping with the number prefix removed
+                    text_without_number = re.sub(r'^\d+(?:\.\d+)*\.?\s+', '', core_content).strip()
+                    if text_without_number and text_without_number.lower() != core_content.lower():
+                        outline_titles_no_number[text_without_number.lower()] = line
 
         # Process content line by line
         content_lines = content.split('\n')
@@ -3946,12 +6422,115 @@ OUTLINE TO ORGANIZE CONTENT:
                         break
 
                 if not found_match:
-                    # If no exact match found, keep original line
+                    content_text_no_number = re.sub(r'^\d+(?:\.\d+)*\.?\s+', '', core_content).strip()
+                    content_text_no_number_lower = content_text_no_number.lower()
+
+                    for outline_text_no_num, outline_format in outline_titles_no_number.items():
+                        if outline_text_no_num == core_content_lower or outline_text_no_num == content_text_no_number_lower:
+                     
+                            corrected_lines.append(outline_format)
+                            found_match = True
+                            break
+
+                if not found_match:
+                    # If still no match found, keep original line
                     corrected_lines.append(original_line)
             else:
-                corrected_lines.append(original_line)
+                is_list_item = bool(re.match(r'^[\*\-]\s+', line_stripped))
+                is_reference = line_stripped.startswith('[')
+                if line_stripped and not is_list_item and not is_reference:
+               
+                    clean_text = re.sub(r'^\*\*(.+?)\*\*$', r'\1', line_stripped).strip()
+                    clean_text_lower = clean_text.lower()
+                    line_stripped_lower = line_stripped.lower()
+
+                    found_match = False
+                    for outline_text_no_num, outline_format in outline_titles_no_number.items():
+                        if outline_text_no_num == clean_text_lower or outline_text_no_num == line_stripped_lower:
+                     
+                            corrected_lines.append(outline_format)
+                            found_match = True
+                            break
+
+                    if not found_match:
+                        corrected_lines.append(original_line)
+                else:
+                    corrected_lines.append(original_line)
 
         return '\n'.join(corrected_lines)
+
+    @staticmethod
+    def _normalize_chapter_heading(line: str) -> Optional[str]:
+        """Normalize a heading line for structure comparison."""
+        if not isinstance(line, str):
+            return None
+
+        line = line.strip()
+        if not line:
+            return None
+
+        if line.startswith("## "):
+            return line
+
+        clean = re.sub(r'^#+\s*', '', line).strip()
+        clean = re.sub(r'^\*\*(.+?)\*\*$', r'\1', clean).strip()
+        clean = re.sub(r'^[\*\-\s]+', '', clean)
+        clean = re.sub(r'[\*\s]+$', '', clean).strip()
+
+        if re.match(r'^\d+\.\d+\s+\S+', clean):
+            return clean
+        return None
+
+    @classmethod
+    def _extract_expected_chapter_headings(cls, current_chapter_outline: str) -> List[str]:
+        """Extract expected chapter headings from current chapter outline."""
+        if not current_chapter_outline or not isinstance(current_chapter_outline, str):
+            return []
+
+        expected = []
+        for raw_line in current_chapter_outline.split('\n'):
+            normalized = cls._normalize_chapter_heading(raw_line)
+            if normalized:
+                expected.append(normalized)
+        return expected
+
+    @classmethod
+    def _extract_actual_chapter_headings(cls, content: str) -> List[str]:
+        """Extract heading lines from generated chapter content."""
+        if not content or not isinstance(content, str):
+            return []
+
+        actual = []
+        for raw_line in content.split('\n'):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            normalized = cls._normalize_chapter_heading(line)
+            if normalized:
+                actual.append(normalized)
+        return actual
+
+    @classmethod
+    def _validate_chapter_structure(cls, content: str, current_chapter_outline: str) -> Dict[str, Any]:
+        """Validate generated chapter headings strictly match the outline headings."""
+        expected = cls._extract_expected_chapter_headings(current_chapter_outline)
+        actual = cls._extract_actual_chapter_headings(content)
+
+        if expected == actual:
+            return {
+                "valid": True,
+                "message": "Chapter structure is consistent with the outline.",
+                "expected": expected,
+                "actual": actual
+            }
+
+        return {
+            "valid": False,
+            "message": "Chapter structure mismatch: headings must strictly match current_chapter_outline in content and order.",
+            "expected": expected,
+            "actual": actual
+        }
 
     def section_writer(
             self,
@@ -3994,8 +6573,12 @@ OUTLINE TO ORGANIZE CONTENT:
             key_files_dict = {}
             # Create full path relative to workspace using config
             analysis_path = storage_config.get('document_analysis_path', './doc_analysis')
-            file_analysis_list = self.load_json(f"{analysis_path}/file_analysis.jsonl").data
-            logger.debug("File analysis loaded successfully")
+            load_result = self.load_json(f"{analysis_path}/file_analysis.jsonl")
+            file_analysis_list = load_result.data if load_result.success else []
+            if not load_result.success:
+                logger.warning(f"Failed to load file_analysis.jsonl: {load_result.error}, using empty list")
+            else:
+                logger.debug("File analysis loaded successfully")
 
             for i, file_info in enumerate(file_analysis_list, 1):
                 file_info['index'] = i  # 在这里给网页进行编号， 从1开始
@@ -4054,12 +6637,22 @@ OUTLINE TO ORGANIZE CONTENT:
 
 """
 
-            system_prompt = f"""You are a writing master. Next, you will receive web page information, user questions, and the structure of the current chapter. You need to integrate the user's questions with the provided web content and write the chapter based on its given structure. Additionally, an overall outline and summaries of previously completed chapters will be provided for reference to avoid repetition or contradictions and ensure logical consistency within the broader framework. Specific requirements will be detailed below.
+            system_prompt = f"""You are a writing master. Next, you will receive web page information, user questions, and the structure of the current chapter. You need to integrate the user's questions with the provided web content and write the chapter based on its given structure, and plan out tables based on the content of the current chapter to make the content more comprehensive and intuitive. Additionally, an overall outline and summaries of previously completed chapters will be provided for reference to avoid repetition or contradictions and ensure logical consistency within the broader framework. Specific requirements will be detailed below.
+
+## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+**Detect the language of the user's query and write this chapter accordingly:**
+- **English query → Write this chapter in English**
+- **Chinese query (中文) → Write this chapter in Chinese (中文撰写)**
+- **Mixed Chinese-English query → Write this chapter in Chinese (中文撰写)**
+This rule applies to ALL chapter content including: headings, body text, tables, and citations.
+**IMPORTANT**: Maintain language consistency with other chapters. If previous chapters were written in Chinese, continue in Chinese. If in English, continue in English.
+
 {user_file_priority_note}When drafting the current chapter content, strictly comply with the following requirements:
 - ⚠️ **CRITICAL CITATION REQUIREMENT - CITE ALL FILES**: In the web page information I gave you, each result is in the format of [webpage X begin]...[webpage X end], where X represents the numerical index of each article. **YOU MUST cite ALL provided webpages at least once in your chapter**. This is NON-NEGOTIABLE. Please cite the context at the end of the sentence when appropriate. Please cite the context in the corresponding part of the answer in the format of the reference number [X]. If a sentence comes from multiple contexts, please list all relevant reference numbers, such as [3][5]. Remember not to collect the references at the end and return the reference numbers, but list them in the corresponding part of the answer. **MANDATORY VERIFICATION**: Before submitting your chapter, verify that you have cited EVERY webpage (1 through {len(key_files) if key_files else 0}) at least once. Count your citations: webpage 1 [✓/✗], webpage 2 [✓/✗], etc. If any webpage is not cited, GO BACK and find appropriate places to cite it. **SPECIAL EMPHASIS**: User-uploaded files (typically webpages 1-{user_file_count if has_user_files else 0}) MUST be cited multiple times (3-5 times each) when they contain relevant information.
 - You can only use the provided web page information for writing, don't make up any content, ensure the accuracy of the facts. Note that when there are contradictions between the facts described in the above search results, you should use your internal knowledge to reasonably identify the correct information. If identification is impossible, you may select the most factual result based on the authority of the web pages and a voting mechanism (e.g., the description consistent with the majority of web pages). If judgment remains impossible using these methods, you may appropriately list possible differing statements, but you must not conflate different claims—prioritize ensuring factual accuracy!
-- You are only permitted to write content strictly within the provided chapter framework. You are forbidden from creating additional subheadings or bullet points within the framework! However, there is a special exception: You may appropriately use tables for narration when necessary. Furthermore, you are not allowed to use concise or summarizing language for narration! We must strictly ensure the information density of the writing and avoid excessive compression.
-- You cannot make any changes to the structure of the chapter you are currently writing, such as the title content and the bold symbols in the title, you are not allowed to make any changes. **Important Note:** When writing Chapter 1, if you find the chapter lacks article title, you must create one based on user query. However, this rule only applies to Chapter 1 - do not add any titles to any other chapters in the work. 
+- You are only permitted to write content strictly within the provided chapter framework. You are forbidden from creating additional subheadings or bullet points within the framework! However, there is a special exception: **You should proactively and actively use Markdown tables to present structured data**. When encountering data comparisons, technical parameters, multi-dimensional comparisons, statistical data, feature contrasts, timeline events, or any scenario where information can be organized in rows and columns, you MUST use tables instead of pure text narration. Tables greatly improve readability and information density. Furthermore, you are not allowed to use concise or summarizing language for narration! We must strictly ensure the information density of the writing and avoid excessive compression.
+- You cannot make any changes to the structure of the chapter you are currently writing, such as the title content and the bold symbols in the title, you are not allowed to make any changes. **CRITICAL: Sub-heading numbers MUST match the chapter number.** For example, if the current chapter is "## 1. Title", then sub-headings MUST be "1.1 ...", "1.2 ...", NOT "2.1 ...". If the current chapter is "## 3. Title", sub-headings must be "3.1 ...", "3.2 ...", etc. Always derive the sub-heading prefix from the chapter number in current_chapter_outline. **Important Note:** When writing Chapter 1, if you find the chapter lacks article title, you must create one based on user query. However, this rule only applies to Chapter 1 - do not add any titles to any other chapters in the work. 
+- **ABSOLUTE OUTLINE LOCK**: You MUST reproduce all heading lines from CURRENT CHAPTER OUTLINE in the exact same order (same numbering, same wording). Do NOT add, delete, or rename any heading line. Do NOT insert extra heading levels.
 - Be careful to ensure that the narrative content is highly relevant and does not contain any common sense errors, note that although you are asked to ensure the richness of information when writing, you must ensure that the content you write is highly relevant and that the context is logically coherent and readable.
 - Proceeding to explain the roles of other specified fields:
     * user_query: The user query, ensure the drafted content is highly relevant to the user's inquiry.
@@ -4067,18 +6660,32 @@ OUTLINE TO ORGANIZE CONTENT:
     * overall_outline: The purpose of giving an overall outline is to let you understand the summary of the article and avoid content inconsistent with other parts during your writing. In short, focus on writing the current chapter.
     * task_content: The task_content may provide the requirements for writing the current chapter as well as prompts for what to avoid. You can refer to this content when drafting.
 
+**📊 TABLE USAGE STRATEGY (MUST FOLLOW):**
+- **Extract and plan table data**: Before writing, extract the interrelated data from the provided web information and plan out tables. When there are comparisons of indicators, dataset sizes, ablation experiments, enumerations of hyperparameters, or any structured data, plan to present them in table form.
+- **Proactively use tables**: Do NOT wait for data to "perfectly fit" a table format. Whenever you encounter 2+ items being compared, contrasted, or listed with multiple attributes, USE A TABLE.
+- **Applicable scenarios include but are not limited to**: data comparison, technical parameter listing, feature/advantage/disadvantage contrast, chronological events, experimental results, statistical summaries, classification/categorization, multi-dimensional analysis, and policy/regulation comparisons.
+- **Table title format**: Every table MUST have a title line above it in the format "**表X: 表格标题**" (Chinese) or "**Table X: Table Title**" (English), where X is the sequential table number within the chapter (starting from 1). For example: "**表1: 不同方法的性能对比**" or "**Table 1: Performance Comparison of Different Methods**".
+- **Minimum expectation**: Each chapter (except Abstract/Introduction) should contain at least 1-2 tables when the source materials contain comparable or structured data. Actively look for opportunities to present information as tables.
+- **Table quality**: Tables must have clear headers, consistent formatting, and meaningful content. Do not create tables with only 1 column or 1 data row.
+
 Other points to note::
 - If the first chapter is an **Abstract** or **Introduction**, do not include subheadings (level-2 or finer bullet points)—begin the content directly under the level-1 heading.  
 - CONTENT LENGTH: Each section should contain approximately 2500 words to ensure comprehensive coverage.
-- **CRITICAL TITLE PRESERVATION RULE:** You MUST preserve the exact format, structure, and content of chapter titles as provided in the current_chapter_outline. This includes:
-  * DO NOT change any markdown formatting symbols (# ## ### ** etc.)
-  * DO NOT add, remove, or rearrange any part of the title structure
-  * Copy the title lines EXACTLY as they appear in current_chapter_outline
-  * Only write content under the provided title structure - never modify the titles themselves
-  * When the title symbols in the current chapter outline are inconsistent with those in the overall outline, use the overall outline's title symbols as the standard and maintain symbol consistency throughout the writing process
+- **CRITICAL HEADING FORMAT RULES:**
+  * **Level 1 章节标题**: 使用 Markdown '##' 格式，如 "## 2. Molecular Mechanisms" 或 "## 2. 分子机制"
+  * **Level 2 子标题**: 必须是**纯文本格式**，不能使用任何markdown符号（不要用 ###、**、* 等）
+    - **错误格式**: "### 2.1 Title" 或 "**### 2.1 Title**" 或 "**2.1 Title**"（包含markdown符号）
+    - **正确格式**: "2.1 Title" 或 "2.1 标题"（纯文本，只有数字+空格+标题）
+  * 如果 current_chapter_outline 中的子标题包含markdown符号，你必须**移除这些符号**，只保留纯文本格式
+  * 当 current_chapter_outline 中的标题符号与 overall_outline 不一致时，以 overall_outline 的标题符号为准，保持全文符号一致性
+  * 这对于PDF目录识别至关重要
 - Note that in Chapter 1, omit any mention of research objectives, methodology, or procedural details.
-- Be sure to ensure that the language of your output is consistent with the language of the user's question. For example, if the user's question is in Chinese, your reply should also be in Chinese.
-- **LANGUAGE RULE**: If the user's question contains ANY Chinese characters, you MUST write the ENTIRE chapter in Chinese (except for specific English technical terms). Even if the user uses English technical terms (like "deep learning") or the source material is in English, the explanation and narrative MUST be in Chinese. If the user's question is entirely in English, then write in English.
+- **🌐 CRITICAL LANGUAGE RULES (MUST FOLLOW)**:
+  * **English query (no Chinese characters) → Write ENTIRE chapter in English**, including title, all headings, and all content.
+  * **Chinese query (contains ANY Chinese characters) → Write ENTIRE chapter in Chinese (中文)**, including title, all headings, and all content. Even if source materials are in English, translate and write in Chinese.
+  * **Mixed Chinese-English query → Write ENTIRE chapter in Chinese (中文)**.
+  * This rule applies to Chapter 1's title generation as well - the title MUST match the query language.
+  * Technical terms may remain in English (e.g., "PINK1/Parkin pathway"), but all explanatory text must follow the language rule.
 
 Strictly follow the following format for output:
 <chapter_content>xxx</chapter_content>
@@ -4147,6 +6754,72 @@ Strictly follow the following format for output:
                 logger.debug(f"Overall outline: {overall_outline[:200]}...")
                 content = self._correct_title_format(content, overall_outline)
                 logger.debug(f"Content after correction: {content[:200]}...")
+
+                # Strictly validate heading structure against current chapter outline
+                structure_validation = self._validate_chapter_structure(content, current_chapter_outline)
+                if not structure_validation.get("valid"):
+                    logger.warning(
+                        f"Chapter structure mismatch detected, trying auto-repair. "
+                        f"Expected={structure_validation.get('expected')}, Actual={structure_validation.get('actual')}"
+                    )
+                    repair_system_prompt = """You are a strict markdown structure fixer.
+Your only goal is to fix heading structure.
+Rules:
+1) Keep the chapter body content as much as possible.
+2) Heading lines MUST exactly match EXPECTED CHAPTER OUTLINE headings in the same order.
+3) Do NOT add extra headings.
+4) Keep level-1 heading with ##, and level-2 headings as plain text like '2.1 Title'.
+5) Return only <chapter_content>...</chapter_content>."""
+                    repair_user_prompt = f"""EXPECTED CHAPTER OUTLINE:
+{current_chapter_outline}
+
+CURRENT CHAPTER CONTENT:
+{content}
+"""
+
+                    repaired_response = None
+                    for attempt in range(3):
+                        try:
+                            repaired_response = requests.post(
+                                url=model_url,
+                                headers=headers,
+                                json={
+                                    "model": model_config.get('model', 'pangu_auto'),
+                                    "chat_template": "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<s>[unused9]系统：[unused10]' }}{% endif %}{% if message['role'] == 'system' %}{{'<s>[unused9]系统：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'assistant' %}{{'[unused9]助手：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'tool' %}{{'[unused9]工具：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'function' %}{{'[unused9]方法：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'user' %}{{'[unused9]用户：' + message['content'] + '[unused10]'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '[unused9]助手：' }}{% endif %}",
+                                    "messages": [
+                                        {"role": "system", "content": repair_system_prompt},
+                                        {"role": "user", "content": repair_user_prompt + " /no_think"}
+                                    ],
+                                    "spaces_between_special_tokens": False,
+                                    "max_tokens": max_tokens,
+                                    "temperature": 0.0,
+                                },
+                                timeout=model_config.get("timeout", 180)
+                            )
+                            repaired_response = repaired_response.json()
+                            repaired_text = repaired_response["choices"][0]["message"]["content"].strip()
+                            repaired_content = repaired_text
+                            if "<chapter_content>" in repaired_text:
+                                repaired_content = repaired_text.split("<chapter_content>")[1].split("</chapter_content>")[0].strip()
+                            content = self._correct_title_format(repaired_content, overall_outline)
+                            structure_validation = self._validate_chapter_structure(content, current_chapter_outline)
+                            if structure_validation.get("valid"):
+                                logger.info("Chapter structure auto-repair succeeded.")
+                                break
+                        except Exception as repair_err:
+                            logger.warning(f"Chapter structure auto-repair attempt {attempt + 1} failed: {repair_err}")
+                            if attempt == 2:
+                                break
+                            time.sleep(2)
+
+                if not structure_validation.get("valid"):
+                    return MCPToolResult(
+                        success=False,
+                        error=(
+                            "section writer failed: chapter structure mismatch with outline. "
+                            f"expected={structure_validation.get('expected')}, actual={structure_validation.get('actual')}"
+                        )
+                    )
                 # Second round: Request summary
                 summary_prompt = "Please give a brief summary of the output chapter content. Be sure to ensure that the language of the summary is consistent with the language of the output chapter content. For example, if the chapter content is in Chinese, your summary should also be in Chinese."
 
@@ -4209,15 +6882,17 @@ Strictly follow the following format for output:
                 if not write_result.success:
                     raise Exception(f"File write failed: {write_result.error}")
 
-                results = []
+                chapter_payload = {
+                    "chapter_summary": summary,
+                    "structure_validation": structure_validation
+                }
                 return MCPToolResult(
                     success=True,
-                    data=results.append({
-                        "chapter_summary": summary,
-                    }),
+                    data=chapter_payload,
                     metadata={
                         'content_length': len(content),
-                        'summary_length': len(summary)
+                        'summary_length': len(summary),
+                        'structure_valid': structure_validation.get("valid", False)
                     }
                 )
 
@@ -4268,7 +6943,8 @@ Strictly follow the following format for output:
                 max_tokens = model_config.get('max_tokens', 8192)
             logger.debug(f"Starting document extraction: tasks={tasks}")
 
-            # 验证并自动补全：仅当任务包含 library_refs 或 user_uploads 文件时才进行补全
+            # 【关键修复】始终检查并自动补全 library_refs 和 user_uploads 目录的文件
+            # 不再依赖 Agent 是否传入了这些目录的文件，而是主动扫描目录
             task_files = [t.get('file_path', '') for t in tasks]
 
             # 规范化路径：移除 ./ 前缀以便统一比较
@@ -4277,26 +6953,55 @@ Strictly follow the following format for output:
 
             normalized_task_files = [normalize_path(f) for f in task_files]
 
-            # 检查任务中是否包含 library_refs 或 user_uploads 文件
-            has_library_files = any(f.startswith('library_refs/') for f in normalized_task_files)
-            has_upload_files = any(f.startswith('user_uploads/') for f in normalized_task_files)
+            if self._last_rag_saved_files and self._last_rag_saved_timestamp:
+                rag_saved_age = time.time() - self._last_rag_saved_timestamp
+                if rag_saved_age <= self._rag_cache_ttl_seconds:
+                    normalized_saved_files = [
+                        normalize_path(f) for f in self._last_rag_saved_files if f
+                    ]
+                    missing_rag_files = [
+                        f for f in normalized_saved_files if f not in normalized_task_files
+                    ]
+                    if missing_rag_files:
+                        sample_files = ", ".join(missing_rag_files[:3])
+                        logger.warning(
+                            "[RAG_ANALYSIS] Detected %s recently saved RAG files not included in "
+                            "document_extract tasks. Example: %s. Consider passing rag_document_saver "
+                            "results to document_extract.",
+                            len(missing_rag_files),
+                            sample_files
+                        )
 
-            # 只有当任务涉及这些目录时，才进行补全验证
-            if has_library_files or has_upload_files:
-                library_refs_dir = self.workspace_path / "library_refs"
-                user_uploads_dir = self.workspace_path / "user_uploads"
+            # 始终扫描 library_refs、user_uploads、arxiv 和 rag_downloads 目录
+            library_refs_dir = self.workspace_path / "library_refs"
+            user_uploads_dir = self.workspace_path / "user_uploads"
+            arxiv_dir = self.workspace_path / "arxiv"
+            rag_downloads_dir = self.workspace_path / "rag_downloads"
 
-                expected_files = []
-                # 只要进入补全逻辑，就扫描两个目录（不管任务中是否包含该目录的文件）
-                if library_refs_dir.exists():
-                    # 扫描所有可能的文件扩展名
-                    for ext in ['*.txt', '*.pdf', '*.doc', '*.docx']:
-                        expected_files.extend([f"library_refs/{f.name}" for f in library_refs_dir.glob(ext)])
-                if user_uploads_dir.exists():
-                    # 扫描所有可能的文件扩展名
-                    for ext in ['*.txt', '*.pdf', '*.doc', '*.docx']:
-                        expected_files.extend([f"user_uploads/{f.name}" for f in user_uploads_dir.glob(ext)])
+            expected_files = []
+            # 扫描各目录中所有可能的文件扩展名
+            if library_refs_dir.exists():
+                for ext in ['*.txt', '*.pdf', '*.doc', '*.docx']:
+                    expected_files.extend([f"library_refs/{f.name}" for f in library_refs_dir.glob(ext)])
+            if user_uploads_dir.exists():
+                for ext in ['*.txt', '*.pdf', '*.doc', '*.docx']:
+                    expected_files.extend([f"user_uploads/{f.name}" for f in user_uploads_dir.glob(ext)])
+            if arxiv_dir.exists():
+                for ext in ['*.txt', '*.pdf']:
+                    expected_files.extend([f"arxiv/{f.name}" for f in arxiv_dir.glob(ext)])
+            # 【RAG 兜底】递归扫描 rag_downloads 下所有 .md 文件（排除 references.jsonl 等元数据）
+            # 这样即使 LLM 未把 rag_document_saver 返回的 file_path 传给 document_extract，
+            # 这些文件也会被自动补全到 tasks，从而进入 file_analysis.jsonl，最终出现在报告参考中
+            if rag_downloads_dir.exists():
+                for md_file in rag_downloads_dir.rglob('*.md'):
+                    try:
+                        rel_path = md_file.relative_to(self.workspace_path).as_posix()
+                        expected_files.append(rel_path)
+                    except Exception:
+                        continue
 
+            # 如果这些目录有文件，则进行补全检查
+            if expected_files:
                 # 智能匹配：基于文件主体名称（保留原始扩展名，移除 .txt 后缀）
                 def get_core_name(path: str) -> str:
                     """
@@ -4333,6 +7038,8 @@ Strictly follow the following format for output:
                     # 分类统计缺失文件
                     missing_library = [f for f in missing_files if f.startswith('library_refs/')]
                     missing_uploads = [f for f in missing_files if f.startswith('user_uploads/')]
+                    missing_arxiv = [f for f in missing_files if f.startswith('arxiv/')]
+                    missing_rag = [f for f in missing_files if f.startswith('rag_downloads/')]
 
                     # 统一输出警告信息
                     missing_info = []
@@ -4340,6 +7047,10 @@ Strictly follow the following format for output:
                         missing_info.append(f"文档库 {len(missing_library)} 个")
                     if missing_uploads:
                         missing_info.append(f"⚠️ 用户上传 {len(missing_uploads)} 个")
+                    if missing_arxiv:
+                        missing_info.append(f"arXiv {len(missing_arxiv)} 个")
+                    if missing_rag:
+                        missing_info.append(f"RAG {len(missing_rag)} 个")
 
                     logger.warning(f"⚠️ 检测到 {len(missing_files)} 个文件未包含在分析任务中 ({', '.join(missing_info)})")
                     logger.warning(f"预期: {len(expected_files)} 个，实际: {len(tasks)} 个 | 🔧 自动补全中...")
@@ -4355,50 +7066,50 @@ Strictly follow the following format for output:
 
                     logger.info(f"✅ 已补全，总任务数: {len(tasks)}")
                 else:
-                    logger.info(f"✅ 所有 library_refs/user_uploads 文件已包含")
-
+                    logger.info(f"✅ 所有 library_refs/user_uploads/arxiv 文件已包含")
             else:
-                # 任务只涉及 research 等其他目录，不进行补全
-                logger.info(f"跳过补全验证（非 library_refs/user_uploads 目录）")
+                # library_refs、user_uploads 和 arxiv 目录都没有文件，无需补全
+                logger.info(f"跳过补全验证（library_refs/user_uploads/arxiv 目录无文件）")
 
-            # 【关键修复】过滤掉文档转换后的 .txt 文件，避免重复分析
-            # 如果同时存在 xxx.pdf 和 xxx.pdf.txt，只保留 .pdf
-            # 如果同时存在 xxx.docx 和 xxx.docx.txt，只保留 .docx
-            # 如果同时存在 xxx.doc 和 xxx.doc.txt，只保留 .doc
-            # 但保留原本就是 .txt 的文件（如 research/xxx.txt）
+            # 【关键修复】过滤掉二进制源文件，优先使用转换后的 .txt 文件
+            # 如果同时存在 xxx.pdf 和 xxx.pdf.txt，只保留 .pdf.txt（可读取）
+            # 如果同时存在 xxx.docx 和 xxx.docx.txt，只保留 .docx.txt
+            # 如果同时存在 xxx.doc 和 xxx.doc.txt，只保留 .doc.txt
+            # 如果只存在 xxx.pdf（无 .txt 版本），仍然保留（虽然可能读取失败）
             filtered_tasks = []
-            source_files = set()  # 存储所有源文件（pdf, docx, doc）
+            txt_converted_files = set()  # 存储所有转换后的 .txt 文件对应的源文件名
 
             # 定义需要检查的源文件扩展名
             source_extensions = ['.pdf', '.docx', '.doc']
 
-            # 第一遍：收集所有源文件
-            for task in tasks:
-                file_path = task.get('file_path', '')
-                normalized_path = file_path.lstrip('./')
-
-                # 检查是否是源文件
-                for ext in source_extensions:
-                    if normalized_path.endswith(ext):
-                        source_files.add(normalized_path)
-                        break
-
-            # 第二遍：过滤任务
+            # 第一遍：收集所有转换后的 .txt 文件对应的源文件
             for task in tasks:
                 file_path = task.get('file_path', '')
                 normalized_path = file_path.lstrip('./')
 
                 # 检查是否是转换后的 .txt 文件（xxx.pdf.txt, xxx.docx.txt, xxx.doc.txt）
-                should_skip = False
                 if normalized_path.endswith('.txt'):
-                    # 检查是否是从源文件转换而来的 .txt
                     for ext in source_extensions:
                         potential_source = normalized_path[:-4]  # 去掉 .txt
-                        if potential_source.endswith(ext) and potential_source in source_files:
-                            # 找到对应的源文件，跳过这个 .txt
-                            logger.info(f"⏭️ 跳过 {file_path}（对应的源文件 {potential_source.split('/')[-1]} 已存在）")
-                            should_skip = True
+                        if potential_source.endswith(ext):
+                            txt_converted_files.add(potential_source)
                             break
+
+            # 第二遍：过滤任务 - 如果源文件有对应的 .txt 版本，则跳过源文件
+            for task in tasks:
+                file_path = task.get('file_path', '')
+                normalized_path = file_path.lstrip('./')
+
+                # 检查是否是二进制源文件（pdf, docx, doc）
+                should_skip = False
+                for ext in source_extensions:
+                    if normalized_path.endswith(ext):
+                        # 检查是否有对应的 .txt 转换文件
+                        if normalized_path in txt_converted_files:
+                            # 找到对应的 .txt 文件，跳过这个源文件
+                            logger.info(f"⏭️ 跳过 {file_path}（已有转换后的 {normalized_path}.txt）")
+                            should_skip = True
+                        break
 
                 if not should_skip:
                     filtered_tasks.append(task)
@@ -4431,6 +7142,7 @@ Strictly follow the following format for output:
                     "2. Authority: According to the information of the document, judge the source of the web page to confirm the credibility of the web page.\n"
                     "3. Relevance: According to the current task (task_content) and the given document, judge whether the current document is related to the current task.\n"
                     "4. Core content: Based on this document, you make a core content summary to ensure the richness of information, with a word count of about 200 words.\n"
+                    "5. Paper metadata extraction: Extract paper title, author(s), abstract, and journal when available. If any field cannot be determined, set it to an empty string.\n"
                     "Information richness: Estimate the total word count of substantive content in the document. Less than 200 words indicates scarcity; over 800 words suggests high richness; between these thresholds denotes moderate richness. Be careful not to just give the word count results, but also give a corresponding text description of how informative the content is.\n"
 
                     "Note:\n1. Ensure the document's language aligns with the extracted dimensions (e.g., Chinese content requires Chinese extraction).\n2. For **source_authority** and **task_relevance**, first provide a brief description before concluding.  \n"
@@ -4443,7 +7155,11 @@ Strictly follow the following format for output:
                     "  \"source_authority\": \"xxx\",\n"
                     "  \"task_relevance\": \"xxx\",\n"
                     "  \"core_content\": \"xxx\",\n"
-                    "  \"information_richness\": \"xxx\"\n"
+                    "  \"information_richness\": \"xxx\",\n"
+                    "  \"title\": \"\",\n"
+                    "  \"author\": \"\",\n"
+                    "  \"abstract\": \"\",\n"
+                    "  \"journal\": \"\"\n"
                     "}\n\n"
                     "Important: Return ONLY the JSON object, no additional text or formatting."
                 )
@@ -4556,7 +7272,355 @@ Strictly follow the following format for output:
             results.sort(key=lambda x: task_order.get(x['file_path'], float('inf')))
 
             # 保存结果到文件
-            def parse_answer_to_structured_data(answer_text: str, file_path: str) -> Dict[str, str]:
+
+            def extract_rag_metadata_from_content(file_path: str, content: str) -> dict:
+                """
+                从 RAG 下载的文件内容中提取元数据。
+                RAG 文件格式:
+                # {title}
+
+                ## Metadata
+                - **Journal**: {journal}
+                - **DOI**: {doi}
+                - **Source**: {source}
+                - **File ID**: {file_id}
+
+                ---
+
+                ## Content
+                ...
+                """
+                if not file_path.startswith('rag_downloads/'):
+                    return None
+
+                metadata = {}
+                lines = content.split('\n')
+
+                # 提取标题（第一行 # 开头）
+                for line in lines[:5]:
+                    if line.startswith('# ') and not line.startswith('## '):
+                        metadata['title'] = line[2:].strip()
+                        break
+
+                # 提取元数据字段
+                in_metadata_section = False
+                for line in lines:
+                    if line.strip() == '## Metadata':
+                        in_metadata_section = True
+                        continue
+                    if line.strip() == '---' or line.strip() == '## Content':
+                        break
+                    if in_metadata_section and line.startswith('- **'):
+                        # 解析 "- **Key**: Value" 格式
+                        try:
+                            # 移除 "- **" 前缀
+                            rest = line[4:]
+                            # 找到 "**:" 分隔符
+                            if '**:' in rest:
+                                key_part, value_part = rest.split('**:', 1)
+                                key = key_part.strip().lower().replace(' ', '_')
+                                value = value_part.strip()
+                                if value and value != 'N/A':
+                                    metadata[key] = value
+                        except:
+                            pass
+
+                if metadata:
+                    logger.info(f"[RAG_METADATA] 从文件内容提取元数据: {file_path} -> {metadata}")
+                    return metadata
+                return None
+
+            def normalize_text_field(value: Any) -> str:
+                """Normalize arbitrary field values to a clean string."""
+                if value is None:
+                    return ""
+
+                if isinstance(value, str):
+                    return value.strip()
+
+                if isinstance(value, list):
+                    normalized_parts = []
+                    for item in value:
+                        item_text = normalize_text_field(item)
+                        if item_text:
+                            normalized_parts.append(item_text)
+                    return ", ".join(normalized_parts)
+
+                if isinstance(value, dict):
+                    for key in ("name", "author", "authors", "text", "value"):
+                        if key in value:
+                            nested_text = normalize_text_field(value.get(key))
+                            if nested_text:
+                                return nested_text
+                    return ""
+
+                return str(value).strip()
+
+            crossref_cache: Dict[str, Dict[str, str]] = {}
+            openalex_cache: Dict[str, Dict[str, str]] = {}
+
+            def extract_doi_from_text(text: str) -> str:
+                """Extract DOI from arbitrary text."""
+                if not text:
+                    return ""
+
+                doi_pattern = r'10\.\d{4,9}/[-._;()/:A-Za-z0-9]+'
+                match = re.search(doi_pattern, text, re.IGNORECASE)
+                if not match:
+                    return ""
+
+                doi = match.group(0).strip().rstrip(".,);]}")
+                return doi
+
+            def fetch_crossref_metadata(doi: str) -> Dict[str, str]:
+                """
+                Fetch metadata from Crossref by DOI.
+                Return empty dict when unavailable.
+                """
+                if not doi:
+                    return {}
+
+                doi = doi.strip()
+                if doi in crossref_cache:
+                    return crossref_cache[doi]
+
+                try:
+                    api_url = f"https://api.crossref.org/works/{doi}"
+                    resp = requests.get(api_url, timeout=12)
+                    if resp.status_code != 200:
+                        crossref_cache[doi] = {}
+                        return {}
+
+                    payload = resp.json().get("message", {})
+                    title_list = payload.get("title") or []
+                    title = title_list[0].strip() if title_list and isinstance(title_list[0], str) else ""
+
+                    author_objs = payload.get("author") or []
+                    authors = []
+                    for a in author_objs:
+                        given = normalize_text_field(a.get("given"))
+                        family = normalize_text_field(a.get("family"))
+                        name = normalize_text_field(a.get("name"))
+                        full_name = f"{given} {family}".strip() if (given or family) else name
+                        if full_name:
+                            authors.append(full_name)
+                    author_text = ", ".join(authors)
+
+                    abstract = normalize_text_field(payload.get("abstract"))
+                    if abstract:
+                        # Crossref abstract may contain JATS tags.
+                        abstract = re.sub(r"<[^>]+>", " ", abstract)
+                        abstract = re.sub(r"\s+", " ", abstract).strip()
+
+                    journal_list = payload.get("container-title") or []
+                    journal = journal_list[0].strip() if journal_list and isinstance(journal_list[0], str) else ""
+
+                    parsed = {
+                        "doi": doi,
+                        "title": title,
+                        "author": author_text,
+                        "abstract": abstract,
+                        "journal": journal
+                    }
+                    crossref_cache[doi] = parsed
+                    return parsed
+                except Exception:
+                    crossref_cache[doi] = {}
+                    return {}
+
+            def fetch_openalex_metadata(doi: str) -> Dict[str, str]:
+                """
+                Fetch metadata from OpenAlex by DOI.
+                OpenAlex often has better abstract coverage than Crossref.
+                """
+                if not doi:
+                    return {}
+
+                doi = doi.strip().lower()
+                if doi in openalex_cache:
+                    return openalex_cache[doi]
+
+                try:
+                    api_url = f"https://api.openalex.org/works/https://doi.org/{doi}"
+                    resp = requests.get(api_url, timeout=12)
+                    if resp.status_code != 200:
+                        openalex_cache[doi] = {}
+                        return {}
+
+                    payload = resp.json()
+                    title = normalize_text_field(payload.get("title"))
+
+                    authorships = payload.get("authorships") or []
+                    authors = []
+                    for authorship in authorships:
+                        author_name = normalize_text_field((authorship or {}).get("author", {}).get("display_name"))
+                        if author_name:
+                            authors.append(author_name)
+
+                    journal = normalize_text_field(
+                        (payload.get("primary_location") or {}).get("source", {}).get("display_name")
+                    )
+
+                    abstract = ""
+                    abstract_inverted_index = payload.get("abstract_inverted_index") or {}
+                    if isinstance(abstract_inverted_index, dict) and abstract_inverted_index:
+                        words_with_positions = []
+                        for word, positions in abstract_inverted_index.items():
+                            for pos in positions:
+                                if isinstance(pos, int):
+                                    words_with_positions.append((pos, word))
+                        if words_with_positions:
+                            words_with_positions.sort(key=lambda item: item[0])
+                            abstract = " ".join(word for _, word in words_with_positions).strip()
+
+                    parsed = {
+                        "doi": doi,
+                        "title": title,
+                        "author": ", ".join(authors),
+                        "abstract": abstract,
+                        "journal": journal
+                    }
+                    openalex_cache[doi] = parsed
+                    return parsed
+                except Exception:
+                    openalex_cache[doi] = {}
+                    return {}
+
+            def extract_abstract_from_content(content: str) -> str:
+                """
+                Try to recover the abstract from local document content.
+                Prefer explicit Abstract sections; otherwise use a conservative heuristic.
+                """
+                if not content:
+                    return ""
+
+                normalized_content = content.replace("\r\n", "\n")
+
+                abstract_patterns = [
+                    r'(?is)(?:^|\n)\s*(?:#+\s*)?abstract\s*[:：]?\s*\n+(.*?)(?=\n\s*(?:#+\s*)?(?:keywords?|introduction|1\.|i\.|background)\b)',
+                    r'(?is)(?:^|\n)\s*(?:#+\s*)?摘要\s*[:：]?\s*\n+(.*?)(?=\n\s*(?:#+\s*)?(?:关键词|关键字|引言|前言|1\.|一、))',
+                    r'(?is)-\s*\*\*abstract\*\*:\s*(.*?)(?=\n-\s*\*\*|\n\s*---|\n\s*##\s+)'
+                ]
+
+                for pattern in abstract_patterns:
+                    match = re.search(pattern, normalized_content)
+                    if match:
+                        candidate = re.sub(r'\s+', ' ', match.group(1)).strip()
+                        if len(candidate) >= 80:
+                            return candidate
+
+                # Conservative fallback: use the first substantial paragraph after metadata/header.
+                lines = normalized_content.split("\n")
+                paragraphs = []
+                buffer = []
+                start_collecting = False
+                for line in lines:
+                    stripped = line.strip()
+                    if not start_collecting:
+                        if stripped in {"## Content", "Abstract", "摘要"} or stripped.lower() == "## content":
+                            start_collecting = True
+                        continue
+
+                    if not stripped:
+                        if buffer:
+                            paragraphs.append(" ".join(buffer).strip())
+                            buffer = []
+                        continue
+
+                    # Skip headings and metadata bullets.
+                    if stripped.startswith("#") or stripped.startswith("- **"):
+                        continue
+
+                    buffer.append(stripped)
+
+                if buffer:
+                    paragraphs.append(" ".join(buffer).strip())
+
+                for paragraph in paragraphs[:3]:
+                    normalized_paragraph = re.sub(r'\s+', ' ', paragraph).strip()
+                    if 150 <= len(normalized_paragraph) <= 2500:
+                        return normalized_paragraph
+
+                return ""
+
+            def summarize_metadata_status(structured_data: Dict[str, Any]) -> Dict[str, Any]:
+                """
+                Compute metadata completeness markers.
+                """
+                fields = ["title", "author", "abstract", "journal"]
+                missing_fields = [f for f in fields if not normalize_text_field(structured_data.get(f))]
+                structured_data["missing_fields"] = missing_fields
+                if not missing_fields:
+                    structured_data["metadata_status"] = "complete"
+                elif len(missing_fields) == len(fields):
+                    structured_data["metadata_status"] = "missing"
+                else:
+                    structured_data["metadata_status"] = "partial"
+                return structured_data
+
+            def enrich_paper_metadata(
+                    structured_data: Dict[str, Any],
+                    rag_metadata: Optional[Dict[str, Any]] = None,
+                    parsed_data: Optional[Dict[str, Any]] = None
+            ) -> Dict[str, Any]:
+                """
+                Ensure paper metadata fields always exist.
+                Priority: parsed_data explicit fields > rag_metadata > existing value > empty string.
+                """
+                rag_metadata = rag_metadata if isinstance(rag_metadata, dict) else {}
+                parsed_data = parsed_data if isinstance(parsed_data, dict) else {}
+
+                def first_non_empty(*candidates) -> str:
+                    for candidate in candidates:
+                        normalized = normalize_text_field(candidate)
+                        if normalized:
+                            return normalized
+                    return ""
+
+                structured_data["title"] = first_non_empty(
+                    parsed_data.get("title"),
+                    parsed_data.get("Title"),
+                    rag_metadata.get("title"),
+                    rag_metadata.get("Title"),
+                    structured_data.get("title")
+                )
+                structured_data["author"] = first_non_empty(
+                    parsed_data.get("author"),
+                    parsed_data.get("authors"),
+                    parsed_data.get("Author"),
+                    parsed_data.get("Authors"),
+                    rag_metadata.get("author"),
+                    rag_metadata.get("authors"),
+                    rag_metadata.get("Author"),
+                    rag_metadata.get("Authors"),
+                    structured_data.get("author")
+                )
+                structured_data["abstract"] = first_non_empty(
+                    parsed_data.get("abstract"),
+                    parsed_data.get("Abstract"),
+                    rag_metadata.get("abstract"),
+                    rag_metadata.get("Abstract"),
+                    structured_data.get("abstract")
+                )
+                structured_data["journal"] = first_non_empty(
+                    parsed_data.get("journal"),
+                    parsed_data.get("Journal"),
+                    rag_metadata.get("journal"),
+                    rag_metadata.get("Journal"),
+                    structured_data.get("journal")
+                )
+
+                structured_data["doi"] = first_non_empty(
+                    parsed_data.get("doi"),
+                    parsed_data.get("DOI"),
+                    rag_metadata.get("doi"),
+                    rag_metadata.get("DOI"),
+                    structured_data.get("doi")
+                )
+                return structured_data
+
+            def parse_answer_to_structured_data(answer_text: str, file_path: str, rag_metadata: dict = None) -> Dict[
+                str, str]:
                 """Parse the AI JSON response into structured data"""
                 # Default structure
                 structured_data = {
@@ -4565,10 +7629,29 @@ Strictly follow the following format for output:
                     "source_authority": "Unknown",
                     "task_relevance": "Unknown",
                     "information_richness": "Unknown",
-                    "core_content": "Unknown"
+                    "core_content": "Unknown",
+                    "title": "",
+                    "author": "",
+                    "abstract": "",
+                    "journal": "",
+                    "doi": "",
+                    "metadata_status": "missing",
+                    "metadata_source": "",
+                    "missing_fields": []
                 }
 
+                # 如果有RAG元数据，保存到structured_data中
+                if rag_metadata:
+                    structured_data["rag_metadata"] = rag_metadata
+
                 if not answer_text:
+                    enrich_paper_metadata(structured_data, rag_metadata=rag_metadata)
+                    structured_data["doi"] = normalize_text_field(structured_data.get("doi"))
+                    if not structured_data["doi"]:
+                        structured_data["doi"] = extract_doi_from_text(json.dumps(rag_metadata, ensure_ascii=False) if rag_metadata else "")
+                    summarize_metadata_status(structured_data)
+                    if rag_metadata and any(normalize_text_field(rag_metadata.get(k)) for k in ["title", "authors", "journal", "doi"]):
+                        structured_data["metadata_source"] = "rag_metadata"
                     return structured_data
 
                 try:
@@ -4604,26 +7687,162 @@ Strictly follow the following format for output:
                             "core_content": parsed_data.get("core_content", "Unknown"),
                             "information_richness": parsed_data.get("information_richness", "Unknown")
                         })
+                        enrich_paper_metadata(
+                            structured_data,
+                            rag_metadata=rag_metadata,
+                            parsed_data=parsed_data
+                        )
+                        structured_data["metadata_source"] = "llm"
+                    else:
+                        enrich_paper_metadata(structured_data, rag_metadata=rag_metadata)
 
+                    # DOI completion (from text/rag if needed)
+                    if not normalize_text_field(structured_data.get("doi")):
+                        structured_data["doi"] = extract_doi_from_text(answer_text)
+                    if not normalize_text_field(structured_data.get("doi")) and rag_metadata:
+                        structured_data["doi"] = extract_doi_from_text(json.dumps(rag_metadata, ensure_ascii=False))
+
+                    # Crossref backfill by DOI
+                    doi = normalize_text_field(structured_data.get("doi"))
+                    if doi:
+                        crossref_meta = fetch_crossref_metadata(doi)
+                        if crossref_meta:
+                            for field_name in ["title", "author", "abstract", "journal"]:
+                                if not normalize_text_field(structured_data.get(field_name)):
+                                    structured_data[field_name] = normalize_text_field(crossref_meta.get(field_name))
+                            if any(normalize_text_field(crossref_meta.get(f)) for f in ["title", "author", "abstract", "journal"]):
+                                structured_data["metadata_source"] = "crossref"
+
+                    summarize_metadata_status(structured_data)
+                    if not normalize_text_field(structured_data.get("metadata_source")) and rag_metadata:
+                        structured_data["metadata_source"] = "rag_metadata"
                     return structured_data
 
                 except json.JSONDecodeError as e:
                     # If JSON parsing fails, return default with error info
                     structured_data[
                         "core_content"] = f"JSON parsing error: {str(e)}. Raw response: {answer_text[:200]}..."
+                    enrich_paper_metadata(structured_data, rag_metadata=rag_metadata)
+                    if not normalize_text_field(structured_data.get("doi")):
+                        structured_data["doi"] = extract_doi_from_text(answer_text)
+                    if not normalize_text_field(structured_data.get("doi")) and rag_metadata:
+                        structured_data["doi"] = extract_doi_from_text(json.dumps(rag_metadata, ensure_ascii=False))
+                    doi = normalize_text_field(structured_data.get("doi"))
+                    if doi:
+                        crossref_meta = fetch_crossref_metadata(doi)
+                        if crossref_meta:
+                            for field_name in ["title", "author", "abstract", "journal"]:
+                                if not normalize_text_field(structured_data.get(field_name)):
+                                    structured_data[field_name] = normalize_text_field(crossref_meta.get(field_name))
+                            structured_data["metadata_source"] = "crossref"
+                    summarize_metadata_status(structured_data)
+                    if not normalize_text_field(structured_data.get("metadata_source")) and rag_metadata:
+                        structured_data["metadata_source"] = "rag_metadata"
                     return structured_data
                 except Exception as e:
                     # Handle any other parsing errors
                     structured_data["core_content"] = f"Parsing error: {str(e)}"
+                    enrich_paper_metadata(structured_data, rag_metadata=rag_metadata)
+                    if not normalize_text_field(structured_data.get("doi")):
+                        structured_data["doi"] = extract_doi_from_text(answer_text)
+                    summarize_metadata_status(structured_data)
                     return structured_data
+
+            def apply_external_metadata_backfill(
+                    structured_data: Dict[str, Any],
+                    answer_text: str = "",
+                    rag_metadata: Optional[Dict[str, Any]] = None,
+                    file_content: str = ""
+            ) -> Dict[str, Any]:
+                """
+                Second-stage metadata completion:
+                1) recover DOI
+                2) Crossref
+                3) OpenAlex
+                4) local abstract extraction from content
+                """
+                rag_metadata = rag_metadata if isinstance(rag_metadata, dict) else {}
+
+                if not normalize_text_field(structured_data.get("doi")):
+                    structured_data["doi"] = extract_doi_from_text(answer_text)
+                if not normalize_text_field(structured_data.get("doi")) and rag_metadata:
+                    structured_data["doi"] = extract_doi_from_text(json.dumps(rag_metadata, ensure_ascii=False))
+                if not normalize_text_field(structured_data.get("doi")) and file_content:
+                    structured_data["doi"] = extract_doi_from_text(file_content)
+
+                doi = normalize_text_field(structured_data.get("doi"))
+                sources_used = []
+
+                if doi:
+                    crossref_meta = fetch_crossref_metadata(doi)
+                    if crossref_meta:
+                        for field_name in ["title", "author", "abstract", "journal"]:
+                            if not normalize_text_field(structured_data.get(field_name)):
+                                structured_data[field_name] = normalize_text_field(crossref_meta.get(field_name))
+                        if any(normalize_text_field(crossref_meta.get(f)) for f in ["title", "author", "abstract", "journal"]):
+                            sources_used.append("crossref")
+
+                    # OpenAlex is especially useful when Crossref lacks abstract.
+                    if not normalize_text_field(structured_data.get("abstract")) or not normalize_text_field(structured_data.get("author")):
+                        openalex_meta = fetch_openalex_metadata(doi)
+                        if openalex_meta:
+                            for field_name in ["title", "author", "abstract", "journal"]:
+                                if not normalize_text_field(structured_data.get(field_name)):
+                                    structured_data[field_name] = normalize_text_field(openalex_meta.get(field_name))
+                            if any(normalize_text_field(openalex_meta.get(f)) for f in ["title", "author", "abstract", "journal"]):
+                                sources_used.append("openalex")
+
+                # Final fallback for abstract: extract from the saved content itself.
+                if not normalize_text_field(structured_data.get("abstract")) and file_content:
+                    extracted_abstract = extract_abstract_from_content(file_content)
+                    if extracted_abstract:
+                        structured_data["abstract"] = extracted_abstract
+                        sources_used.append("content_extract")
+
+                if sources_used:
+                    structured_data["metadata_source"] = "+".join(dict.fromkeys(sources_used))
+
+                summarize_metadata_status(structured_data)
+                return structured_data
 
             # Transform results into the desired format
             structured_results = []
             for result in results:
                 if result.get('success', False) and result.get('answer'):
+                    file_path = result['file_path']
+
+                    # 从task中获取RAG元数据（如果有）
+                    task_info = next((t for t in tasks if t['file_path'] == file_path), {})
+                    rag_metadata = task_info.get('rag_metadata', None)
+
+                    # 【关键修复】如果没有传入rag_metadata，且是RAG文件，则从文件内容中提取
+                    file_content = ""
+                    if not rag_metadata and file_path.startswith('rag_downloads/'):
+                        try:
+                            read_result = self.file_read(file_path)
+                            if read_result.success:
+                                file_content = read_result.data
+                                rag_metadata = extract_rag_metadata_from_content(file_path, read_result.data)
+                        except Exception as e:
+                            logger.warning(f"[RAG_METADATA] 无法从文件提取元数据: {file_path}, error: {e}")
+                    elif not file_content:
+                        try:
+                            read_result = self.file_read(file_path)
+                            if read_result.success:
+                                file_content = read_result.data
+                        except Exception:
+                            file_content = ""
+
                     structured_data = parse_answer_to_structured_data(
                         result['answer'],
-                        result['file_path']
+                        file_path,
+                        rag_metadata
+                    )
+                    structured_data = apply_external_metadata_backfill(
+                        structured_data,
+                        answer_text=result.get('answer', ''),
+                        rag_metadata=rag_metadata,
+                        file_content=file_content
                     )
                     structured_results.append(structured_data)
                 else:
@@ -4634,7 +7853,11 @@ Strictly follow the following format for output:
                         "source_authority": "Processing failed",
                         "task_relevance": "Processing failed",
                         "information_richness": "Unknown",
-                        "core_content": f"Error: {result.get('error', 'Unknown error')}"
+                        "core_content": f"Error: {result.get('error', 'Unknown error')}",
+                        "title": "",
+                        "author": "",
+                        "abstract": "",
+                        "journal": ""
                     })
 
             # Save structured results to JSON file
@@ -4643,7 +7866,28 @@ Strictly follow the following format for output:
             full_save_path = self.workspace_path / analysis_path / "file_analysis.jsonl"
             full_save_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # Read existing data to avoid duplicates
+            # 【关键修复】使用核心名称作为 key 进行去重，避免重复记录
+            def get_core_key(path: str) -> str:
+                """
+                获取文件的核心 key，用于去重
+                - 移除 ./ 前缀
+                - 移除转换后缀 .pdf.txt -> .pdf, .docx.txt -> .docx, .doc.txt -> .doc
+                例如：./user_uploads/xxx.pdf 和 user_uploads/xxx.pdf.txt 都会映射到 user_uploads/xxx.pdf
+                """
+                # 移除 ./ 前缀
+                normalized = path.lstrip('./')
+                # 移除转换后的 .txt 后缀
+                for ext in ['.pdf.txt', '.docx.txt', '.doc.txt']:
+                    if normalized.endswith(ext):
+                        normalized = normalized[:-4]  # 移除 .txt
+                        break
+                return normalized
+
+            def is_successful_result(data: dict) -> bool:
+                """判断分析结果是否成功"""
+                return data.get('doc_time') != 'Processing failed'
+
+            # Read existing data to avoid duplicates (智能去重：优先保留成功记录)
             existing_data = {}
             if full_save_path.exists():
                 try:
@@ -4652,16 +7896,48 @@ Strictly follow the following format for output:
                             try:
                                 data = json.loads(line.strip())
                                 if data.get('file_path'):
-                                    existing_data[data['file_path']] = data
+                                    core_key = get_core_key(data['file_path'])
+                                    existing = existing_data.get(core_key)
+                                    
+                                    # 智能覆盖：优先保留成功的记录
+                                    should_replace = True
+                                    if existing:
+                                        existing_success = is_successful_result(existing)
+                                        new_success = is_successful_result(data)
+                                        
+                                        if existing_success and not new_success:
+                                            # 已有成功的结果，不用失败的覆盖
+                                            should_replace = False
+                                    
+                                    if should_replace:
+                                        existing_data[core_key] = data
                             except json.JSONDecodeError:
                                 continue  # Skip malformed lines
                 except Exception as e:
                     logger.error(f"Warning: Failed to read existing analysis file: {e}")
 
-            # Merge new results (new data overwrites old data for same file_path)
+            # Merge new results (智能覆盖：成功覆盖失败，不用失败覆盖成功)
             for result in structured_results:
                 if result.get('file_path'):
-                    existing_data[result['file_path']] = result
+                    core_key = get_core_key(result['file_path'])
+                    existing = existing_data.get(core_key)
+                    
+                    # 决定是否覆盖
+                    should_replace = True
+                    if existing:
+                        existing_success = is_successful_result(existing)
+                        new_success = is_successful_result(result)
+                        
+                        if existing_success and not new_success:
+                            # 已有成功的结果，不用失败的覆盖
+                            logger.info(f"保留已有成功结果: {core_key}")
+                            should_replace = False
+                        elif new_success and not existing_success:
+                            # 新结果成功，覆盖旧的失败结果
+                            logger.info(f"用成功结果覆盖失败记录: {core_key}")
+                    
+                    if should_replace:
+                        existing_data[core_key] = result
 
             # Write back all data (overwrite mode to ensure no duplicates)
             # 【关键修复】用户上传文件优先排序，文档库和网络检索由LLM自行判断
@@ -4670,6 +7946,12 @@ Strictly follow the following format for output:
             other_files = []
 
             for file_data in existing_data.values():
+                # Ensure old historical records also carry required paper metadata fields
+                enrich_paper_metadata(
+                    file_data,
+                    rag_metadata=file_data.get("rag_metadata"),
+                    parsed_data=file_data
+                )
                 file_path = file_data.get('file_path', '')
                 if 'user_uploads' in file_path or file_path.startswith('./user_uploads/'):
                     user_uploaded_files.append(file_data)
@@ -4713,7 +7995,7 @@ Strictly follow the following format for output:
     def document_qa(
             self,
             tasks: List[Dict],
-            model: str = "gpt-4o",
+            model: str = "pangu_auto",
             temperature: float = 0.3,
             max_tokens: int = 8192,
             max_workers: int = 5
@@ -4726,13 +8008,21 @@ Strictly follow the following format for output:
             tasks: List of task dictionaries containing:
                 - file_path: Relative path to the file (relative to workspace root) to read
                 - question: Question to ask about this file
-            model: AI model to use for generating answers
+            model: AI model to use for generating answers (defaults to MODEL_NAME from config)
             temperature: Creativity level for the AI response (0-1)
             max_tokens: Maximum tokens for the AI response
             max_workers: Maximum number of concurrent model API requests
         """
         try:
             logger.info(f"我现在开始调用document_qa了：{tasks}")
+
+            # 获取自定义LLM配置
+            model_config = get_config().get_custom_llm_config()
+            PANGU_URL = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
+            model_name = model or model_config.get('model') or os.getenv('MODEL_NAME', '')
+            model_token = model_config.get('token') or os.getenv('MODEL_REQUEST_TOKEN', '')
+            model_timeout = model_config.get('timeout', 180)
+            headers = {'Content-Type': 'application/json', 'csb-token': model_token}
 
             # 处理单个任务
             def process_single_task(task: Dict) -> Dict:
@@ -4760,8 +8050,7 @@ Strictly follow the following format for output:
                     "CONTEXT:\n{context}"
                 ).format(context=content)
 
-                # 3. 调用大模型API
-                import litellm
+                # 3. 调用自定义大模型API
                 try:
                     # Add retry logic for AI model call
                     max_retries = 5
@@ -4769,17 +8058,23 @@ Strictly follow the following format for output:
 
                     for attempt in range(max_retries):
                         try:
-                            response = litellm.completion(
-                                model=model,
-                                messages=[
-                                    {"role": "system", "content": system_prompt},
-                                    {"role": "user", "content": question}
-                                ],
-                                temperature=temperature,
-                                # temperature=1,
-                                max_tokens=max_tokens,
-                                proxy=proxy
+                            response = requests.post(
+                                url=PANGU_URL,
+                                headers=headers,
+                                json={
+                                    "model": model_name,
+                                    "chat_template": "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<s>[unused9]系统：[unused10]' }}{% endif %}{% if message['role'] == 'system' %}{{'<s>[unused9]系统：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'assistant' %}{{'[unused9]助手：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'tool' %}{{'[unused9]工具：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'function' %}{{'[unused9]方法：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'user' %}{{'[unused9]用户：' + message['content'] + '[unused10]'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '[unused9]助手：' }}{% endif %}",
+                                    "messages": [
+                                        {"role": "system", "content": system_prompt},
+                                        {"role": "user", "content": question}
+                                    ],
+                                    "max_tokens": max_tokens,
+                                    "spaces_between_special_tokens": False,
+                                    "temperature": temperature,
+                                },
+                                timeout=model_config.get("timeout", 180)
                             )
+                            response = response.json()
                             break  # Success, exit retry loop
                         except Exception as e:
                             logger.warning(f"LLM API call attempt {attempt + 1} failed: {e}")
@@ -4790,7 +8085,7 @@ Strictly follow the following format for output:
                     if response is None:
                         raise Exception("Failed to get response after all retries")
 
-                    answer = response.choices[0].message.content
+                    answer = response["choices"][0]["message"]["content"]
                     return {
                         'file_path': file_path,
                         'question': question,
@@ -4907,9 +8202,17 @@ Strictly follow the following format for output:
                         filename = filename[:-4] + '.txt'
                         logger.info(f"网页下载的PDF文件将转换为文本格式: {filename}")
 
-                    file_path = download_dir / filename
-                    if not os.path.realpath(file_path).startswith(self.full_workspace_path):
+                    # 仅做 '..' 穿越/绝对路径检查，避免在不存在的目标上调用
+                    # os.path.realpath 时的 Windows 并发竞态（见 _validate_workspace_path）。
+                    normalized_filename = os.path.normpath(filename).replace('\\', '/')
+                    if (
+                        normalized_filename == '..'
+                        or normalized_filename.startswith('../')
+                        or '/../' in normalized_filename
+                        or os.path.isabs(normalized_filename)
+                    ):
                         raise Exception(f"Path '{filename}' is outside workspace directory.")
+                    file_path = download_dir / normalized_filename
 
                     # Check if file exists
                     if file_path.exists() and not overwrite:
@@ -5864,14 +9167,25 @@ Strictly follow the following format for output:
     def _read_doc_text(self, path: Path) -> str:
         """
         读取旧版Word文档文本内容（支持.doc格式）
-        多方案回退机制（跨平台优先）：
-        - Linux/Mac: antiword (推荐) > textract
-        - Windows: win32com (如果有MS Word) > antiword > textract
+        多方案回退机制（纯Python优先，适配openEuler等环境）：
+        1. olefile (纯Python) - 无需系统依赖，推荐
+        2. win32com (Windows) - 需要MS Word
+        3. antiword (系统工具) - 如果已安装
+        4. textract (Python库) - 依赖较多
         """
         import sys
         import subprocess
 
-        # Windows优先尝试win32com（如果安装了MS Word，效果最好）
+        # 方案1: 使用olefile纯Python解析（推荐，无需系统依赖）
+        try:
+            text = self._extract_doc_with_olefile(path)
+            if text and text.strip():
+                logger.info(f"Successfully extracted text from DOC using olefile: {path} ({len(text)} chars)")
+                return text.strip()
+        except Exception as e:
+            logger.debug(f"olefile extraction failed for {path}: {e}")
+
+        # 方案2: Windows优先尝试win32com（如果安装了MS Word，效果最好）
         if sys.platform == 'win32':
             try:
                 import win32com.client
@@ -5890,14 +9204,14 @@ Strictly follow the following format for output:
             except Exception as e:
                 logger.debug(f"win32com failed for {path}: {e}")
 
-        # 方案1: 使用antiword（跨平台，Linux服务器推荐）
+        # 方案3: 使用antiword（如果系统已安装）
         try:
             result = subprocess.run(
                 ['antiword', str(path)],
                 capture_output=True,
                 text=True,
                 timeout=30,
-                check=False  # 不抛出异常，通过returncode判断
+                check=False
             )
             if result.returncode == 0 and result.stdout.strip():
                 text = result.stdout.strip()
@@ -5906,12 +9220,11 @@ Strictly follow the following format for output:
             else:
                 logger.debug(f"antiword returned code {result.returncode}, stderr: {result.stderr}")
         except FileNotFoundError:
-            logger.debug(
-                f"antiword not found. Install: apt-get install antiword (Linux) or choco install antiword (Windows)")
+            logger.debug(f"antiword not found")
         except Exception as e:
             logger.debug(f"antiword failed for {path}: {e}")
 
-        # 方案2: 使用textract（Python库，跨平台但依赖较多）
+        # 方案4: 使用textract（Python库，依赖较多）
         try:
             import textract
             text = textract.process(str(path)).decode('utf-8')
@@ -5925,11 +9238,108 @@ Strictly follow the following format for output:
 
         # 所有方法都失败
         logger.warning(f"All DOC extraction methods failed for {path}. Recommendations:")
-        logger.warning(f"  1. Install antiword: apt-get install antiword (Linux) or choco install antiword (Windows)")
-        logger.warning(f"  2. Install pywin32: pip install pywin32 (Windows with MS Word)")
-        logger.warning(f"  3. Install textract: pip install textract (requires system dependencies)")
-        logger.warning(f"  4. Or convert the file to .docx/.pdf format manually")
-        return ''  # 返回空字符串，让调用方处理
+        logger.warning(f"  1. Install olefile: pip install olefile (Pure Python, recommended)")
+        logger.warning(f"  2. Or convert the file to .docx/.pdf format manually")
+        return ''
+
+    def _extract_doc_with_olefile(self, path: Path) -> str:
+        """
+        使用olefile纯Python库解析.doc文件提取文本
+        .doc文件是OLE Compound Document格式
+        """
+        import re
+        
+        try:
+            import olefile
+        except ImportError:
+            logger.debug("olefile not installed. Install with: pip install olefile")
+            raise ImportError("olefile not installed")
+
+        ole = olefile.OleFileIO(str(path))
+        
+        try:
+            # 检查是否是Word文档
+            if not ole.exists('WordDocument'):
+                raise ValueError("Not a valid Word document")
+
+            # 读取WordDocument流
+            word_stream = ole.openstream('WordDocument').read()
+            
+            # 提取文本
+            text = self._extract_text_from_word_stream(word_stream)
+            
+            if text:
+                return text
+            
+            # 备选：尝试从Data流提取
+            if ole.exists('Data'):
+                data_stream = ole.openstream('Data').read()
+                text = self._decode_ole_stream(data_stream)
+                if text:
+                    return text
+            
+            return ''
+        finally:
+            ole.close()
+
+    def _extract_text_from_word_stream(self, stream: bytes) -> str:
+        """从WordDocument流中提取文本"""
+        import re
+        
+        text_parts = []
+        
+        # 尝试UTF-16LE解码（Windows Word默认编码）
+        try:
+            raw_text = stream.decode('utf-16-le', errors='ignore')
+            # 过滤出可打印字符
+            decoded = ''.join(c for c in raw_text if c.isprintable() or c in '\n\r\t')
+            if len(decoded) > 50:
+                text_parts.append(decoded)
+        except Exception:
+            pass
+        
+        # 尝试提取ASCII/GBK文本（中文文档）
+        try:
+            # 匹配连续的可打印字符序列
+            ascii_pattern = re.compile(b'[\x20-\x7e\x0a\x0d\t]{4,}')
+            matches = ascii_pattern.findall(stream)
+            if matches:
+                ascii_text = b' '.join(matches).decode('gbk', errors='ignore')
+                if len(ascii_text) > len(''.join(text_parts)):
+                    text_parts = [ascii_text]
+        except Exception:
+            pass
+        
+        # 合并并清理文本
+        full_text = '\n'.join(text_parts)
+        return self._clean_doc_text(full_text)
+
+    def _decode_ole_stream(self, stream: bytes) -> str:
+        """解码OLE流数据"""
+        try:
+            text = stream.decode('utf-16-le', errors='ignore')
+            text = ''.join(c for c in text if c.isprintable() or c in '\n\r\t')
+            return self._clean_doc_text(text)
+        except Exception:
+            return ''
+
+    def _clean_doc_text(self, text: str) -> str:
+        """清理提取的文本"""
+        import re
+        
+        if not text:
+            return ''
+        
+        # 移除控制字符
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
+        # 移除Word内部标记
+        text = re.sub(r'(Times New Roman|Arial|Calibri|宋体|黑体|微软雅黑)\s*', '', text)
+        text = re.sub(r'HYPERLINK\s*"[^"]*"', '', text)
+        # 合并多个空格和换行
+        text = re.sub(r' +', ' ', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        return text.strip()
 
     def _normalize_report_part_path(self, file_path: str) -> str:
         """Normalize misformatted report chapter filenames.
@@ -5979,6 +9389,12 @@ Strictly follow the following format for output:
 
             # Normalize [webpaeg22] or [webpage22] -> [22]
             content = re.sub(r"\[webp(?:aeg|age)(\d+)\]", r"[\1]", content)
+
+            # Normalize multi-citation [53, 57] -> [53][57]
+            def _split_multi_cite(m):
+                nums = [n.strip() for n in m.group(1).split(",") if n.strip().isdigit()]
+                return "".join(f"[{n}]" for n in nums)
+            content = re.sub(r"\[(\d+(?:\s*,\s*\d+)+)\]", _split_multi_cite, content)
         except Exception:
             # On regex errors, return original content to be safe
             return content
@@ -6513,7 +9929,6 @@ Strictly follow the following format for output:
             # Execute command
             result = subprocess.run(
                 command,
-                # 标记1 原始：shell=True,
                 shell=True,
                 cwd=str(cwd),
                 capture_output=capture_output,
@@ -7339,7 +10754,7 @@ Strictly follow the following format for output:
         # 生成搜索 URL
         try:
             search_url = generate_pubmed_search_url(term=keywords, num_results=max_results)
-            logger.info("Generated URL:", search_url)
+            logger.info(f"Generated URL: {search_url}")
 
             # 获取并解析搜索结果
             pmids = search_pubmed(search_url)
@@ -7361,7 +10776,7 @@ Strictly follow the following format for output:
             search_url = generate_pubmed_search_url(term=term, title=title, author=author,
                                                     journal=journal, start_date=start_date,
                                                     end_date=end_date, num_results=num_results)
-            logger.info("Generated URL:", search_url)
+            logger.info(f"Generated URL: {search_url}")
 
             # 获取并解析搜索结果
             pmids = search_pubmed(search_url)
@@ -7377,65 +10792,570 @@ Strictly follow the following format for output:
             logger.error(e)
             return MCPToolResult(success=False, error=f"获取pubmed信息失败!{e}")
 
+    def _extract_pmc_fulltext_xml(self, pmc_id_num: str) -> str:
+        """
+        通过PMC efetch API获取全文XML并提取纯文本
+        pmc_id_num: 纯数字PMC ID（不含'PMC'前缀）
+        """
+        efetch_pmc_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pmc&id={pmc_id_num}&rettype=full&retmode=xml"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        response = requests.get(efetch_pmc_url, headers=headers, verify=False, proxies=proxy, timeout=30)
+        if response.status_code != 200:
+            logger.warning(f"PMC efetch API returned status {response.status_code} for PMC ID {pmc_id_num}")
+            return ""
+
+        try:
+            root = ET.fromstring(response.content)
+        except ET.ParseError as e:
+            logger.warning(f"Failed to parse PMC XML for {pmc_id_num}: {e}")
+            return ""
+
+        article_parts = []
+
+        # 提取标题
+        title_el = root.find(".//article-title")
+        if title_el is not None:
+            title_text = "".join(title_el.itertext()).strip()
+            if title_text:
+                article_parts.append(f"# {title_text}\n")
+
+        # 提取摘要
+        abstract_el = root.find(".//abstract")
+        if abstract_el is not None:
+            article_parts.append("## Abstract\n")
+            for sec in abstract_el.findall(".//sec"):
+                sec_title = sec.find("title")
+                if sec_title is not None:
+                    article_parts.append(f"### {sec_title.text.strip()}\n")
+                for p in sec.findall("p"):
+                    p_text = "".join(p.itertext()).strip()
+                    if p_text:
+                        article_parts.append(p_text + "\n")
+            # 也处理没有sec包裹的abstract段落
+            for p in abstract_el.findall("p"):
+                p_text = "".join(p.itertext()).strip()
+                if p_text:
+                    article_parts.append(p_text + "\n")
+
+        # 提取正文
+        body_el = root.find(".//body")
+        if body_el is not None:
+            for sec in body_el.findall(".//sec"):
+                sec_title = sec.find("title")
+                if sec_title is not None:
+                    sec_title_text = "".join(sec_title.itertext()).strip()
+                    if sec_title_text:
+                        article_parts.append(f"\n## {sec_title_text}\n")
+                for p in sec.findall("p"):
+                    p_text = "".join(p.itertext()).strip()
+                    if p_text:
+                        article_parts.append(p_text + "\n")
+            # 也处理没有sec包裹的body段落
+            for p in body_el.findall("./p"):
+                p_text = "".join(p.itertext()).strip()
+                if p_text:
+                    article_parts.append(p_text + "\n")
+
+        return "\n".join(article_parts)
+
+    def search_rag_knowledge(
+            self,
+            content: str,
+            repo_id: str = None,
+            page_num: int = 1,
+            page_size: int = None
+    ) -> MCPToolResult:
+
+        """
+        Search RAG knowledge base for relevant documents.
+
+        Args:
+            content: Search query content
+            repo_id: Repository ID (optional, uses default from config if not provided)
+            page_num: Page number for pagination (default: 1)
+            page_size: Number of results per page (optional, uses default from config if not provided)
+
+        Returns:
+            MCPToolResult with search results containing relevant documents
+        """
+        try:
+            from config.config import get_rag_config
+
+            rag_config = get_rag_config()
+            api_url = rag_config.get('api_url')
+            app_code = rag_config.get('app_code')
+
+            if not api_url or not app_code:
+                return MCPToolResult(
+                    success=False,
+                    error="RAG API configuration is missing. Please check RAG_API_URL and RAG_APP_CODE in .env file"
+                )
+
+            # If repo_id is None, empty string, or "default", use the configured default repo_id
+            if not repo_id or repo_id == "default":
+                repo_id = rag_config.get('default_repo_id')
+                if not repo_id:
+                    return MCPToolResult(
+                        success=False,
+                        error="Repository ID is required. Please provide repo_id or set RAG_DEFAULT_REPO_ID in .env file"
+                    )
+
+            if page_size is None:
+                page_size = rag_config.get('default_page_size', 10)
+
+            headers = {"X-Apig-AppCode": app_code}
+            data = {
+                "repo_id": repo_id,
+                "content": content,
+                "page_num": page_num,
+                "page_size": page_size
+            }
+
+            logger.info(f"Searching RAG knowledge base with query: {content[:100]}...")
+            logger.info(f"RAG API URL: {api_url}")
+            logger.info(f"RAG request data: repo_id={repo_id}, page_num={page_num}, page_size={page_size}")
+
+            timeout = rag_config.get('timeout', 30)
+
+            # 添加重试机制：最多重试 3 次，间隔 1 秒
+            max_retries = 3
+            retry_delay = 1
+            last_exception = None
+
+            for attempt in range(max_retries):
+                try:
+                    response = requests.post(api_url, headers=headers, json=data, timeout=timeout)
+                    logger.info(
+                        f"RAG API response status: {response.status_code} (attempt {attempt + 1}/{max_retries})")
+
+                    if response.status_code != 200:
+                        logger.error(f"RAG API response body: {response.text[:500]}")
+
+                    # 成功获取响应，跳出重试循环
+                    break
+
+                except requests.exceptions.Timeout as e:
+                    last_exception = e
+                    logger.warning(f"RAG API timeout on attempt {attempt + 1}/{max_retries}: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        raise
+
+                except requests.exceptions.RequestException as e:
+                    last_exception = e
+                    logger.warning(f"RAG API request error on attempt {attempt + 1}/{max_retries}: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        raise
+
+            if response.status_code != 200:
+                return MCPToolResult(
+                    success=False,
+                    error=f"RAG API request failed with status code: {response.status_code}"
+                )
+
+            result_data = response.json()
+
+            # 处理绝对路径问题：清理不可访问的本地或远程路径
+            # RAG 返回的文档路径可能是绝对路径，这会导致 MCP 服务器拒绝访问
+            import os
+            logger.info(f"[PATH_CLEANUP] Starting path cleanup for RAG results")
+            if result_data and isinstance(result_data, dict):
+                # RAG API 返回的是 doc_list，不是 data.documents
+                if 'doc_list' in result_data and isinstance(result_data['doc_list'], list):
+                    logger.info(f"[PATH_CLEANUP] Found {len(result_data['doc_list'])} documents in RAG response")
+                    cleaned_count = 0
+                    for idx, doc in enumerate(result_data['doc_list']):
+                        if isinstance(doc, dict):
+                            # 路径在 additional_fields.metadata.file_path 中
+                            if 'additional_fields' in doc and isinstance(doc['additional_fields'], dict):
+                                metadata = doc['additional_fields'].get('metadata', {})
+                                if isinstance(metadata, dict) and 'file_path' in metadata:
+                                    file_path = metadata['file_path']
+                                    if file_path and isinstance(file_path, str):
+                                        # 检测本地绝对路径（Windows: C:/, D:/ 或 Linux: /）
+                                        if file_path.startswith(
+                                                ('C:/', 'D:/', 'E:/', 'F:/', '/', 'C:\\', 'D:\\', 'E:\\', 'F:\\')):
+                                            logger.warning(
+                                                f"[PATH_CLEANUP] Doc {idx}: Removing local absolute path: {file_path[:100]}...")
+                                            # 删除本地绝对路径，避免 Agent 误用
+                                            del metadata['file_path']
+                                            metadata[
+                                                '_path_removed_reason'] = 'Local absolute path not accessible. Use the content field instead.'
+                                            cleaned_count += 1
+                                            logger.info(f"[PATH_CLEANUP] Doc {idx}: Local absolute path removed")
+                                        elif file_path.startswith('uploads/'):
+                                            logger.info(
+                                                f"[PATH_CLEANUP] Doc {idx}: Removing remote storage path from metadata")
+                                            del metadata['file_path']
+                                            metadata[
+                                                '_path_removed_reason'] = 'Remote storage path not used. Use the content field instead.'
+                                            cleaned_count += 1
+
+                    if cleaned_count > 0:
+                        logger.warning(
+                            f"[PATH_CLEANUP] ⚠️ Cleaned {cleaned_count} invalid paths from RAG results")
+                    if cleaned_count == 0:
+                        logger.info(f"[PATH_CLEANUP] No paths needed cleanup")
+                else:
+                    logger.warning(f"[PATH_CLEANUP] No doc_list found in RAG response")
+
+            logger.info(f"RAG search completed successfully, found results")
+
+            # 【优化】后处理过滤：根据领域关键词过滤不相关文档
+            # 提高检索质量，减少不相关文档的干扰
+            if result_data and 'doc_list' in result_data and isinstance(result_data['doc_list'], list):
+                original_count = len(result_data['doc_list'])
+                filtered_docs = self._filter_relevant_rag_documents(result_data['doc_list'], content)
+                result_data['doc_list'] = filtered_docs
+                filtered_count = len(filtered_docs)
+
+                if filtered_count < original_count:
+                    logger.info(
+                        f"[RAG_FILTER] Filtered {original_count - filtered_count} irrelevant documents ({original_count} → {filtered_count})")
+                else:
+                    logger.info(f"[RAG_FILTER] All {original_count} documents passed relevance filter")
+
+            # Cache the search result for rag_document_saver to use
+            # This avoids the need to pass large JSON through LLM
+            current_time = time.time()
+            self._last_rag_search_result = result_data
+            self._last_rag_search_query = content
+            self._last_rag_search_timestamp = current_time
+            logger.info(f"[RAG_CACHE] Cached RAG search result for query: {content[:50]}...")
+
+            # Generate simplified document list for rag_document_saver (similar to url_crawler's documents parameter)
+            # This allows Agent to pass a simple list instead of the full search result
+            documents_for_saver = []
+            if result_data and 'doc_list' in result_data:
+                seen_file_ids = set()
+                for idx, doc in enumerate(result_data['doc_list']):
+                    content_text = doc.get('content', '')
+                    file_id = doc.get('file_id', '')
+                    # 获取 metadata - 可能在 additional_fields.metadata 或直接在 doc 中
+                    additional_fields = doc.get('additional_fields', {})
+                    metadata = additional_fields.get('metadata', {})
+
+                    # 调试：打印第一个文档的完整结构
+                    if idx == 0:
+                        logger.info(f"[RAG_DEBUG] First doc keys: {list(doc.keys())}")
+                        logger.info(
+                            f"[RAG_DEBUG] additional_fields keys: {list(additional_fields.keys()) if additional_fields else 'None'}")
+                        logger.info(f"[RAG_DEBUG] metadata keys: {list(metadata.keys()) if metadata else 'None'}")
+                        logger.info(f"[RAG_DEBUG] metadata content: {metadata}")
+
+                    if not file_id:
+                        metadata_file_id = metadata.get('file_id', '')
+                        if metadata_file_id:
+                            file_id = metadata_file_id
+                        elif content_text:
+                            import hashlib
+                            file_id = f"rag_{hashlib.md5(content_text.encode('utf-8')).hexdigest()[:12]}"
+                        else:
+                            file_id = f"rag_{idx}_{int(current_time)}"
+
+                    if file_id in seen_file_ids:
+                        continue
+                    seen_file_ids.add(file_id)
+
+                    has_content = bool(content_text)
+                    if has_content:
+                        # 提取完整的元数据字段
+                        doc_metadata = {
+                            'file_id': file_id,
+                            'title': metadata.get('title', ''),
+                            'journal': metadata.get('journal', ''),
+                            'doi': metadata.get('doi', ''),
+                            'section': metadata.get('section', ''),
+                            'authors': metadata.get('authors', []),
+                            'publication_date': metadata.get('publication_date', ''),
+                            'volume': metadata.get('volume', ''),
+                            'chunk_length': metadata.get('chunk_length', 0) or len(content_text)
+                        }
+                        documents_for_saver.append(doc_metadata)
+
+                        # 【关键修复】累积式缓存：将元数据保存到 _rag_metadata_cache
+                        # 这样即使后续搜索覆盖了 _last_rag_search_result，元数据仍然可用
+                        # 缓存结构包含时间戳用于过期检查
+                        # 使用锁保护并发写入
+                        cache_key = f"file_id:{file_id}"
+
+                        cache_metadata = {**doc_metadata, 'content': content_text}
+                        with self._rag_cache_lock:
+                            self._rag_metadata_cache[cache_key] = {
+                                'metadata': cache_metadata,
+                                'timestamp': current_time
+                            }
+
+                # 清理过期缓存（内部已有锁保护）
+                self._clean_rag_cache()
+
+                # 读取缓存大小时也需要锁保护
+                with self._rag_cache_lock:
+                    cache_size = len(self._rag_metadata_cache)
+
+                logger.info(f"[RAG_CACHE] Generated {len(documents_for_saver)} documents for saver")
+                logger.info(f"[RAG_CACHE] Total cached metadata entries: {cache_size}")
+
+            # Add documents_for_download to data (similar to how batch_web_search returns URLs in data)
+            # This allows Agent to extract the list and pass to rag_document_saver
+            result_data['documents_for_download'] = documents_for_saver
+
+            return MCPToolResult(
+                success=True,
+                data=result_data,
+                metadata={
+                    "query": content,
+                    "repo_id": repo_id,
+                    "page_num": page_num,
+                    "page_size": page_size,
+                    "cached_for_saver": True
+                }
+            )
+
+        except requests.exceptions.Timeout:
+            return MCPToolResult(
+                success=False,
+                error="RAG API request timeout"
+            )
+        except requests.exceptions.RequestException as e:
+            logger.error(f"RAG API request error: {e}")
+            return MCPToolResult(
+                success=False,
+                error=f"RAG API request failed: {str(e)}"
+            )
+        except Exception as e:
+            logger.error(f"RAG search error: {e}")
+            return MCPToolResult(
+                success=False,
+                error=f"RAG search failed: {str(e)}"
+            )
+
     def get_pubmed_article(self, pmid) -> MCPToolResult:
         logger.info(f"Attempting to access full text for PMID: {pmid}")
         try:
-            # 首先，我们需要检查这篇文章是否有PMC ID
+            # 获取PMC ID
             efetch_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id={pmid}&retmode=xml"
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             }
             response = requests.get(efetch_url, headers=headers, verify=False, proxies=proxy)
 
             if response.status_code != 200:
-                return f"Error: Unable to fetch article data (status code: {response.status_code})"
+                return MCPToolResult(success=False, error=f"Unable to fetch article data (status code: {response.status_code})")
 
             root = ET.fromstring(response.content)
             pmc_id = root.find(".//ArticleId[@IdType='pmc']")
 
+            # 预先获取元数据（标题等），用于嵌入到保存的文件中
+            metadata = get_pubmed_metadata(pmid)
+            article_title = metadata.get("Title", "Unknown Title") if metadata else "Unknown Title"
+            pubmed_url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+
+            # 无PMC ID，使用Abstract
             if pmc_id is None:
-                logger.info(f"No PMC ID found for PMID: {pmid}")
-                pubmed_url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
-                logger.info(f"You can check the article availability at: {pubmed_url}")
-                return f"No PMC ID found for PMID: {pmid}" + "\n" + f"You can check the article availability at: {pubmed_url}"
+                logger.info(f"No PMC ID found for PMID: {pmid}, falling back to abstract only")
+                if metadata and metadata.get("Abstract"):
+                    file_path = f"./pubmed/{pmid}_abstract.txt"
+                    # 嵌入元数据头，确保引用时能提取标题和URL
+                    content_with_header = f"# {article_title}\nURL Source: {pubmed_url}\n\n{metadata['Abstract']}"
+                    self.file_write(file_path=file_path, content=content_with_header, create_dirs=True)
+                    return MCPToolResult(success=True, data={
+                        "content": metadata["Abstract"],
+                        "file_path": file_path,
+                        "url": pubmed_url,
+                        "source_type": "pubmed_abstract",
+                        "pmid": pmid
+                    })
+                else:
+                    return MCPToolResult(success=False, error=f"No PMC ID or Abstract found for PMID: {pmid}")
+                
+            pmc_id = pmc_id.text  # e.g. "PMC7096724"
+            pmc_id_num = pmc_id.replace("PMC", "")  # e.g. "7096724"
+            pmc_url = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmc_id}/"
+            logger.info(f"Found PMC ID: {pmc_id} for PMID: {pmid}")
 
-            pmc_id = pmc_id.text
+            save_path = "./pubmed"
+            os.makedirs(self.workspace_path / save_path, exist_ok=True)
 
-            # 检查文章是否为开放访问
-            pmc_url = f"https://pmc.ncbi.nlm.nih.gov/articles/PMC8312049/"
-            pmc_response = requests.get(pmc_url, headers=headers, verify=False, proxies=proxy)
-            article = "pmc_sec_title".join(str(pmc_response.content).split("h2 class=\"pmc_sec_title")[1:-1])
-            logger.info("get pubmed content success")
-            '''
-            if pmc_response.status_code != 200:
-                logger.error(f"Error: Unable to access PMC article page (status code: {pmc_response.status_code})")
-                logger.info(f"You can check the article availability at: {pmc_url}")
-                return f"Error: Unable to access PMC article page (status code: {pmc_response.status_code})" + "\n" + f"You can check the article availability at: {pmc_url}"f"You can check the article availability at: {pmc_url}"
+            # ====== 方案1: PMC efetch XML API 获取全文（最可靠） ======
+            try:
+                logger.info(f"[方案1] Trying PMC efetch XML API for {pmc_id}")
+                xml_fulltext = self._extract_pmc_fulltext_xml(pmc_id_num)
+                if xml_fulltext and len(xml_fulltext.strip()) > 500:
+                    txt_file = f"{save_path}/{pmid}.txt"
+                    # 如果XML全文不是以#标题开头，则添加元数据头
+                    if not xml_fulltext.strip().startswith('# '):
+                        xml_fulltext = f"# {article_title}\nURL Source: {pmc_url}\n\n{xml_fulltext}"
+                    else:
+                        # 在标题后插入URL Source行
+                        lines = xml_fulltext.split('\n', 1)
+                        xml_fulltext = f"{lines[0]}\nURL Source: {pmc_url}\n{lines[1] if len(lines) > 1 else ''}"
+                    with open(self.workspace_path / txt_file, 'w', encoding='utf-8') as f:
+                        f.write(xml_fulltext)
+                    logger.info(f"[方案1 成功] PMC XML full text saved as {txt_file}, length: {len(xml_fulltext)}")
+                    return MCPToolResult(success=True, data={
+                        "content": xml_fulltext,
+                        "file_path": txt_file,
+                        "url": pmc_url,
+                        "source_type": "pubmed_pmc_xml",
+                        "pmid": pmid,
+                        "pmc_id": pmc_id
+                    })
+                else:
+                    logger.warning(f"[方案1 失败] PMC XML content too short ({len(xml_fulltext.strip()) if xml_fulltext else 0} chars)")
+            except Exception as e:
+                logger.warning(f"[方案1 异常] PMC efetch XML failed for {pmc_id}: {e}")
+
+            # ====== 方案2: 下载PDF并提取文本 ======
+            try:
+                logger.info(f"[方案2] Trying PDF download for {pmc_id}")
+                pdf_url = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmc_id}/pdf"
+                pdf_response = requests.get(pdf_url, headers=headers, verify=False, proxies=proxy, timeout=30, allow_redirects=True)
+                logger.info(f"[方案2] PDF response status: {pdf_response.status_code}, content-type: {pdf_response.headers.get('content-type', 'unknown')}")
+
+                if pdf_response.status_code == 200 and 'pdf' in pdf_response.headers.get('content-type', '').lower():
+                    temp_pdf = self.workspace_path / save_path / f"{pmid}_temp.pdf"
+                    with open(temp_pdf, 'wb') as f:
+                        f.write(pdf_response.content)
+                    
+                    pdf_text = self._read_pdf_text(temp_pdf)
+                    
+                    if temp_pdf.exists():
+                        temp_pdf.unlink()
+                    
+                    if pdf_text and len(pdf_text.strip()) > 100:
+                        txt_file = f"{save_path}/{pmid}.txt"
+                        # 添加元数据头
+                        pdf_text_with_header = f"# {article_title}\nURL Source: {pmc_url}\n\n{pdf_text}"
+                        with open(self.workspace_path / txt_file, 'w', encoding='utf-8') as f:
+                            f.write(pdf_text_with_header)
+                        logger.info(f"[方案2 成功] PDF text saved as {txt_file}, length: {len(pdf_text)}")
+                        return MCPToolResult(success=True, data={
+                            "content": pdf_text,
+                            "file_path": txt_file,
+                            "url": pmc_url,
+                            "source_type": "pubmed_pmc_pdf",
+                            "pmid": pmid,
+                            "pmc_id": pmc_id
+                        })
+                    else:
+                        logger.warning(f"[方案2 失败] PDF text extraction too short or empty")
+                else:
+                    logger.warning(f"[方案2 失败] PDF not available or wrong content-type")
+            except Exception as e:
+                logger.warning(f"[方案2 异常] PDF download failed for {pmc_id}: {e}")
+
+            # ====== 方案3: 抓取PMC HTML页面 ======
+            article = ""
+            try:
+                logger.info(f"[方案3] Trying PMC HTML scraping for {pmc_id}")
+                pmc_response = requests.get(pmc_url, headers=headers, verify=False, proxies=proxy, timeout=30)
+                logger.info(f"[方案3] HTML response status: {pmc_response.status_code}")
+
+                if pmc_response.status_code == 200:
+                    soup = BeautifulSoup(pmc_response.content, 'html.parser')
+                    
+                    # 提取标题 - 尝试多种选择器
+                    title = soup.find('h1', class_='content-title')
+                    if not title:
+                        title = soup.find('h1', id='article-title')
+                    if not title:
+                        title = soup.select_one('.article-title, .head-title, h1.heading-title')
+                    if title:
+                        article += f"# {title.get_text(strip=True)}\n\n"
+                    
+                    # 提取摘要
+                    abstract = soup.find('div', class_='abstract')
+                    if not abstract:
+                        abstract = soup.find('section', class_='abstract')
+                    if not abstract:
+                        abstract = soup.select_one('#abstract, .abstract-content')
+                    if abstract:
+                        article += "## Abstract\n\n"
+                        article += abstract.get_text(separator='\n', strip=True) + "\n\n"
+                    
+                    # 提取正文 - 尝试多种选择器
+                    main_content = soup.find('div', class_='jig-ncbiinpagenav')
+                    if not main_content:
+                        main_content = soup.find('div', id='mc')
+                    if not main_content:
+                        main_content = soup.find('div', class_='article-body')
+                    if not main_content:
+                        main_content = soup.find('main')
+                    if not main_content:
+                        main_content = soup.find('article')
+                    if not main_content:
+                        # 尝试所有 tsec class 的 div
+                        tsec_divs = soup.find_all('div', class_='tsec')
+                        if tsec_divs:
+                            for tsec in tsec_divs:
+                                for el in tsec.find_all(['p', 'h2', 'h3', 'h4']):
+                                    text = el.get_text(strip=True)
+                                    if text:
+                                        if el.name in ['h2', 'h3', 'h4']:
+                                            article += f"\n## {text}\n\n"
+                                        else:
+                                            article += text + "\n\n"
+                    
+                    if main_content:
+                        for section in main_content.find_all(['p', 'h2', 'h3', 'h4']):
+                            text = section.get_text(strip=True)
+                            if text:
+                                if section.name in ['h2', 'h3', 'h4']:
+                                    article += f"\n## {text}\n\n"
+                                else:
+                                    article += text + "\n\n"
+                    
+                    logger.info(f"[方案3] Extracted HTML content length: {len(article)}")
+            except Exception as e:
+                logger.warning(f"[方案3 异常] HTML scraping failed for {pmc_id}: {e}")
+
+            if article and len(article.strip()) > 200:
+                txt_file = f"{save_path}/{pmid}.txt"
+                # 如果HTML内容不是以#标题开头，添加元数据头
+                if not article.strip().startswith('# '):
+                    article = f"# {article_title}\nURL Source: {pmc_url}\n\n{article}"
+                else:
+                    lines = article.split('\n', 1)
+                    article = f"{lines[0]}\nURL Source: {pmc_url}\n{lines[1] if len(lines) > 1 else ''}"
+                with open(self.workspace_path / txt_file, 'w', encoding='utf-8') as f:
+                    f.write(article)
+                logger.info(f"[方案3 成功] HTML content saved as {txt_file}")
+                return MCPToolResult(success=True, data={
+                    "content": article,
+                    "file_path": txt_file,
+                    "url": pmc_url,
+                    "source_type": "pubmed_pmc_html",
+                    "pmid": pmid,
+                    "pmc_id": pmc_id
+                })
+
+            # ====== 所有方案失败，回退到摘要 ======
+            logger.warning(f"All full-text methods failed for PMID {pmid} ({pmc_id}), falling back to abstract")
+            if metadata and metadata.get("Abstract"):
+                file_path = f"./pubmed/{pmid}_abstract.txt"
+                content_with_header = f"# {article_title}\nURL Source: {pmc_url}\n\n{metadata['Abstract']}"
+                self.file_write(file_path=file_path, content=content_with_header, create_dirs=True)
+                return MCPToolResult(success=True, data={
+                    "content": metadata["Abstract"],
+                    "file_path": file_path,
+                    "url": pmc_url,
+                    "source_type": "pubmed_abstract",
+                    "pmid": pmid,
+                    "pmc_id": pmc_id
+                })
+            else:
+                return MCPToolResult(success=False, error=f"Failed to get any content for PMID: {pmid}")
             
-            if "This article is available under a" not in pmc_response.text:
-                logger.info(f"The article doesn't seem to be fully open access.")
-                logger.info(f"You can check the article availability at: {pmc_url}")
-                return f"The article doesn't seem to be fully open access." + "\n" + f"You can check the article availability at: {pmc_url}"
-            
-            # 尝试下载PDF
-            pdf_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmc_id}/pdf"
-            pdf_response = requests.get(pdf_url, headers=headers,verify=False)
-            
-            if pdf_response.status_code != 200:
-                logger.error(f"Error: Unable to download PDF (status code: {pdf_response.status_code})")
-                logger.info(f"You can try accessing the article directly at: {pmc_url}")
-                return f"Error: Unable to download PDF (status code: {pdf_response.status_code})" + "\n" + f"You can try accessing the article directly at: {pmc_url}"
-            
-            # 保存PDF文件
-            # filename = f"PMID_{pmid}_PMC_{pmc_id}.pdf"
-            # with open(filename, 'wb') as f:
-            #     f.write(pdf_response.content)
-            
-            # print(f"PDF for PMID {pmid} has been downloaded as {filename}")
-            '''
-            return MCPToolResult(success=True, data={"content": article})
         except Exception as e:
-            logger.error(e)
+            logger.error(f"Error in get_pubmed_article: {e}")
             return MCPToolResult(success=False, error=f"获取pubmed论文内容失败!{e}")
 
     def arxiv_search(self, query: str, max_results: int = 10) -> MCPToolResult:
@@ -7446,7 +11366,15 @@ Strictly follow the following format for output:
             'sortBy': 'submittedDate',
             'sortOrder': 'descending'
         }
-        response = requests.get(BASE_URL, params=params, verify=False, proxies=proxy)
+        request_timeout = int(os.environ.get("ARXIV_SEARCH_TIMEOUT_SECONDS", "30"))
+        response = requests.get(
+            BASE_URL,
+            params=params,
+            verify=False,
+            proxies=proxy,
+            timeout=request_timeout
+        )
+        response.raise_for_status()
         feed = feedparser.parse(response.content)
         papers = []
         for entry in feed.entries:
@@ -7476,101 +11404,982 @@ Strictly follow the following format for output:
     def download_pdf(self, paper_id: str, save_path: str) -> str:
         pdf_url = f"https://arxiv.org/pdf/{paper_id}.pdf"
         response = requests.get(pdf_url, verify=False, proxies=proxy)
-        output_file = f"{save_path}/{paper_id}.txt"
-        with open(output_file, 'wb') as f:
+        
+        # 确保目录存在
+        os.makedirs(save_path, exist_ok=True)
+        
+        # 先保存 PDF 文件到临时位置
+        temp_pdf_path = Path(save_path) / f"{paper_id}.pdf"
+        with open(temp_pdf_path, 'wb') as f:
             f.write(response.content)
-        return output_file
+        
+        # 提取 PDF 文本内容
+        try:
+            extracted_text = self._read_pdf_text(temp_pdf_path)
+            if not extracted_text or len(extracted_text.strip()) < 100:
+                logger.warning(f"PDF text extraction failed or content too short for {paper_id}, keeping PDF file")
+                # 如果提取失败，保留 PDF 文件
+                return str(temp_pdf_path)
+            
+            # 保存提取的文本
+            output_file = Path(save_path) / f"{paper_id}.txt"
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write(extracted_text)
+            
+            # 删除临时 PDF 文件
+            temp_pdf_path.unlink()
+            
+            logger.info(f"Successfully extracted text from arXiv paper {paper_id}")
+            return str(output_file)
+            
+        except Exception as e:
+            logger.error(f"Failed to extract text from PDF {paper_id}: {e}")
+            # 提取失败时保留 PDF 文件
+            return str(temp_pdf_path)
 
     def arxiv_read_paper(self, paper_id: str, save_path: str = "./arxiv") -> MCPToolResult:
         """Read a paper and convert it to text format.
 
         Args:
             paper_id: arXiv paper ID
-            save_path: Directory where the PDF is/will be saved
+            save_path: Directory where the PDF is/will be saved (relative to workspace)
+                      Note: Should be a directory path, not a file path
 
         Returns:
             str: The extracted text content of the paper
         """
         try:
-            txt_path = f"{save_path}/{paper_id}.txt"
-            pdf_path = f"{save_path}/{paper_id}.pdf"
+            # 将 save_path 转换为相对于 workspace_path 的绝对路径
+            # 如果 save_path 以 ./ 开头，去掉它
+            if save_path.startswith('./'):
+                save_path = save_path[2:]
+            
+            # 检查 save_path 是否错误地包含了文件名（以 .txt 或其他扩展名结尾）
+            # 如果是，提取目录部分
+            if save_path.endswith('.txt') or save_path.endswith('.pdf'):
+                logger.warning(f"save_path appears to be a file path: {save_path}, extracting directory")
+                save_path = str(Path(save_path).parent)
+            
+            # 构建完整路径（相对于 workspace）
+            full_save_path = self.workspace_path / save_path
+            
+            txt_path = full_save_path / f"{paper_id}.txt"
+            pdf_path = full_save_path / f"{paper_id}.pdf"
 
+            # 计算相对于 workspace 的文件路径（用于 document_extract）
+            relative_txt_path = str(Path(save_path) / f"{paper_id}.txt")
+            
+            # 构建 arXiv URL（用于参考文献）
+            arxiv_url = f"https://arxiv.org/abs/{paper_id}"
+            
             # 如果已经存在文本文件，直接读取
-            if os.path.exists(txt_path):
+            if txt_path.exists():
                 with open(txt_path, 'rb') as f:
                     content = f.read()
-                return MCPToolResult(success=True, data={"paper": content.decode('utf-8', errors='ignore')})
+                return MCPToolResult(success=True, data={
+                    "paper": content.decode('utf-8', errors='ignore'),
+                    "file_path": relative_txt_path,
+                    "url": arxiv_url,
+                    "source_type": "arxiv",
+                    "paper_id": paper_id
+                })
 
             # 如果存在旧的PDF文件，重命名为.txt
-            if os.path.exists(pdf_path):
-                os.rename(pdf_path, txt_path)
+            if pdf_path.exists():
+                pdf_path.rename(txt_path)
                 logger.info(f"已将arxiv论文 {paper_id} 的PDF文件重命名为.txt格式")
                 with open(txt_path, 'rb') as f:
                     content = f.read()
-                return MCPToolResult(success=True, data={"paper": content.decode('utf-8', errors='ignore')})
+                return MCPToolResult(success=True, data={
+                    "paper": content.decode('utf-8', errors='ignore'),
+                    "file_path": relative_txt_path,
+                    "url": arxiv_url,
+                    "source_type": "arxiv",
+                    "paper_id": paper_id
+                })
 
             # 下载文件（download_pdf现在会直接保存为.txt）
-            txt_path = self.download_pdf(paper_id, save_path)
-            with open(txt_path, 'rb') as f:
+            txt_path_str = self.download_pdf(paper_id, str(full_save_path))
+            with open(txt_path_str, 'rb') as f:
                 content = f.read()
-            return MCPToolResult(success=True, data={"paper": content.decode('utf-8', errors='ignore')})
+            return MCPToolResult(success=True, data={
+                "paper": content.decode('utf-8', errors='ignore'),
+                "file_path": relative_txt_path,
+                "url": arxiv_url,
+                "source_type": "arxiv",
+                "paper_id": paper_id
+            })
 
         except Exception as e:
             return MCPToolResult(success=False, error=f"获取arxiv论文内容失败!{e}")
 
-    def medrxiv_search(self, query: str, max_results: int = 10, days: int = 30) -> List[Paper]:
+    def advanced_google_scholar_search(self, query: str, author: str = None, start_year: int = None, 
+                                       end_year: int = None, num_results: int = 5) -> MCPToolResult:
         """
-        Search for papers on medRxiv by category within the last N days.
+        Search Google Scholar using advanced search filters (e.g., author, year range).
 
         Args:
-            query: Category name to search for (e.g., "cardiovascular medicine").
+            query: The search query (e.g., paper title or topic)
+            author: The author's name to filter the results (optional)
+            start_year: Start year to filter the results by publication year (optional)
+            end_year: End year to filter the results by publication year (optional)
+            num_results: The number of results to retrieve (default: 5)
+
+        Returns:
+            MCPToolResult: Standardized result format with search results
+        """
+        try:
+            search_url = "https://scholar.google.com/scholar?"
+
+            search_params = {'q': query.replace(' ', '+')}
+            if author:
+                search_params['as_auth'] = author
+            if start_year:
+                search_params['as_ylo'] = start_year
+            if end_year:
+                search_params['as_yhi'] = end_year
+
+            search_url += '&'.join([f"{key}={value}" for key, value in search_params.items()])
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            }
+
+            response = requests.get(search_url, headers=headers, proxies=proxy, timeout=5, verify=False)
+
+            if response.status_code != 200:
+                return MCPToolResult(
+                    success=False,
+                    error=f"Failed to fetch data. HTTP Status code: {response.status_code}"
+                )
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            results = []
+            count = 0
+
+            for item in soup.find_all('div', class_='gs_ri'):
+                if count >= num_results:
+                    break
+
+                title_tag = item.find('h3', class_='gs_rt')
+                title = title_tag.get_text() if title_tag else 'No title available'
+
+                link = title_tag.find('a')['href'] if title_tag and title_tag.find('a') else 'No link available'
+
+                authors_tag = item.find('div', class_='gs_a')
+                authors = authors_tag.get_text() if authors_tag else 'No authors available'
+
+                abstract_tag = item.find('div', class_='gs_rs')
+                abstract = abstract_tag.get_text() if abstract_tag else 'No abstract available'
+
+                result_data = {
+                    'Title': title,
+                    'Authors': authors,
+                    'Abstract': abstract,
+                    'URL': link
+                }
+                results.append(result_data)
+                count += 1
+
+            return MCPToolResult(
+                success=True,
+                data={
+                    "results": results,
+                    "total_results": len(results),
+                    "query": query
+                },
+                metadata={"tool_name": "advanced_google_scholar_search"}
+            )
+
+        except Exception as e:
+            logger.error(f"Advanced Google Scholar search failed: {e}")
+            return MCPToolResult(
+                success=False,
+                error=f"Search failed: {str(e)}"
+            )
+
+    def google_scholar_search(self, query: str, num_results: int = 5) -> MCPToolResult:
+        """
+        Search Google Scholar using a simple keyword query.
+
+        Args:
+            query: The search query (e.g., paper title or author)
+            num_results: The number of results to retrieve (default: 5)
+
+        Returns:
+            MCPToolResult: Standardized result format with search results
+        """
+        try:
+            search_url = f"https://scholar.google.com/scholar?q={query.replace(' ', '+')}"
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            }
+
+            response = requests.get(search_url, proxies=proxy, timeout=5, headers=headers, verify=False)
+
+            if response.status_code != 200:
+                return MCPToolResult(
+                    success=False,
+                    error=f"Failed to fetch data. HTTP Status code: {response.status_code}"
+                )
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            results = []
+            count = 0
+
+            for item in soup.find_all('div', class_='gs_ri'):
+                if count >= num_results:
+                    break
+
+                title_tag = item.find('h3', class_='gs_rt')
+                title = title_tag.get_text() if title_tag else 'No title available'
+
+                link = title_tag.find('a')['href'] if title_tag and title_tag.find('a') else 'No link available'
+
+                authors_tag = item.find('div', class_='gs_a')
+                authors = authors_tag.get_text() if authors_tag else 'No authors available'
+
+                abstract_tag = item.find('div', class_='gs_rs')
+                abstract = abstract_tag.get_text() if abstract_tag else 'No abstract available'
+
+                result_data = {
+                    'Title': title,
+                    'Authors': authors,
+                    'Abstract': abstract,
+                    'URL': link
+                }
+                results.append(result_data)
+                count += 1
+
+            return MCPToolResult(
+                success=True,
+                data={
+                    "results": results,
+                    "total_results": len(results),
+                    "query": query
+                },
+                metadata={"tool_name": "google_scholar_search"}
+            )
+
+        except Exception as e:
+            logger.error(f"Google Scholar search failed: {e}")
+            return MCPToolResult(
+                success=False,
+                error=f"Search failed: {str(e)}"
+            )
+
+    def google_scholar_get_paper(self, paper_url: str) -> MCPToolResult:
+        """
+        Download and analyze a paper from Google Scholar search results.
+        Similar to arxiv_read_paper and get_pubmed_article.
+        
+        Args:
+            paper_url: The paper URL from google_scholar_search results
+            
+        Returns:
+            MCPToolResult: Paper analysis result with file path
+        """
+        try:
+            # Generate file path for saving
+            import hashlib
+            url_hash = hashlib.md5(paper_url.encode()).hexdigest()[:8]
+            
+            # Check if URL points to a PDF file
+            is_pdf_url = paper_url.lower().endswith('.pdf') or '/pdf/' in paper_url.lower()
+            
+            if is_pdf_url:
+                # Direct PDF download
+                filename = f"google_scholar_{url_hash}.pdf"
+                file_path = self.workspace_path / "url_crawler_save_files" / filename
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                try:
+                    # Download PDF file directly
+                    import requests
+                    response = requests.get(paper_url, stream=True, timeout=30, verify=False)
+                    response.raise_for_status()
+                    
+                    # Save PDF file
+                    with open(file_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    
+                    saved_file_path = str(file_path.relative_to(self.workspace_path))
+                    paper_title = "Google Scholar Paper"
+                    
+                except Exception as e:
+                    logger.error(f"Failed to download PDF: {e}")
+                    return MCPToolResult(
+                        success=False,
+                        error=f"Failed to download PDF: {str(e)}"
+                    )
+                
+            else:
+                # Use url_crawler for web pages
+                filename = f"google_scholar_{url_hash}.txt"
+                file_path = f"url_crawler_save_files/{filename}"
+                
+                crawler_result = self.url_crawler(documents=[{
+                    "url": paper_url, 
+                    "title": "Google Scholar Paper",
+                    "file_path": file_path
+                }])
+                
+                if not crawler_result.success:
+                    return MCPToolResult(
+                        success=False,
+                        error=f"Failed to fetch paper: {crawler_result.error}"
+                    )
+                
+                # Extract content from crawler result
+                # url_crawler returns data as a list of result dicts directly
+                crawled_data = crawler_result.data if isinstance(crawler_result.data, list) else []
+                if not crawled_data:
+                    return MCPToolResult(
+                        success=False,
+                        error="No content retrieved from URL"
+                    )
+                
+                result_data = crawled_data[0]
+                
+                # Check if crawling was successful
+                if not result_data.get('success', False):
+                    return MCPToolResult(
+                        success=False,
+                        error=f"Failed to crawl URL: {result_data.get('error', 'Unknown error')}"
+                    )
+                
+                paper_title = result_data.get('title', 'Google Scholar Paper')
+                saved_file_path = result_data.get('file_path')
+                
+                if not saved_file_path:
+                    return MCPToolResult(
+                        success=False,
+                        error="File path not found in crawler result"
+                    )
+            
+            # Use document_extract to analyze the paper
+            extract_result = self.document_extract(
+                file_path=saved_file_path,
+                task_description="Analyze this academic paper from Google Scholar"
+            )
+            
+            if extract_result.success:
+                return MCPToolResult(
+                    success=True,
+                    data={
+                        "file_path": saved_file_path,
+                        "title": paper_title,
+                        "url": paper_url,
+                        "analysis": extract_result.data,
+                        "message": f"Successfully downloaded and analyzed paper from Google Scholar"
+                    },
+                    metadata={"tool_name": "google_scholar_get_paper"}
+                )
+            else:
+                # Even if analysis fails, the file is still saved
+                return MCPToolResult(
+                    success=True,
+                    data={
+                        "file_path": saved_file_path,
+                        "title": paper_title,
+                        "url": paper_url,
+                        "message": f"Paper downloaded but analysis failed: {extract_result.error}"
+                    },
+                    metadata={"tool_name": "google_scholar_get_paper"}
+                )
+                
+        except Exception as e:
+            logger.error(f"Google Scholar get paper failed: {e}")
+            return MCPToolResult(
+                success=False,
+                error=f"Failed to get paper: {str(e)}"
+            )
+
+    def scihub_search(self, query: str, num_results: int = 5) -> MCPToolResult:
+        """
+        Search for academic papers via CrossRef API (used as Sci-Hub search backend).
+        Returns paper metadata including DOI which can be used with scihub_get_paper.
+
+        Args:
+            query: Search query string (keywords, paper title, etc.)
+            num_results: Number of results to retrieve (default: 5)
+
+        Returns:
+            MCPToolResult: Standardized result format with search results including DOI
+        """
+        try:
+            url = f"https://api.crossref.org/works?query={quote(query)}&rows={num_results}"
+            response = requests.get(url, proxies=proxy, timeout=15, verify=False)
+
+            if response.status_code != 200:
+                return MCPToolResult(
+                    success=False,
+                    error=f"CrossRef API request failed: HTTP {response.status_code}"
+                )
+
+            data = response.json()
+            items = data.get('message', {}).get('items', [])
+
+            papers = []
+            for item in items:
+                try:
+                    doi = item.get('DOI', '')
+                    title_list = item.get('title', [])
+                    title = title_list[0] if title_list else 'No title available'
+                    
+                    # Extract authors
+                    author_list = item.get('author', [])
+                    authors = []
+                    for a in author_list:
+                        given = a.get('given', '')
+                        family = a.get('family', '')
+                        authors.append(f"{given} {family}".strip())
+                    authors_str = ', '.join(authors) if authors else 'No authors available'
+                    
+                    # Extract year
+                    created = item.get('created', {})
+                    date_parts = created.get('date-parts', [[]])
+                    year = str(date_parts[0][0]) if date_parts and date_parts[0] else ''
+                    
+                    # Extract URL
+                    paper_url = item.get('URL', '')
+                    
+                    # Extract journal/container
+                    container = item.get('container-title', [])
+                    journal = container[0] if container else ''
+                    
+                    # Extract abstract if available
+                    abstract = item.get('abstract', 'No abstract available')
+                    # Clean HTML tags from abstract
+                    if abstract and abstract != 'No abstract available':
+                        abstract = re.sub(r'<[^>]+>', '', abstract).strip()
+
+                    papers.append({
+                        'DOI': doi,
+                        'Title': title,
+                        'Authors': authors_str,
+                        'Year': year,
+                        'URL': paper_url,
+                        'Journal': journal,
+                        'Abstract': abstract
+                    })
+                except Exception as e:
+                    logger.warning(f"Failed to parse CrossRef item: {e}")
+                    continue
+
+            return MCPToolResult(
+                success=True,
+                data={
+                    "results": papers,
+                    "total_results": len(papers),
+                    "query": query
+                },
+                metadata={"tool_name": "scihub_search"}
+            )
+
+        except Exception as e:
+            logger.error(f"Sci-Hub search (CrossRef) failed: {e}")
+            return MCPToolResult(
+                success=False,
+                error=f"Search failed: {str(e)}"
+            )
+
+    def scihub_search_by_title(self, title: str) -> MCPToolResult:
+        """
+        Search for a specific paper by title via CrossRef, returning best match with DOI.
+
+        Args:
+            title: The paper title to search for
+
+        Returns:
+            MCPToolResult: Best matching paper with DOI
+        """
+        try:
+            url = f"https://api.crossref.org/works?query.title={quote(title)}&rows=1"
+            response = requests.get(url, proxies=proxy, timeout=15, verify=False)
+
+            if response.status_code != 200:
+                return MCPToolResult(
+                    success=False,
+                    error=f"CrossRef API request failed: HTTP {response.status_code}"
+                )
+
+            data = response.json()
+            items = data.get('message', {}).get('items', [])
+
+            if not items:
+                return MCPToolResult(
+                    success=True,
+                    data={"result": None, "message": "No matching paper found"},
+                    metadata={"tool_name": "scihub_search_by_title"}
+                )
+
+            item = items[0]
+            doi = item.get('DOI', '')
+            title_list = item.get('title', [])
+            found_title = title_list[0] if title_list else 'No title available'
+            
+            author_list = item.get('author', [])
+            authors = []
+            for a in author_list:
+                given = a.get('given', '')
+                family = a.get('family', '')
+                authors.append(f"{given} {family}".strip())
+            authors_str = ', '.join(authors) if authors else 'No authors available'
+            
+            created = item.get('created', {})
+            date_parts = created.get('date-parts', [[]])
+            year = str(date_parts[0][0]) if date_parts and date_parts[0] else ''
+            
+            paper_url = item.get('URL', '')
+            container = item.get('container-title', [])
+            journal = container[0] if container else ''
+
+            return MCPToolResult(
+                success=True,
+                data={
+                    "result": {
+                        'DOI': doi,
+                        'Title': found_title,
+                        'Authors': authors_str,
+                        'Year': year,
+                        'URL': paper_url,
+                        'Journal': journal
+                    }
+                },
+                metadata={"tool_name": "scihub_search_by_title"}
+            )
+
+        except Exception as e:
+            logger.error(f"Sci-Hub title search failed: {e}")
+            return MCPToolResult(
+                success=False,
+                error=f"Search by title failed: {str(e)}"
+            )
+
+    def scihub_get_paper(self, doi: str) -> MCPToolResult:
+        """
+        Download and analyze a paper via Sci-Hub using DOI.
+        First tries Sci-Hub mirrors for direct PDF download, then falls back to
+        CrossRef URL + url_crawler for content extraction.
+
+        Args:
+            doi: The DOI of the paper (e.g., "10.1038/nature12373")
+
+        Returns:
+            MCPToolResult: Paper analysis result with file path
+        """
+        try:
+            import hashlib
+            doi_hash = hashlib.md5(doi.encode()).hexdigest()[:8]
+            
+            # Sci-Hub mirror list (ordered by reliability)
+            scihub_mirrors = [
+                "https://sci-hub.st",
+                "https://sci-hub.ru",
+                "https://sci-hub.se",
+            ]
+            
+            pdf_downloaded = False
+            saved_file_path = None
+            
+            logger.info(f"Attempting to download paper via Sci-Hub for DOI: {doi}")
+            
+            # Try Sci-Hub mirrors for direct PDF download
+            for idx, mirror in enumerate(scihub_mirrors, 1):
+                try:
+                    logger.info(f"Trying Sci-Hub mirror {idx}/{len(scihub_mirrors)}: {mirror}")
+                    scihub_url = f"{mirror}/{doi}"
+                    
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                    }
+                    
+                    response = requests.get(scihub_url, headers=headers, proxies=proxy, timeout=30, verify=False, allow_redirects=True)
+                    
+                    if response.status_code != 200:
+                        logger.warning(f"Sci-Hub mirror {mirror} returned status code {response.status_code} for DOI {doi}")
+                        continue
+                    
+                    # Parse Sci-Hub page to find embedded PDF URL
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    
+                    # Look for PDF embed/iframe
+                    pdf_url = None
+                    embed = soup.find('embed', {'type': 'application/pdf'})
+                    if embed and embed.get('src'):
+                        pdf_url = embed['src']
+                    else:
+                        iframe = soup.find('iframe', {'id': 'pdf'})
+                        if iframe and iframe.get('src'):
+                            pdf_url = iframe['src']
+                    
+                    if not pdf_url:
+                        # Try finding direct PDF link
+                        for a_tag in soup.find_all('a', href=True):
+                            href = a_tag['href']
+                            if href.endswith('.pdf') or '/pdf/' in href:
+                                pdf_url = href
+                                break
+                    
+                    if not pdf_url:
+                        logger.warning(f"No PDF URL found in Sci-Hub page from {mirror} for DOI {doi}")
+                        continue
+                    
+                    # Normalize PDF URL
+                    if pdf_url.startswith('//'):
+                        pdf_url = 'https:' + pdf_url
+                    elif pdf_url.startswith('/'):
+                        pdf_url = mirror + pdf_url
+                    
+                    # Download PDF
+                    pdf_response = requests.get(pdf_url, headers=headers, proxies=proxy, timeout=60, verify=False, stream=True)
+                    if pdf_response.status_code == 200 and len(pdf_response.content) > 1000:
+                        # 先保存PDF到临时文件
+                        temp_pdf_filename = f"scihub_{doi_hash}.pdf"
+                        temp_pdf_path = self.workspace_path / "url_crawler_save_files" / temp_pdf_filename
+                        temp_pdf_path.parent.mkdir(parents=True, exist_ok=True)
+                        
+                        with open(temp_pdf_path, 'wb') as f:
+                            for chunk in pdf_response.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                        
+                        # 提取PDF文本内容
+                        try:
+                            extracted_text = self._read_pdf_text(temp_pdf_path)
+                            if not extracted_text or len(extracted_text.strip()) < 100:
+                                logger.warning(f"PDF text extraction failed or content too short for DOI {doi}, keeping PDF file")
+                                saved_file_path = str(temp_pdf_path.relative_to(self.workspace_path))
+                                pdf_downloaded = True
+                                logger.info(f"✅ Successfully downloaded paper via Sci-Hub ({mirror}) for DOI: {doi} (kept as PDF)")
+                                break
+                            
+                            # 保存提取的文本为TXT，添加元数据头部
+                            txt_filename = f"scihub_{doi_hash}.txt"
+                            txt_path = self.workspace_path / "url_crawler_save_files" / txt_filename
+                            
+                            # 构建带元数据的内容（与url_crawler格式一致）
+                            # 尝试从PDF文本中提取标题（取前100个字符作为标题）
+                            first_line = extracted_text.split('\n')[0].strip()
+                            paper_title = first_line[:100] if first_line else f"Paper from Sci-Hub (DOI: {doi})"
+                            
+                            # 构建完整内容
+                            txt_content = f"""Title: {paper_title}
+
+URL Source: https://doi.org/{doi}
+
+Markdown Content:
+{extracted_text}"""
+                            
+                            with open(txt_path, 'w', encoding='utf-8') as f:
+                                f.write(txt_content)
+                            
+                            # 删除临时PDF文件
+                            temp_pdf_path.unlink()
+                            
+                            saved_file_path = str(txt_path.relative_to(self.workspace_path))
+                            pdf_downloaded = True
+                            logger.info(f"✅ Successfully downloaded and extracted paper via Sci-Hub ({mirror}) for DOI: {doi}")
+                            break
+                            
+                        except Exception as e:
+                            logger.error(f"Failed to extract text from Sci-Hub PDF for DOI {doi}: {e}")
+                            # 提取失败时保留PDF文件
+                            saved_file_path = str(temp_pdf_path.relative_to(self.workspace_path))
+                            pdf_downloaded = True
+                            logger.info(f"✅ Successfully downloaded paper via Sci-Hub ({mirror}) for DOI: {doi} (kept as PDF due to extraction error)")
+                            break
+                        
+                except Exception as e:
+                    logger.warning(f"Sci-Hub mirror {mirror} failed for DOI {doi}: {e}")
+                    continue
+            
+            # Fallback: use CrossRef URL + url_crawler
+            if not pdf_downloaded:
+                logger.info(f"Sci-Hub download failed, falling back to CrossRef URL for DOI: {doi}")
+                crossref_url = f"https://doi.org/{doi}"
+                filename = f"scihub_{doi_hash}.txt"
+                file_path = f"url_crawler_save_files/{filename}"
+                
+                crawler_result = self.url_crawler(documents=[{
+                    "url": crossref_url,
+                    "title": f"Sci-Hub Paper (DOI: {doi})",
+                    "file_path": file_path
+                }])
+                
+                if not crawler_result.success:
+                    return MCPToolResult(
+                        success=False,
+                        error=f"Failed to fetch paper via both Sci-Hub and DOI redirect: {crawler_result.error}"
+                    )
+                
+                crawled_data = crawler_result.data if isinstance(crawler_result.data, list) else []
+                if not crawled_data:
+                    return MCPToolResult(
+                        success=False,
+                        error="No content retrieved from DOI URL"
+                    )
+                
+                result_data = crawled_data[0]
+                if not result_data.get('success', False):
+                    return MCPToolResult(
+                        success=False,
+                        error=f"Failed to crawl DOI URL: {result_data.get('error', 'Unknown error')}"
+                    )
+                
+                saved_file_path = result_data.get('file_path')
+                if not saved_file_path:
+                    return MCPToolResult(
+                        success=False,
+                        error="File path not found in crawler result"
+                    )
+            
+            # Use document_extract to analyze the paper
+            extract_result = self.document_extract(
+                tasks=[{"file_path": saved_file_path, "task": "Analyze this academic paper obtained via Sci-Hub"}]
+            )
+            
+            paper_url = f"https://doi.org/{doi}"
+            
+            if extract_result.success:
+                return MCPToolResult(
+                    success=True,
+                    data={
+                        "file_path": saved_file_path,
+                        "doi": doi,
+                        "url": paper_url,
+                        "analysis": extract_result.data,
+                        "message": f"Successfully downloaded and analyzed paper via Sci-Hub (DOI: {doi})"
+                    },
+                    metadata={"tool_name": "scihub_get_paper"}
+                )
+            else:
+                return MCPToolResult(
+                    success=True,
+                    data={
+                        "file_path": saved_file_path,
+                        "doi": doi,
+                        "url": paper_url,
+                        "message": f"Paper downloaded but analysis failed: {extract_result.error}"
+                    },
+                    metadata={"tool_name": "scihub_get_paper"}
+                )
+
+        except Exception as e:
+            logger.error(f"Sci-Hub get paper failed: {e}")
+            return MCPToolResult(
+                success=False,
+                error=f"Failed to get paper via Sci-Hub: {str(e)}"
+            )
+
+    def springer_search(self, query: str, max_results: int = 10, subject: str = None, 
+                       start_year: int = None, end_year: int = None) -> MCPToolResult:
+        """
+        Search for papers on Springer Nature using their Open Access API.
+        
+        Args:
+            query: Search query string (keywords, title, etc.)
+            max_results: Maximum number of papers to return (default: 10)
+            subject: Filter by subject area (optional)
+            start_year: Filter by start year (optional)
+            end_year: Filter by end year (optional)
+            
+        Returns:
+            MCPToolResult with list of Paper objects
+        """
+        try:
+            BASE_URL = "https://api.springernature.com/openaccess/json"
+            
+            params = {
+                'q': query,
+                'p': max_results,
+                's': 1
+            }
+            
+            if subject:
+                params['q'] = f"{params['q']} subject:{subject}"
+            
+            if start_year and end_year:
+                params['q'] = f"{params['q']} year:{start_year}-{end_year}"
+            elif start_year:
+                params['q'] = f"{params['q']} year:{start_year}-{datetime.now().year}"
+            
+            response = requests.get(BASE_URL, params=params, verify=False, proxies=proxy, timeout=30)
+            
+            if response.status_code != 200:
+                return MCPToolResult(success=False, error=f"Springer API请求失败: HTTP {response.status_code}")
+            
+            data = response.json()
+            records = data.get('records', [])
+            
+            papers = []
+            for record in records:
+                try:
+                    pub_date_str = record.get('publicationDate', '')
+                    try:
+                        pub_date = datetime.strptime(pub_date_str, '%Y-%m-%d')
+                    except:
+                        try:
+                            pub_date = datetime.strptime(pub_date_str, '%Y-%m')
+                        except:
+                            pub_date = datetime.now()
+                    
+                    creators = record.get('creators', [])
+                    authors = [creator.get('creator', '') for creator in creators if isinstance(creator, dict)]
+                    
+                    doi = record.get('doi', '')
+                    paper_id = doi if doi else record.get('identifier', '')
+                    
+                    url = record.get('url', [])
+                    paper_url = url[0].get('value', '') if url and isinstance(url, list) and len(url) > 0 else f"https://doi.org/{doi}"
+                    
+                    pdf_url = ''
+                    for url_item in url:
+                        if isinstance(url_item, dict) and url_item.get('format', '') == 'pdf':
+                            pdf_url = url_item.get('value', '')
+                            break
+                    
+                    abstract = record.get('abstract', '')
+                    
+                    subjects = record.get('subjects', [])
+                    categories = [subj.get('subject', '') for subj in subjects if isinstance(subj, dict)]
+                    
+                    paper = Paper(
+                        paper_id=paper_id,
+                        title=record.get('title', ''),
+                        authors=authors,
+                        abstract=abstract,
+                        doi=doi,
+                        published_date=pub_date,
+                        pdf_url=pdf_url,
+                        url=paper_url,
+                        source='springer',
+                        categories=categories,
+                        keywords=[],
+                        extra={
+                            'publisher': record.get('publisher', ''),
+                            'publicationType': record.get('publicationType', ''),
+                            'issn': record.get('issn', ''),
+                            'isbn': record.get('isbn', ''),
+                            'volume': record.get('volume', ''),
+                            'number': record.get('number', ''),
+                            'startingPage': record.get('startingPage', ''),
+                            'endingPage': record.get('endingPage', '')
+                        }
+                    )
+                    papers.append(paper.to_dict())
+                    
+                except Exception as e:
+                    logger.warning(f"解析Springer论文记录失败: {e}")
+                    continue
+            
+            return MCPToolResult(success=True, data={"papers": papers, "total": len(papers)})
+            
+        except Exception as e:
+            logger.error(f"Springer搜索失败: {e}")
+            return MCPToolResult(success=False, error=f"Springer搜索失败: {e}")
+
+    # DISABLED: Springer API currently unavailable
+    # def springer_get_article(self, doi: str) -> MCPToolResult:
+    #     """
+    #     Get full article details from Springer Nature by DOI.
+    #     
+    #     Args:
+    #         doi: Digital Object Identifier of the paper
+    #         
+    #     Returns:
+    #         MCPToolResult with article content and metadata
+    #     """
+    #     pass
+
+    def medrxiv_search(self, query: str, max_results: int = 10, days: int = 30) -> List[Paper]:
+        """
+        Search for papers on medRxiv within the last N days.
+        Supports keyword matching in title/abstract and category filtering.
+
+        Args:
+            query: Search query - can be keywords (e.g., "COVID-19 vaccine") or 
+                   category name (e.g., "infectious diseases").
             max_results: Maximum number of papers to return.
             days: Number of days to look back for papers.
 
         Returns:
-            List of Paper objects matching the category within the specified date range.
+            List of Paper objects matching the query within the specified date range.
         """
         # Calculate date range: last N days
         try:
+            # 正确的API地址: api.biorxiv.org (不是 api.medrxiv.org)
+            BASE_URL = "https://api.biorxiv.org/pubs/medrxiv"
             end_date = datetime.now().strftime('%Y-%m-%d')
             start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
 
-            # Format category: lowercase and replace spaces with underscores
-            category = query.lower().replace(' ', '_')
+            # 准备搜索关键词（用于客户端过滤）
+            query_lower = query.lower().strip()
+            query_keywords = [kw.strip() for kw in query_lower.split() if len(kw.strip()) > 2]
+            # 也准备类别格式用于匹配
+            category_format = query_lower.replace(' ', '_')
 
             papers = []
             cursor = 0
-            while len(papers) < max_results:
-                url = f"{self.BASE_URL}/{start_date}/{end_date}/{cursor}"
-                if category:
-                    url += f"?category={category}"
+            max_api_pages = 10  # 最多请求10页（1000篇）避免无限循环
+            pages_fetched = 0
+            
+            while len(papers) < max_results and pages_fetched < max_api_pages:
+                # API格式: /pubs/medrxiv/{start}/{end}/{cursor}
+                url = f"{BASE_URL}/{start_date}/{end_date}/{cursor}"
+                logger.info(f"medRxiv API request: {url}")
 
                 tries = 0
+                fetched_this_page = False
                 while tries < self.max_retries:
                     try:
                         response = self.session.get(url, timeout=self.timeout, verify=False, proxies=proxy)
                         response.raise_for_status()
                         data = response.json()
                         collection = data.get('collection', [])
+                        
                         for item in collection:
-                            date = datetime.strptime(item['date'], '%Y-%m-%d')
-                            papers.append(Paper(
-                                paper_id=item['doi'],
-                                title=item['title'],
-                                authors=item['authors'].split('; '),
-                                abstract=item['abstract'],
-                                url=f"https://www.medrxiv.org/content/{item['doi']}v{item.get('version', '1')}",
-                                pdf_url=f"https://www.medrxiv.org/content/{item['doi']}v{item.get('version', '1')}.full.pdf",
-                                published_date=date,
-                                updated_date=date,
-                                source="medrxiv",
-                                categories=[item['category']],
-                                keywords=[],
-                                doi=item['doi']
-                            ).to_dict())
+                            # 客户端过滤：匹配类别或关键词
+                            item_category = item.get('category', '').lower().replace(' ', '_')
+                            item_title = item.get('title', '').lower()
+                            item_abstract = item.get('abstract', '').lower()
+                            
+                            # 匹配条件：类别匹配 OR 所有关键词出现在标题/摘要中
+                            category_match = category_format and category_format in item_category
+                            keyword_match = query_keywords and all(
+                                kw in item_title or kw in item_abstract 
+                                for kw in query_keywords
+                            )
+                            
+                            if category_match or keyword_match:
+                                date = datetime.strptime(item['date'], '%Y-%m-%d')
+                                papers.append(Paper(
+                                    paper_id=item['doi'],
+                                    title=item['title'],
+                                    authors=item['authors'].split('; '),
+                                    abstract=item['abstract'],
+                                    url=f"https://www.medrxiv.org/content/{item['doi']}v{item.get('version', '1')}",
+                                    pdf_url=f"https://www.medrxiv.org/content/{item['doi']}v{item.get('version', '1')}.full.pdf",
+                                    published_date=date,
+                                    updated_date=date,
+                                    source="medrxiv",
+                                    categories=[item.get('category', '')],
+                                    keywords=[],
+                                    doi=item['doi']
+                                ).to_dict())
+                                
+                                if len(papers) >= max_results:
+                                    break
+                        
+                        fetched_this_page = True
                         if len(collection) < 100:
-                            break  # No more results
-                        cursor += 100
+                            pages_fetched = max_api_pages  # 没有更多结果了
+                        else:
+                            cursor += 100
                         break  # Exit retry loop on success
                     except requests.exceptions.RequestException as e:
                         tries += 1
@@ -7578,23 +12387,26 @@ Strictly follow the following format for output:
                             logger.error(f"Failed to connect to medRxiv API after {self.max_retries} attempts: {e}")
                             break
                         logger.error(f"Attempt {tries} failed, retrying...")
-                else:
-                    continue
-                break
+                
+                pages_fetched += 1
+                if not fetched_this_page:
+                    break  # API请求失败，停止分页
+            
+            logger.info(f"medRxiv search found {len(papers)} papers for query '{query}' in {pages_fetched} pages")
             return MCPToolResult(success=True, data={"paper": papers})
         except Exception as e:
             return MCPToolResult(success=False, error=f"获取medrxiv论文内容失败!{e}")
 
     def medrxiv_download_pdf(self, paper_id: str, save_path: str) -> str:
         """
-        Download a PDF for a given paper ID from medRxiv.
+        Download a PDF for a given paper ID from medRxiv and extract text.
 
         Args:
             paper_id: The DOI of the paper.
-            save_path: Directory to save the PDF.
+            save_path: Directory to save the text file (relative to workspace).
 
         Returns:
-            Path to the downloaded PDF file.
+            Path to the text file (relative to workspace).
         """
         if not paper_id:
             raise ValueError("Invalid paper_id: paper_id is empty")
@@ -7603,17 +12415,36 @@ Strictly follow the following format for output:
         tries = 0
         while tries < self.max_retries:
             try:
-                # Add User-Agent to avoid potential 403 errors
                 headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                 }
                 response = self.session.get(pdf_url, timeout=self.timeout, headers=headers, verify=False, proxies=proxy)
                 response.raise_for_status()
-                os.makedirs(save_path, exist_ok=True)
-                output_file = f"{save_path}/{paper_id.replace('/', '_')}.txt"
-                with open(output_file, 'wb') as f:
+                
+                # 创建目录
+                os.makedirs(self.workspace_path / save_path, exist_ok=True)
+                
+                # 先保存PDF到临时文件
+                temp_pdf_path = self.workspace_path / save_path / f"{paper_id.replace('/', '_')}_temp.pdf"
+                with open(temp_pdf_path, 'wb') as f:
                     f.write(response.content)
-                logger.info(f"已将medrxiv论文 {paper_id} 直接保存为.txt格式")
+                
+                # 提取PDF文本
+                extracted_text = self._read_pdf_text(temp_pdf_path)
+                
+                # 删除临时PDF
+                if temp_pdf_path.exists():
+                    temp_pdf_path.unlink()
+                
+                if not extracted_text or len(extracted_text.strip()) < 100:
+                    raise Exception("PDF text extraction failed or content too short")
+                
+                # 保存为文本文件
+                output_file = f"{save_path}/{paper_id.replace('/', '_')}.txt"
+                with open(self.workspace_path / output_file, 'w', encoding='utf-8') as f:
+                    f.write(extracted_text)
+                    
+                logger.info(f"Successfully extracted text from medRxiv PDF: {paper_id}")
                 return output_file
             except requests.exceptions.RequestException as e:
                 tries += 1
@@ -7627,7 +12458,7 @@ Strictly follow the following format for output:
 
         Args:
             paper_id: medRxiv DOI
-            save_path: Directory where the PDF is/will be saved
+            save_path: Directory where the PDF is/will be saved (relative to workspace)
 
         Returns:
             MCPToolResult: The extracted text content of the paper
@@ -7635,59 +12466,46 @@ Strictly follow the following format for output:
         try:
             txt_path = f"{save_path}/{paper_id.replace('/', '_')}.txt"
             pdf_path = f"{save_path}/{paper_id.replace('/', '_')}.pdf"
+            
+            # 使用workspace_path检查文件
+            full_txt_path = self.workspace_path / txt_path
+            full_pdf_path = self.workspace_path / pdf_path
 
             # 如果已经存在文本文件，直接读取
-            if os.path.exists(txt_path):
-                with open(txt_path, 'rb') as f:
+            if full_txt_path.exists():
+                with open(full_txt_path, 'rb') as f:
                     content = f.read()
-                return MCPToolResult(success=True, data={"paper": content.decode('utf-8', errors='ignore')})
+                return MCPToolResult(success=True, data={
+                    "paper": content.decode('utf-8', errors='ignore'),
+                    "file_path": txt_path,
+                    "source_type": "medrxiv"
+                })
 
             # 如果存在旧的PDF文件，重命名为.txt
-            if os.path.exists(pdf_path):
-                os.rename(pdf_path, txt_path)
+            if full_pdf_path.exists():
+                full_pdf_path.rename(full_txt_path)
                 logger.info(f"已将medrxiv论文 {paper_id} 的PDF文件重命名为.txt格式")
-                with open(txt_path, 'rb') as f:
+                with open(full_txt_path, 'rb') as f:
                     content = f.read()
-                return MCPToolResult(success=True, data={"paper": content.decode('utf-8', errors='ignore')})
+                return MCPToolResult(success=True, data={
+                    "paper": content.decode('utf-8', errors='ignore'),
+                    "file_path": txt_path,
+                    "source_type": "medrxiv"
+                })
 
-            # 下载文件（medrxiv_download_pdf现在会直接保存为.txt）
+            # 下载文件
             txt_path = self.medrxiv_download_pdf(paper_id, save_path)
-            with open(txt_path, 'rb') as f:
+            with open(self.workspace_path / txt_path, 'rb') as f:
                 content = f.read()
-            return MCPToolResult(success=True, data={"paper": content.decode('utf-8', errors='ignore')})
+            return MCPToolResult(success=True, data={
+                "paper": content.decode('utf-8', errors='ignore'),
+                "file_path": txt_path,
+                "source_type": "medrxiv"
+            })
 
         except Exception as e:
             return MCPToolResult(success=False, error=f"获取medrxiv论文内容失败!{e}")
 
-
-def normalize_company(param_name: str):
-    def decorator(func):
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            response = await func(*args, **kwargs)
-            if response.get('statusCode') == 2:
-                sig = inspect.signature(func)
-                params = list(sig.parameters.keys())
-                if param_name in params:
-                    param_index = params.index(param_name)
-                    if kwargs.get(param_name):
-                        company_name = kwargs.get(param_name)
-                    else:
-                        args = list(args)
-                        company_name = args[param_index]
-                    n_company_name = await normalize_company_name(company_name)
-                    if n_company_name and company_name != n_company_name:
-                        if kwargs.get(param_name):
-                            kwargs[param_name] = n_company_name
-                        else:
-                            args[param_index] = n_company_name
-                            args = tuple(args)
-                        return await func(*args, **kwargs)
-            return response
-
-        return wrapper
-
-    return decorator
 
 
 def generate_pubmed_search_url(term=None, title=None, author=None, journal=None,
@@ -7891,6 +12709,53 @@ MCP_TOOL_SCHEMAS = {
         }
     },
 
+    "rag_document_saver": {
+        "name": "rag_document_saver",
+        "description": "Save RAG documents using RAG content and metadata. Similar to url_crawler for web pages. SIMPLE USAGE: Just call rag_document_saver() with no arguments after search_rag_knowledge - it automatically saves all documents from the last search.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "documents": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "description": "Document content from RAG response"
+                            },
+                            "file_path": {
+                                "type": "string",
+                                "description": "Optional local save path"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Document title"
+                            },
+                            "file_id": {
+                                "type": "string",
+                                "description": "File ID"
+                            }
+                        },
+                        "required": []
+                    },
+                    "description": "Optional list of documents to save. If not provided, uses cached result from last search_rag_knowledge."
+                },
+                "save_directory": {
+                    "type": "string",
+                    "default": "rag_downloads/research",
+                    "description": "Directory to save files (relative to workspace)"
+                },
+                "max_workers": {
+                    "type": "integer",
+                    "default": 10,
+                    "description": "Maximum concurrent saves"
+                }
+            },
+            "required": []
+        }
+    },
+
     "concat_section_files": {
         "name": "concat_section_files",
         "description": "Concatenate the content of the saved section files into a single file",
@@ -7959,6 +12824,11 @@ MCP_TOOL_SCHEMAS = {
                     "type": "integer",
                     "default": 2000,
                     "description": "Maximum tokens for the AI response"
+                },
+                "reasoning_text": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Your reasoning process text explaining how you analyzed the research materials and why you generated this specific outline structure. This text will be displayed to the user before the outline. Write it in the same language as the user's query. Example: '基于提供的研究资料，我分析了关于[主题]的多个维度，包括[维度1]、[维度2]等。结合用户的查询需求，我将为您撰写一篇综合研究报告，大纲结构如下：'"
                 }
             },
             "required": ["key_files", "outline"]
@@ -7991,7 +12861,7 @@ MCP_TOOL_SCHEMAS = {
                 },
                 "model": {
                     "type": "string",
-                    "default": "gpt-4o-mini",
+                    "default": "pangu_auto",
                     "description": "AI model to use for generating answers"
                 },
                 "temperature": {
@@ -8646,6 +13516,32 @@ MCP_TOOL_SCHEMAS = {
             "required": []
         }
     },
+    "search_rag_knowledge": {
+        "name": "search_rag_knowledge",
+        "description": "Search the RAG knowledge base for relevant documents and information. Use this tool to retrieve context from the organization's knowledge repository.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "Search query content - can be a question, keywords, or natural language query"
+                },
+                "repo_id": {
+                    "type": "string",
+                    "description": "Repository ID to search in. IMPORTANT: To use the default repository, completely omit this parameter from your function call - do NOT pass empty string, 'default', or any placeholder value. Only provide this parameter if you have a specific repository UUID to use."
+                },
+                "page_num": {
+                    "type": "integer",
+                    "description": "Page number for pagination (default: 1)"
+                },
+                "page_size": {
+                    "type": "integer",
+                    "description": "Number of results per page (optional, uses default from config if not provided)"
+                }
+            },
+            "required": ["content"]
+        }
+    },
     "get_pubmed_article": {
         "name": "get_pubmed_article",
         "description": "Obtain articles of biology on PubMed via PMID. Before calling this function, first use search_key_words or search_advanced to obtain the article's PMID.",
@@ -8738,6 +13634,159 @@ MCP_TOOL_SCHEMAS = {
             "required": ["paper_id"]
         }
     },
+    "google_scholar_search": {
+        "name": "google_scholar_search",
+        "description": "Search Google Scholar for academic papers using a simple keyword query. Returns paper titles, authors, abstracts and URLs. Covers all academic disciplines. Use this for broad academic search across all fields.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query string (keywords, paper title, etc.), only supports english"
+                },
+                "num_results": {
+                    "type": "integer",
+                    "description": "Number of results to retrieve (default: 5)"
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    "advanced_google_scholar_search": {
+        "name": "advanced_google_scholar_search",
+        "description": "Search Google Scholar with advanced filters including author name and year range. Returns paper titles, authors, abstracts and URLs. Use this when you need to filter by specific author or publication year range.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query string (keywords, paper title, etc.), only supports english"
+                },
+                "author": {
+                    "type": "string",
+                    "description": "Author name to filter results (optional)"
+                },
+                "start_year": {
+                    "type": "integer",
+                    "description": "Start year to filter by publication year (optional)"
+                },
+                "end_year": {
+                    "type": "integer",
+                    "description": "End year to filter by publication year (optional)"
+                },
+                "num_results": {
+                    "type": "integer",
+                    "description": "Number of results to retrieve (default: 5)"
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    "google_scholar_get_paper": {
+        "name": "google_scholar_get_paper",
+        "description": "Download and analyze a paper from Google Scholar search results. Similar to arxiv_read_paper and get_pubmed_article. Use this after google_scholar_search to get full paper content for analysis. The paper will be downloaded, saved to workspace, and analyzed automatically.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "paper_url": {
+                    "type": "string",
+                    "description": "The paper URL from google_scholar_search results"
+                }
+            },
+            "required": ["paper_url"]
+        }
+    },
+    "scihub_search": {
+        "name": "scihub_search",
+        "description": "Search for academic papers via CrossRef API (Sci-Hub search backend). Returns paper metadata including DOI, title, authors, year, journal, and abstract. The DOI can then be used with scihub_get_paper to download full paper content via Sci-Hub. Covers all academic disciplines with comprehensive DOI-based metadata.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query string (keywords, paper title, etc.)"
+                },
+                "num_results": {
+                    "type": "integer",
+                    "description": "Number of results to retrieve (default: 5)"
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    "scihub_search_by_title": {
+        "name": "scihub_search_by_title",
+        "description": "Search for a specific paper by exact title via CrossRef, returning the best match with DOI. Use this when you have a known paper title and need to find its DOI for downloading via scihub_get_paper.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "The exact paper title to search for"
+                }
+            },
+            "required": ["title"]
+        }
+    },
+    "scihub_get_paper": {
+        "name": "scihub_get_paper",
+        "description": "Download and analyze a paper via Sci-Hub using its DOI. Attempts to download PDF from Sci-Hub mirrors first, then falls back to DOI redirect + content extraction. The paper will be saved to workspace and analyzed automatically. Use this after scihub_search to get full paper content.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "doi": {
+                    "type": "string",
+                    "description": "The DOI of the paper (e.g., '10.1038/nature12373')"
+                }
+            },
+            "required": ["doi"]
+        }
+    },
+    # DISABLED: Springer API currently unavailable
+    # "springer_search": {
+    #     "name": "springer_search",
+    #     "description": "Search for open access papers on Springer Nature across multiple disciplines. Returns metadata of papers including DOI, PDF links, and abstracts. Only searches open access content. Supports English queries only.",
+    #     "inputSchema": {
+    #         "type": "object",
+    #         "properties": {
+    #             "query": {
+    #                 "type": "string",
+    #                 "description": "Search query string (keywords, title, etc.), only supports English"
+    #             },
+    #             "max_results": {
+    #                 "type": "integer",
+    #                 "description": "Maximum number of papers to return (default: 10)"
+    #             },
+    #             "subject": {
+    #                 "type": "string",
+    #                 "description": "Filter by subject area (e.g., 'Computer Science', 'Earth Sciences', 'Life Sciences', 'Medicine', 'Physics', 'Chemistry', 'Mathematics', 'Engineering')"
+    #             },
+    #             "start_year": {
+    #                 "type": "integer",
+    #                 "description": "Filter by start year (e.g., 2020)"
+    #             },
+    #             "end_year": {
+    #                 "type": "integer",
+    #                 "description": "Filter by end year (e.g., 2024)"
+    #             }
+    #         },
+    #         "required": ["query"]
+    #     }
+    # },
+    # "springer_get_article": {
+    #     "name": "springer_get_article",
+    #     "description": "Get full article details from Springer Nature by DOI. Returns article content, metadata, and PDF link if available. Before calling this function, first use springer_search to obtain the article's DOI.",
+    #     "inputSchema": {
+    #         "type": "object",
+    #         "properties": {
+    #             "doi": {
+    #                 "type": "string",
+    #                 "description": "Digital Object Identifier (DOI) of the paper"
+    #             }
+    #         },
+    #         "required": ["doi"]
+    #     }
+    # },
     "file_stats": {
         "name": "file_stats",
         "description": "Get comprehensive file statistics without reading full content - perfect for deciding reading strategy",

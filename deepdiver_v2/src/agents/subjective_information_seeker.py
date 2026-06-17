@@ -1,10 +1,12 @@
-# Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright (c) 2026 South China Sea Institute of Oceanology, Chinese Academy of Sciences (SCSIO, CAS). All rights reserved.
 import json
 from typing import Dict, Any, List
 import time
 import requests
 import os
 from .base_agent import BaseAgent, AgentConfig, AgentResponse, TaskInput
+from config.logging_config import get_logger
+logger = get_logger()
 
 
 
@@ -16,21 +18,188 @@ class InformationSeekerAgent(BaseAgent):
     thinks interleaved (reasoning -> action -> reasoning -> action),
     uses MCP tools to gather information, and returns structured results.
     """
-    
+
     def __init__(self, config: AgentConfig = None, shared_mcp_client=None):
         # Set default agent name if not specified
         if config is None:
             config = AgentConfig(agent_name="InformationSeekerAgent")
         elif config.agent_name == "base_agent":
             config.agent_name = "InformationSeekerAgent"
-            
+
         super().__init__(config, shared_mcp_client)
+
+    def set_cancellation_token(self, cancellation_token):
+        """
+        Set the cancellation token for this agent
+        设置此代理的取消令牌
+
+        Args:
+            cancellation_token: threading.Event object that will be set when task should be cancelled
+        """
+        self._cancellation_token = cancellation_token
+
+    def _check_cancellation(self) -> bool:
+        """
+        Check if task has been cancelled
+        检查任务是否已被取消
+
+        Returns:
+            True if task should be cancelled, False otherwise
+        """
+        if self._cancellation_token and self._cancellation_token.is_set():
+            self.logger.info("InformationSeekerAgent task cancellation detected")
+            return True
+        return False
 
     def _build_system_prompt(self) -> str:
         """Build the system prompt for the ReAct agent"""
         tool_schemas_str = json.dumps(self.tool_schemas, ensure_ascii=False)
-        system_prompt_template = """You are an Information Seeker Agent that follows the ReAct pattern (Reasoning + Acting).
-        
+
+        # Read search source preferences from environment variables
+        use_websearch = os.environ.get('SEARCH_SOURCE_WEBSEARCH', 'True').lower() == 'true'
+        use_pubmed = os.environ.get('SEARCH_SOURCE_PUBMED', 'True').lower() == 'true'
+        use_arxiv = os.environ.get('SEARCH_SOURCE_ARXIV', 'True').lower() == 'true'
+        use_google_scholar = os.environ.get('SEARCH_SOURCE_GOOGLE_SCHOLAR', 'True').lower() == 'true'
+        use_scihub = os.environ.get('SEARCH_SOURCE_SCIHUB', 'True').lower() == 'true'
+        use_rag = os.environ.get('SEARCH_SOURCE_RAG', 'True').lower() == 'true'
+        # use_springer = os.environ.get('SEARCH_SOURCE_SPRINGER', 'True').lower() == 'true'  # DISABLED
+
+        # Get all available tools from MCP
+        # Tool schemas have structure: {'type': 'function', 'function': {'name': '...', ...}}
+        available_tools = []
+        for tool in self.tool_schemas:
+            if isinstance(tool, dict):
+                if 'function' in tool and isinstance(tool['function'], dict) and 'name' in tool['function']:
+                    available_tools.append(tool['function']['name'])
+                elif 'name' in tool:
+                    available_tools.append(tool['name'])
+
+        # Define tool category patterns (only need to maintain this mapping when adding new sources)
+        tool_category_patterns = {
+            'websearch': ['batch_web_search', 'web_search'],
+            'pubmed': ['pubmed', 'medrxiv'],
+            'arxiv': ['arxiv'],
+            'google_scholar': ['google_scholar', 'scholar'],
+            'scihub': ['scihub'],
+			'rag': ['search_rag_knowledge', 'rag_knowledge'],
+            # 'springer': ['springer']  # DISABLED
+        }
+
+        # Dynamically filter tools based on environment variables
+        enabled_tools = []
+        disabled_tools = []
+
+        # Log environment variable values for debugging
+        logger.info(f"[SEARCH_SOURCE_DEBUG] WebSearch={use_websearch}, PubMed={use_pubmed}, arXiv={use_arxiv}, GoogleScholar={use_google_scholar}, SciHub={use_scihub}, RAG={use_rag}")
+        logger.info(f"[SEARCH_SOURCE_DEBUG] Available tools from MCP: {available_tools}")
+
+        for tool_name in available_tools:
+            tool_lower = tool_name.lower()
+            is_enabled = False
+
+            # Check if tool belongs to any enabled category
+            if use_websearch and any(pattern in tool_lower for pattern in tool_category_patterns['websearch']):
+                is_enabled = True
+            elif use_pubmed and any(pattern in tool_lower for pattern in tool_category_patterns['pubmed']):
+                is_enabled = True
+            elif use_arxiv and any(pattern in tool_lower for pattern in tool_category_patterns['arxiv']):
+                is_enabled = True
+            elif use_google_scholar and any(pattern in tool_lower for pattern in tool_category_patterns['google_scholar']):
+                is_enabled = True
+            elif use_scihub and any(pattern in tool_lower for pattern in tool_category_patterns['scihub']):
+                is_enabled = True
+            elif use_rag and any(pattern in tool_lower for pattern in tool_category_patterns['rag']):
+                is_enabled = True
+                logger.info(f"[SEARCH_SOURCE_DEBUG] Tool '{tool_name}' matched RAG pattern and is_enabled={is_enabled}")
+            # elif use_springer and any(pattern in tool_lower for pattern in tool_category_patterns['springer']):
+            #     is_enabled = True
+            #     logger.info(f"[SEARCH_SOURCE_DEBUG] Tool '{tool_name}' matched Springer pattern and is_enabled={is_enabled}")
+
+            # Categorize tool
+            if any(pattern in tool_lower for pattern in tool_category_patterns['websearch'] + tool_category_patterns['pubmed'] + tool_category_patterns['arxiv'] + tool_category_patterns['google_scholar'] + tool_category_patterns['scihub'] + tool_category_patterns['rag']):
+                if is_enabled:
+                    enabled_tools.append(tool_name)
+                else:
+                    disabled_tools.append(tool_name)
+
+        logger.info(f"[SEARCH_SOURCE_DEBUG] Enabled tools: {enabled_tools}")
+        logger.info(f"[SEARCH_SOURCE_DEBUG] Disabled tools: {disabled_tools}")
+
+        # Build search source guidance message with priority strategy
+        search_source_guidance = ""
+        if enabled_tools:
+            # Check if RAG is enabled
+            has_rag = any('rag' in tool.lower() or 'search_rag_knowledge' in tool.lower() for tool in enabled_tools)
+            # Check if other search sources are enabled (only check actual search tools, not document processing tools)
+            search_tool_patterns = tool_category_patterns['websearch'] + tool_category_patterns['pubmed'] + tool_category_patterns['arxiv'] + tool_category_patterns['google_scholar']
+            has_other_sources = any(
+                tool for tool in enabled_tools
+                if any(pattern in tool.lower() for pattern in search_tool_patterns)
+            )
+            # Categorize tools by type
+            api_tools = [t for t in enabled_tools if any(p in t.lower() for p in ['arxiv', 'pubmed', 'medrxiv', 'google_scholar', 'scholar', 'scihub'])]
+            web_tools = [t for t in enabled_tools if any(p in t.lower() for p in ['web_search', 'batch_web'])]
+            other_tools = [t for t in enabled_tools if t not in api_tools and t not in web_tools]
+
+            # Build concise search source guidance
+            available_tools = []
+            if api_tools:
+                available_tools.extend(api_tools)
+            if web_tools:
+                available_tools.extend(web_tools)
+
+            if available_tools:
+                search_source_guidance = f"\n**Available Search Tools**: {', '.join(available_tools)}\n"
+                search_source_guidance += "**Quick Guide**: Use academic APIs (arxiv_search, pubmed_search, etc.) for papers; use batch_web_search for general content.\n"
+            else:
+                search_source_guidance = ""
+                search_source_guidance = f"\n\n**📚 AVAILABLE SEARCH TOOLS:**\n"
+                search_source_guidance += f"You have access to the following search tools: **{', '.join(enabled_tools)}**\n"
+                search_source_guidance += f"These tools are fully functional and ready to use. Focus on using these tools effectively to gather comprehensive information.\n"
+                # Dynamic search strategy based on available tools
+            if has_rag and has_other_sources:
+                # Multiple sources available - require comprehensive strategy
+                search_source_guidance += f"\n**CRITICAL - COMPREHENSIVE SEARCH STRATEGY (Multiple Sources Available):**\n"
+                search_source_guidance += f"- **MANDATORY:** You MUST use MULTIPLE search sources to gather comprehensive information\n"
+                search_source_guidance += f"- **RAG Knowledge Base:** ALWAYS call RAG multiple times (3-5 times minimum) with detailed, precise query terms from different angles\n"
+                search_source_guidance += f"- **Other Search Tools:** Use WebSearch, PubMed, arXiv, Springer as appropriate\n"
+                search_source_guidance += f"- **INTEGRATION REQUIREMENT:** Combine results from RAG AND other search sources, cross-reference findings\n"
+            elif has_rag and not has_other_sources:
+            # Only RAG available - focus on RAG optimization
+                search_source_guidance += f"\n**CRITICAL - RAG-FOCUSED SEARCH STRATEGY (RAG Only Mode):**\n"
+                search_source_guidance += f"- **MANDATORY:** Call RAG multiple times (3-5 times minimum) with different query formulations\n"
+                search_source_guidance += f"- Use detailed, precise query terms (e.g., 'sodium-ion battery cathode P2-type layered oxide rate performance K+ doping')\n"
+                search_source_guidance += f"- Search from different angles: material types, modification strategies, performance metrics, synthesis methods\n"
+                search_source_guidance += f"- RAG contains high-quality academic papers - maximize its value through comprehensive multi-angle searches\n"
+            elif not has_rag and has_other_sources:
+                # No RAG, only other sources
+                search_source_guidance += f"\n**SEARCH STRATEGY (Non-RAG Sources):**\n"
+                search_source_guidance += f"- Use available search tools (WebSearch, PubMed, arXiv, Springer) comprehensively\n"
+                search_source_guidance += f"- Generate multiple search queries from different angles\n"
+
+            if disabled_tools:
+                search_source_guidance += f"**Disabled**: {', '.join(disabled_tools)}\n"
+        else:
+            search_source_guidance = "**WARNING: ALL SEARCH TOOLS DISABLED**\n"
+            search_source_guidance += f"No external search tools are available in this session. You can only work with existing files in the workspace (user_uploads/, library_refs/, etc.).\n"
+            search_source_guidance += f"Focus on analyzing existing documents and files using document_extract, document_qa, and file operations.\n"
+
+        # Add current date for time awareness
+        from datetime import datetime
+        current_date = datetime.now().strftime("%Y-%m-%d")
+
+        system_prompt_template = f"""You are an Information Seeker Agent that follows the ReAct pattern (Reasoning + Acting).
+
+        ## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+        **Detect the language of the user's query/task and respond accordingly:**
+        - **English query → Respond in English**
+        - **Chinese query (中文) → Respond in Chinese (中文回复)**
+        - **Mixed Chinese-English query → Respond in Chinese (中文回复)**
+        This rule applies to ALL outputs including: task summaries, findings, and any content in task_done reports.
+
+        **IMPORTANT - Current Date: {current_date}**
+        When searching for recent information or papers, be aware that the current date is {current_date}. Papers and content from 2024, 2025, and 2026 are recent and relevant.
+
         Your role is to:
         1. Take decomposed sub-questions or tasks from parent agents
         2. Think step-by-step through reasoning 
@@ -38,107 +207,144 @@ class InformationSeekerAgent(BaseAgent):
         4. Continue reasoning based on tool results
         5. Repeat this process until you have sufficient information
         6. Call info_seeker_subjective_task_done to provide a structured summary and key files
-        
+
         TOOL USAGE STRATEGY:
         Follow this optimized workflow for information gathering:
-        
-        1. INITIAL RESEARCH:
-           - Generate focused search queries (≤10): Limit to no more than 10 initial search queries to avoid increased failure rates from excessive decomposition.
+
+        0. **FIRST STEP - Check Workspace Files (Smart Detection):**
+           - Use `list_workspace` to quickly check if `./user_uploads/` or `./library_refs/` contain any files
+           - If files exist: Use `document_extract` to analyze ALL files (include ALL .pdf, .doc, .docx, .txt files)
+           - If no files: Skip this step and proceed directly to web search
+
+        1. INITIAL RESEARCH:{search_source_guidance}
+           - Generate focused search queries (≤10) to avoid increased failure rates from excessive decomposition
            - Use `batch_web_search` to find relevant URLs for your queries. When calling the search statement, consider the language of the user's question. For example, for a Chinese question, generate a part of the search statement in Chinese.
-           - Analyze the search results (titles, snippets, URLs) to identify promising sources
-        
-        2. CONTENT EXTRACTION:  
-           - For important URLs, use `url_crawler` to:  
-                a) Extract full content from the webpage  
-                b) Save the content to a file in the workspace **under the relative path `./url_crawler_save_files/`**  
+           - Analyze the search results (titles, snippets, URLs, paper metadata) to identify promising sources
+
+        2. CONTENT EXTRACTION:
+           - **CRITICAL: For RAG knowledge base search results from `search_rag_knowledge`, you MUST use `rag_document_saver` to save documents (similar to how `url_crawler` works for web pages):**
+                a) Save documents using RAG response content
+                b) Save documents to workspace with proper metadata (title, journal, DOI, etc.)
+                c) Enable proper citation generation in the final report
+                d) **MANDATORY:** Always call `rag_document_saver` immediately after `search_rag_knowledge`
+                e) **Usage (similar to url_crawler):**
+                   ```
+                   # Step 1: Search RAG - returns documents_for_download list
+                   search_rag_knowledge(content="catalyst performance")
+                   # Result contains: {{"doc_list": [...], "documents_for_download": [{{"file_id": ..., "title": ...}}, ...]}}
+
+                   # Step 2: Pass the documents_for_download list to rag_document_saver
+                   rag_document_saver(documents=[
+                       {{"file_id": "rag_xxx", "title": "Document 1"}},
+                       {{"file_id": "rag_yyy", "title": "Document 2"}}
+                   ])
+                   # Or simply call without arguments to download all:
+                   rag_document_saver()
+                   ```
+                f) Documents will be saved under `rag_downloads/research/` with metadata preserved
+                g) **MANDATORY:** After `rag_document_saver`, explicitly call `document_extract` with the saved RAG file paths so they enter `file_analysis.jsonl` and appear in references
+                   ```
+                   # Step 3: Analyze saved RAG files
+                   # Use rag_document_saver result paths (data[].file_path)
+                   document_extract(tasks=[
+                       {{"file_path": "rag_downloads/research/xxx.md", "task": "Analyze this RAG paper"}}
+                   ])
+                   ```
+           - Use `url_crawler` to extract content from URLs and save to `./url_crawler_save_files/`
+           - For known paper IDs, you can use dedicated tools (arxiv_read_paper, get_pubmed_article, medrxiv_read_paper, etc.)
            - Store results with meaningful file paths (e.g., `url_crawler_save_files/research/ai_trends_2024.txt`)
-        
+
         3. CONTENT ANALYSIS:
+           - Use `document_qa` to ask focused questions about saved files
            - Use `document_extract` for multi-dimensional analysis of saved files:
                 a) Provides structured analysis across five key dimensions: doc time source authority, core content and task relevance
-        
+
         4. FILE MANAGEMENT:
+           - Use `file_write` to save important findings or summaries
            - For reviewing saved content:
                 a) Prefer `document_extract` to get comprehensive multi-dimensional analysis of saved files
                 b) Use `file_read` ONLY for small files (<1000 tokens) when you need the entire content
                 c) Avoid reading large files directly as it may exceed context limits
-        
-        ### Usage of Systematic Tool:
+
+        5. TASK COMPLETION:
+           - Call `info_seeker_subjective_task_done` with markdown summary and list of key files
+
+        ### Systematic Tools:
             - `think` is a systematic tool. After receiving the response from the complex tool or before invoking any other tools, you must **first invoke the `think` tool**: to deeply reflect on the results of previous tool invocations (if any), and to thoroughly consider and plan the user's task. The `think` tool does not acquire new information; it only saves your thoughts into memory.
-        
+            - `reflect` is a systematic tool. When encountering a failure in tool execution, it is necessary to invoke the reflect tool to conduct a review and revise the task plan. It does not acquire new information; it only saves your thoughts into memory.
+
         Always provide clear reasoning for your actions and synthesize information effectively.
 
-Below, within the <tools></tools> tags, are the descriptions of each tool and the required fields for invocation:
-<tools>
-$tool_schemas
-</tools>
-For each function call, return a JSON object placed within the [unused11][unused12] tags, which includes the function name and the corresponding function arguments:
-[unused11][{\"name\": <function name>, \"arguments\": <args json object>}][unused12]
-"""
+        Below, within the <tools></tools> tags, are the descriptions of each tool and the required fields for invocation:
+        <tools>
+        $tool_schemas
+        </tools>
+        For each function call, return a JSON object placed within the [unused11][unused12] tags, which includes the function name and the corresponding function arguments:
+        [unused11][{{"name": <function name>, "arguments": <args json object>}}][unused12]
+        """
         return system_prompt_template.replace("$tool_schemas", tool_schemas_str)
 
     @staticmethod
     def _build_initial_message_from_task_input(task_input: TaskInput) -> str:
         """Build the initial user message from TaskInput"""
         message = task_input.format_for_prompt()
-        
+
         message += "\nPlease analyze this task and start your ReAct process:\n"
         message += "1. Reason about what information you need to gather\n"
         message += "2. Use appropriate tools to get that information\n"
         message += "3. Continue reasoning and acting until you have sufficient information\n"
         message += "4. Call info_seeker_subjective_task_done when ready to provide your complete findings\n\n"
         message += "Begin with your initial reasoning about the task."
-        
+
         return message
-    
+
     def execute_task(self, task_input: TaskInput) -> AgentResponse:
         """
         Execute a task using ReAct pattern (Reasoning + Acting)
-        
+
         Args:
             task_input: TaskInput object with standardized task information
-            
+
         Returns:
             AgentResponse with results and process trace
         """
         start_time = time.time()
-        
+
         try:
             self.logger.info(f"Starting information seeker task: {task_input.task_content}")
-            
+
             # Reset trace for new task
             self.reset_trace()
-            
+
             # Initialize conversation history
             conversation_history = []
-            
+
             # Build initial system prompt for ReAct
             system_prompt = self._build_system_prompt()
-            
+
             # Build initial user message from TaskInput
             user_message = self._build_initial_message_from_task_input(task_input)
 
             # Add to conversation
             conversation_history.append({"role": "system", "content": system_prompt})
             conversation_history.append({"role": "user", "content": user_message + " /no_think"})
-            
+
             iteration = 0
             task_completed = False
             # Get model configuration from config
             from config.config import get_config
             config = get_config()
             model_config = config.get_custom_llm_config()
-            
+
             pangu_url = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
             model_token = model_config.get('token') or os.getenv('MODEL_REQUEST_TOKEN', '')
             headers = {'Content-Type': 'application/json', 'csb-token': model_token}
 
             # ReAct Loop: Reasoning -> Acting -> Reasoning -> Acting...
-            self.config.max_iterations = 30
             while iteration < self.config.max_iterations and not task_completed:
                 iteration += 1
                 self.logger.info(f"Planning iteration {iteration}")
-                
+
                 try:
                     # Get LLM response (reasoning + potential tool calls)
                     retry_num = 1
@@ -158,7 +364,6 @@ For each function call, return a JSON object placed within the [unused11][unused
                                 timeout=model_config.get("timeout", 180)
                             )
                             response = response.json()
-
                             self.logger.debug(f"API response received")
                             break
                         except Exception as e:
@@ -196,16 +401,57 @@ For each function call, return a JSON object placed within the [unused11][unused
                         else:
                             return []
                         return tool_calls
-                    
+
                     # Add assistant message to conversation
                     conversation_history.append({
                         "role": "assistant",
                         "content": assistant_message["content"]
                     })
-                    
-                    tool_calls = extract_tool_calls(assistant_message["content"])
 
-                    if tool_calls[0] == "fail_tools_load":
+                    tool_calls = extract_tool_calls(assistant_message["content"])
+                    document_extract_calls = [
+                        call for call in tool_calls
+                        if isinstance(call, dict) and call.get("name") == "document_extract"
+                    ]
+                    has_rag_extract_call = False
+                    for doc_call in document_extract_calls:
+                        arguments = doc_call.get("arguments", {}) if isinstance(doc_call, dict) else {}
+                        tasks = arguments.get("tasks", []) if isinstance(arguments, dict) else []
+                        if not isinstance(tasks, list):
+                            continue
+                        for task in tasks:
+                            if not isinstance(task, dict):
+                                continue
+                            file_path = str(task.get("file_path", ""))
+                            normalized_path = file_path[2:] if file_path.startswith("./") else file_path
+                            if normalized_path.startswith("rag_downloads/"):
+                                has_rag_extract_call = True
+                                break
+                        if has_rag_extract_call:
+                            break
+
+                    def build_rag_tasks(tool_result: Dict[str, Any], default_task: str) -> List[Dict[str, Any]]:
+                        data = tool_result.get("data", [])
+                        if not isinstance(data, list):
+                            return []
+                        rag_tasks = []
+                        seen_paths = set()
+                        for item in data:
+                            if not isinstance(item, dict):
+                                continue
+                            if not item.get("success"):
+                                continue
+                            file_path = item.get("file_path")
+                            if not file_path or file_path in seen_paths:
+                                continue
+                            seen_paths.add(file_path)
+                            rag_tasks.append({
+                                "file_path": file_path,
+                                "task": default_task
+                            })
+                        return rag_tasks
+
+                    if len(tool_calls) > 0 and tool_calls[0] == "fail_tools_load":
                         # Parse error, rerun
                         followup_prompt = f"There was a parsing error in the format of the tool call" \
                                           f" you generated:{tool_calls[1]} Please regenerate it."
@@ -227,16 +473,31 @@ For each function call, return a JSON object placed within the [unused11][unused
                             tool_result = {"tool_results": "You can proceed to invoke other tools if needed."}
                         else:
                             tool_result = self.execute_tool_call(tool_call)
-                        
+
                         # Log the action using base class method
                         self.log_action(iteration, tool_call["name"], arguments, tool_result)
-                        
+
                         # Add tool result to conversation
                         conversation_history.append({
                             "role": "tool",
                             "content": json.dumps(tool_result, ensure_ascii=False, indent=2) + " /no_think"
                         })
-                    
+
+                        if tool_call["name"] == "rag_document_saver" and not has_rag_extract_call:
+                            default_task = task_input.task_content or "RAG document analysis"
+                            rag_tasks = build_rag_tasks(tool_result, default_task)
+                            if rag_tasks:
+                                auto_tool_call = {
+                                    "name": "document_extract",
+                                    "arguments": {"tasks": rag_tasks}
+                                }
+                                auto_result = self.execute_tool_call(auto_tool_call)
+                                self.log_action(iteration, "document_extract", auto_tool_call["arguments"], auto_result)
+                                conversation_history.append({
+                                    "role": "tool",
+                                    "content": json.dumps(auto_result, ensure_ascii=False, indent=2) + " /no_think"
+                                })
+
                     # If no tool calls, encourage continued planning
                     if len(tool_calls) == 0:
                         # Add follow-up prompt to encourage action or completion
@@ -248,13 +509,13 @@ For each function call, return a JSON object placed within the [unused11][unused
                     if iteration == self.config.max_iterations-3:
                         followup_prompt = "Due to length and number of rounds restrictions, you must now call the `info_seeker_subjective_task_done` tool to report the completion of your task."
                         conversation_history.append({"role": "user", "content": followup_prompt + " /no_think"})
-                    
-                    
+
+
                 except Exception as e:
                     error_msg = f"Error in planning iteration {iteration}: {e}"
                     self.log_error(iteration, error_msg)
                     break
-            
+
             execution_time = time.time() - start_time
             # Extract final result
             if task_completed:
@@ -264,7 +525,7 @@ For each function call, return a JSON object placed within the [unused11][unused
                     if step.get("type") == "action" and step.get("tool") == "info_seeker_subjective_task_done":
                         task_done_result = step.get("result")
                         break
-                
+
                 return self.create_response(
                     success=True,
                     result=task_done_result,
@@ -278,7 +539,7 @@ For each function call, return a JSON object placed within the [unused11][unused
                     iterations=iteration,
                     execution_time=execution_time
                 )
-                
+
         except Exception as e:
             execution_time = time.time() - start_time
             self.logger.error(f"Error in execute_task: {e}")
@@ -374,6 +635,7 @@ For each function call, return a JSON object placed within the [unused11][unused
                     }
                 }
             },
+
         ]
 
         schemas.extend(builtin_assignment_schemas)
@@ -402,7 +664,7 @@ def create_subjective_information_seeker(
     """
     # Import the enhanced config function
     from .base_agent import create_agent_config
-    
+
     # Create agent configuration (session managed by MCP server)
     config = create_agent_config(
         agent_name="InformationSeekerAgent",
@@ -410,8 +672,8 @@ def create_subjective_information_seeker(
         max_iterations=max_iterations,
         **kwargs
     )
-    
+
     # Create agent instance with shared MCP client (filtered tools for information seeking)
     agent = InformationSeekerAgent(config=config, shared_mcp_client=shared_mcp_client)
-    
+
     return agent
