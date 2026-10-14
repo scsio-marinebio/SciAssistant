@@ -178,7 +178,7 @@ If agent initialization fails:
 If tool calls fail:
 
 1. Verify MCP server is running and has the required tools
-2. Check network connectivity for web search/crawler tools
+2. Check network connectivity for web search/parse tools
 3. Ensure workspace directories exist and are writable
 4. Review tool arguments for correctness
 
@@ -223,8 +223,8 @@ User Query
 PlannerAgent (Coordinator)
     ↓
 ├── InformationSeekerAgent (Research)
-│   ├── Web Search Tools
-│   ├── URL Crawling Tools  
+│   ├── Webpage Search Tools
+│   ├── Webpage Parseing Tools  
 │   ├── Document Analysis Tools
 │   └── File Management Tools
 │
