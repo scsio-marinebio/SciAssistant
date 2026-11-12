@@ -6,6 +6,7 @@ import re
 import os
 import jwt
 import datetime
+import time
 from flask import Flask, request, jsonify, app, abort, send_from_directory
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -16,6 +17,9 @@ from pathlib import Path
 from typing import Optional
 import shutil
 import sys
+import json
+import requests
+from flask import Response, stream_with_context
 
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent))
@@ -23,8 +27,20 @@ sys.path.insert(0, str(Path(__file__).parent))
 # 导入日志配置
 from deepdiver_v2.config.logging_config import quick_setup, get_logger
 
-# 加载环境变量
+# 加载环境变量（项目根 .env）后加载 deepdiver 配置，后者覆盖同名键
 load_dotenv()
+_DEEPDIVER_ENV_PATH = Path(__file__).resolve().parent / "deepdiver_v2" / "config" / ".env"
+load_dotenv(_DEEPDIVER_ENV_PATH, override=True)
+
+# app.py 联网搜索 / 大模型：优先 SERPER_*、LLM_*，兼容 deepdiver 既有键名
+LLM_API_URL = os.getenv("MODEL_REQUEST_URL")
+
+LLM_MODEL_NAME = os.getenv("MODEL_NAME") or "pangu"
+SERPER_API_URL = (
+    os.getenv("SEARCH_ENGINE_BASE_URL")
+    or "https://google.serper.dev/search"
+)
+SERPER_API_KEY = os.getenv("SEARCH_ENGINE_API_KEYS")
 # 数据库配置
 MYSQL_HOST=""
 MYSQL_USER=""
@@ -463,10 +479,8 @@ def get_chat_sessions_by_userid(connection, user_id):
         sql = "SELECT * FROM chat_list WHERE user_id = %s order by update_time desc;"
         cursor.execute(sql, (user_id,))
         session = cursor.fetchall()
-        if session:
-            return jsonify(session)
-        else:
-            return jsonify({'error': 'User not found'}), 404
+        # 即使没有记录也返回空数组，而不是404错误
+        return jsonify(session if session else [])
 
 
 @app.route('/api/chat/sessions/<session_id>', methods=['PUT'])
@@ -496,7 +510,7 @@ def update_chat_session_time(connection, session_id):
     """更新聊天会话的最后更新时间"""
     with connection.cursor() as cursor:
         sql = "UPDATE chat_list SET update_time = NOW() WHERE session_id = %s"
-        cursor.execute(sql, (session_id,))
+        cursor.execute(sql, (session_id))
         connection.commit()
 
         if cursor.rowcount == 0:
@@ -531,12 +545,55 @@ def delete_chat_session(connection, session_id):
             connection.rollback()  # Rollback on any error
             return jsonify({'error': str(e)}), 500
 
+
+@app.route('/api/chat/sessions/batch-delete', methods=['POST'])
+@db_operation
+def batch_delete_chat_sessions(connection):
+    """批量删除多个会话及其详情"""
+    data = request.get_json()
+    
+    if not data or 'session_ids' not in data:
+        return jsonify({'error': '缺少必要字段: session_ids'}), 400
+    
+    session_ids = data['session_ids']
+    
+    if not isinstance(session_ids, list) or len(session_ids) == 0:
+        return jsonify({'error': 'session_ids必须是非空数组'}), 400
+    
+    with connection.cursor() as cursor:
+        try:
+            # 使用IN语句批量删除conversation_detail
+            placeholders = ','.join(['%s'] * len(session_ids))
+            sql_detail = f"DELETE FROM conversation_detail WHERE session_id IN ({placeholders})"
+            cursor.execute(sql_detail, tuple(session_ids))
+            
+            # 使用IN语句批量删除chat_list
+            sql_history = f"DELETE FROM chat_list WHERE session_id IN ({placeholders})"
+            cursor.execute(sql_history, tuple(session_ids))
+            deleted_count = cursor.rowcount
+            
+            if deleted_count == 0:
+                connection.rollback()
+                return jsonify({'error': '未找到要删除的会话'}), 404
+            
+            connection.commit()
+            return jsonify({
+                'message': f'成功删除 {deleted_count} 个会话',
+                'deleted_count': deleted_count
+            })
+        
+        except Exception as e:
+            connection.rollback()
+            logger.error(f"批量删除会话失败: {e}")
+            return jsonify({'error': str(e)}), 500
+
 #-----------------会话详情相关接口------------------
 @app.route('/api/chat/messages', methods=['POST'])
 def add_chat_message():
     """添加聊天消息"""
     try:
         data = request.get_json()
+        logger.info(f"[add_chat_message] 收到请求: from_who={data.get('from_who') if data else 'NO_DATA'}, session_id={data.get('session_id') if data else 'NO_DATA'}, content_len={len(data.get('content','')) if data else 0}")
         if not data:
             return jsonify({'error': '没有提供JSON数据'}), 400
 
@@ -555,8 +612,7 @@ def add_chat_message():
         timestamp = data.get('timestamp', datetime.datetime.now())
         message_uuid = data.get('uuid', data.get('backend_session_id'))
         has_report = data.get('has_report',0)
-        report_title = data.get('report_title', '')  # 新增：获取报告标题
-
+        report_title = data.get('report_title', '')
 
         # 验证from_who值
         if from_who not in ['user', 'ai']:
@@ -568,6 +624,7 @@ def add_chat_message():
 
         try:
             with connection.cursor() as cursor:
+                # 统一存储逻辑：所有消息直接存储为单条记录
                 sql = """
                     INSERT INTO conversation_detail 
                     (session_id, from_who, round, timestamp, uuid, content, think_msg, create_time, has_report, report_title)
@@ -577,9 +634,15 @@ def add_chat_message():
                     session_id, from_who, round_num, timestamp,
                     message_uuid, content, think_msg, has_report, report_title
                 ))
+                insert_rows = cursor.rowcount
+                sql1 = "UPDATE chat_list SET update_time = NOW() WHERE session_id = %s"
+                cursor.execute(sql1, (session_id,))
+                
+                logger.info(f"[add_chat_message] INSERT rowcount={insert_rows}, from_who={from_who}, session_id={session_id}, content_len={len(content)}")
+                    
             connection.commit()
+            logger.info(f"[add_chat_message] COMMIT 完成, from_who={from_who}")
 
-            logger.info(f"成功插入消息: session_id={session_id}, from={from_who}, report_title={report_title}")
             return jsonify({
                 'success': True,
                 'message': '消息添加成功',
@@ -612,24 +675,90 @@ def get_chat_messages_by_session_id(session_id):
                     FROM conversation_detail
                     WHERE session_id = %s
                     ORDER BY round ASC, 
-                     timestamp ASC, from_who DESC;
+                     timestamp ASC, 
+                     CASE 
+                         WHEN think_msg IN ('1','2','3') THEN CAST(think_msg AS UNSIGNED)
+                         ELSE 999
+                     END ASC,
+                     from_who DESC;
                 """
                 cursor.execute(sql, (session_id,))
                 messages = cursor.fetchall()
 
-                # 转换datetime对象为字符串
+                # 转换为前端需要的格式
                 converted_messages = []
+                
                 for message in messages:
-                    converted_message = {}
-                    for key, value in message.items():
-                        converted_message[key] = convert_datetime_to_string(value)
+                    converted_message = {
+                        'id': message.get('id'),
+                        'session_id': message.get('session_id'),
+                        'from_who': message.get('from_who'),
+                        'content': message.get('content', ''),
+                        'round': message.get('round'),
+                        'timestamp': message.get('timestamp').isoformat() if message.get('timestamp') else None,
+                        'uuid': message.get('uuid'),
+                        'think_msg': message.get('think_msg', ''),
+                        'has_report': message.get('has_report', 0),
+                        'report_title': message.get('report_title', '')
+                    }
                     converted_messages.append(converted_message)
+
+                # 判断是否有正在运行的任务
+                # 策略：只要最后一条消息是用户消息，就认为有任务正在运行（等待AI回复）
+                has_pending_task = False
+                pending_mode = None
+                
+                if converted_messages:
+                    last_message = converted_messages[-1]
+                    
+                    # 如果最后一条是用户消息，说明正在等待AI回复
+                    if last_message['from_who'] == 'user':
+                        has_pending_task = True
+                        # 从 think_msg 字段中读取模式信息（前端保存时写入的）
+                        # think_msg 可能是 'deepdiver', 'chat', 'reasoner' 等
+                        user_mode = last_message.get('think_msg', '').strip()
+                        if user_mode in ['deepdiver', 'chat', 'reasoner']:
+                            pending_mode = user_mode
+                        else:
+                            # 兜底：如果没有模式信息，默认为 chat
+                            pending_mode = 'chat'
+                        
+                        # 【关键修复】对deepdiver模式，交叉验证任务管理器中的实际任务状态
+                        # 解决：用户取消任务后，saveResultToDB异步写入未完成 → 刷新页面 → 
+                        # DB最后一条仍是用户消息 → has_pending_task误判为true的问题
+                        if pending_mode == 'deepdiver':
+                            try:
+                                task_resp = requests.get('http://localhost:8000/api/tasks', timeout=3)
+                                if task_resp.status_code == 200:
+                                    tasks_data = task_resp.json()
+                                    all_tasks = tasks_data.get('tasks', [])
+                                    # 查找与当前session_id关联的任务
+                                    # 注意：/api/tasks 返回的 tasks 是列表，不是字典
+                                    session_has_active_task = False
+                                    for task_info in all_tasks:
+                                        progress = task_info.get('progress', {})
+                                        params = progress.get('params', {})
+                                        task_session_id = params.get('frontend_session_id', '')
+                                        if task_session_id == session_id:
+                                            task_status = task_info.get('status', '')
+                                            if task_status in ('running', 'queued', 'pending'):
+                                                session_has_active_task = True
+                                                break
+                                    
+                                    if not session_has_active_task:
+                                        logger.info(f"[has_pending_task] session {session_id}: DB显示pending但任务管理器无活跃任务，覆盖为false")
+                                        has_pending_task = False
+                                        pending_mode = None
+                            except Exception as task_check_err:
+                                logger.warning(f"[has_pending_task] 查询任务管理器失败: {task_check_err}")
 
                 return jsonify({
                     'success': True,
                     'session_id': session_id,
                     'messages': converted_messages,
-                    'count': len(converted_messages)
+                    'count': len(converted_messages),
+                    'has_pending_task': has_pending_task,
+                    'pending_mode': pending_mode
                 }), 200
 
         except Exception as e:
@@ -650,8 +779,8 @@ PDF_DIR = BASE_DIR / "workspaces"  # 统一路径
 # 上传文件目录与配置
 UPLOAD_DIR = BASE_DIR / "uploads"
 ALLOWED_EXTENSIONS = {'.txt', '.md', '.csv', '.json', '.log', '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.xml', '.html', '.htm', '.rtf', '.odt', '.epub', '.yaml', '.yml'}
-MAX_UPLOAD_SIZE = 30 * 1024 * 1024  # 30MB（单个文件限制，支持Chat模式；DeepDiver模式在前端限制为20MB）
-MAX_TOTAL_UPLOAD_SIZE = 60 * 1024 * 1024  # 60MB（总大小限制，前端控制）
+MAX_UPLOAD_SIZE = 15 * 1024 * 1024  # 15MB（单个文件限制，DeepDiver和文档库统一）
+MAX_TOTAL_UPLOAD_SIZE = 75 * 1024 * 1024  # 75MB（总大小限制）
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 def _find_workspace_file(session_id: str, filename: str) -> Optional[Path]:
@@ -677,10 +806,22 @@ def upload_context_file():
     支持两种模式：
     1. 临时上传：保存到uploads目录，用于当前会话
     2. 同步到文档库：如果提供user_id和save_to_library=true，同时保存到文档库
+    
+    注意：此接口设计为单文件上传，如果前端传入多个文件，只处理第一个
     """
     if 'file' not in request.files:
         return jsonify({'success': False, 'message': '未找到文件字段: file'}), 400
-    file = request.files['file']
+    
+    # 获取文件（如果是多文件，只取第一个）
+    files = request.files.getlist('file')
+    if not files or len(files) == 0:
+        return jsonify({'success': False, 'message': '未选择文件'}), 400
+    
+    # 防御性检查：如果前端误传多个文件，只处理第一个并给出提示
+    if len(files) > 1:
+        logger.warning(f"上下文上传接收到{len(files)}个文件，只处理第一个")
+    
+    file = files[0]
     if not file or file.filename == '':
         return jsonify({'success': False, 'message': '未选择文件'}), 400
 
@@ -1245,8 +1386,9 @@ def rag_search():
 
 # 文件上传配置
 UPLOAD_BASE_DIR = BASE_DIR / "user_files"  # 基础文件存储目录
-ALLOWED_EXTENSIONS_LIBRARY = {'pdf', 'doc', 'docx', 'png', 'jpg', 'jpeg', 'ppt', 'pptx', 'txt', 'xlsx', 'xls'}  # 文档库允许的扩展名（不带点号）
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+ALLOWED_EXTENSIONS_LIBRARY = {'pdf', 'doc', 'docx', 'txt'}  # 文档库允许的扩展名（仅支持可被分析的文档类型）
+MAX_FILE_SIZE = 75 * 1024 * 1024  # 75MB（总大小限制）
+MAX_SINGLE_FILE_SIZE = 15 * 1024 * 1024  # 15MB（单个文件大小限制，与DeepDiver统一）
 
 # 确保基础上传目录存在
 UPLOAD_BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1336,6 +1478,16 @@ def upload_files():
 
                     # 获取文件大小
                     file_size = os.path.getsize(file_path)
+                    
+                    # 检查单个文件大小是否超限
+                    if file_size > MAX_SINGLE_FILE_SIZE:
+                        # 删除已上传的文件
+                        os.remove(file_path)
+                        return jsonify({
+                            'success': False,
+                            'message': f'文件 {original_filename} 大小超过{MAX_SINGLE_FILE_SIZE / 1024 / 1024:.0f}MB限制'
+                        }), 400
+                    
                     total_size += file_size
 
                     # 检查总大小是否超限
@@ -1652,6 +1804,401 @@ def start_file_qa():
         logger.error(f"启动文件问答失败: {str(e)}")
         return jsonify({'success': False, 'message': f'启动文件问答失败: {str(e)}'}), 500
 
+# ------------------- 联网搜索增强接口 -------------------
+# 大模型 / Serper 配置见文件顶部（从 deepdiver_v2/config/.env 等加载）
+
+def call_llm(messages, stream=False, timeout=60):
+    """调用大模型API的辅助函数"""
+    payload = {
+        "model": LLM_MODEL_NAME,
+        "messages": messages,
+        "stream": stream
+    }
+    try:
+        resp = requests.post(
+            LLM_API_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            stream=stream,
+            timeout=timeout
+        )
+        resp.raise_for_status()
+        if stream:
+            return resp  # 返回原始response对象，由调用方处理流
+        else:
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.error(f"调用大模型失败: {e}")
+        raise
+
+
+def rewrite_query_for_search(user_query):
+    """
+    调用大模型将用户query改写/拆分为适合搜索引擎的搜索关键词。
+    返回一个搜索关键词列表（1~3个）。
+    """
+    # 获取当前年月日，用于时间敏感查询
+    import pytz
+    beijing_tz = pytz.timezone('Asia/Shanghai')
+    current_time = datetime.datetime.now(beijing_tz)
+    current_year = current_time.year
+    current_month = current_time.month
+    current_day = current_time.day
+    
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                f"你是一个搜索查询改写助手。当前时间是{current_year}年{current_month}月{current_day}日。\n"
+                "用户会给你一个问题，你需要将它改写为1到3个适合在搜索引擎中搜索的关键词短语。\n\n"
+                "要求：\n"
+                "1. 每个搜索词应该简洁、精准，适合搜索引擎\n"
+                "2. 如果问题比较简单，1个搜索词即可；如果问题复杂，可以拆分为2-3个搜索词\n"
+                "3. **时间敏感问题必须添加时间限定**：\n"
+                f"   - 如果用户问\"最近\"、\"近期\"，可以加上\"{current_year}年{current_month}月\"或\"{current_year}年{current_month}月{current_day}日\"\n"
+                f"   - 如果用户问\"今年\"，加上\"{current_year}年\"\n"
+                f"   - 如果用户问\"今天\"、\"最新\"，加上\"{current_year}年{current_month}月{current_day}日\"或\"最新\"\n"
+                "   - 例如：\"最近有什么热门事件\" -> \"2026年2月热门事件\" 或 \"2026年2月26日热点新闻\"\n"
+                "4. 只输出搜索词，每行一个，不要输出任何其他内容\n"
+                "5. 搜索词使用与用户问题相同的语言\n\n"
+                "示例：\n"
+                "用户问题：EVO2是谁研发的\n"
+                "输出：\nEVO2 研发机构\nEVO2 开发者是谁\n\n"
+                "用户问题：最近有什么热门事件\n"
+                f"输出：\n{current_year}年{current_month}月热门事件\n{current_year}年{current_month}月{current_day}日热点新闻\n"
+            )
+        },
+        {"role": "user", "content": user_query + " /no_think"}
+    ]
+    try:
+        result = call_llm(messages, stream=False, timeout=30)
+        # 解析返回的搜索词（每行一个）
+        search_queries = [q.strip() for q in result.strip().split('\n') if q.strip()]
+        # 过滤掉空行和过长的查询
+        search_queries = [q for q in search_queries if len(q) <= 100]
+        if not search_queries:
+            # 如果改写失败，使用原始query
+            search_queries = [user_query]
+        logger.info(f"Query改写结果: {user_query} -> {search_queries}")
+        return search_queries[:3]  # 最多3个
+    except Exception as e:
+        logger.error(f"Query改写失败: {e}，使用原始query")
+        return [user_query]
+
+
+
+
+def web_search(query, max_results=5):
+    """
+    联网搜索：使用Google Serper API（与deepdiver共用同一个Key）。
+    返回搜索结果列表，每个结果包含 title, url, snippet。
+    """
+    results = _search_serper(query, max_results)
+    if results:
+        return results
+    logger.error(f"Google Serper搜索失败: '{query}'")
+    return []
+
+
+def _search_serper(query, max_results=5, max_retries=3):
+    """
+    使用Google Serper API进行搜索（与deepdiver项目共用同一个API Key）。
+    API文档: https://serper.dev/
+    增加重试机制以提高稳定性。
+    """
+    results = []
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            payload = json.dumps({
+                "q": query,
+                "num": max_results
+            })
+            headers = {
+                "X-API-KEY": SERPER_API_KEY,
+                "Content-Type": "application/json"
+            }
+            resp = requests.post(SERPER_API_URL, headers=headers, data=payload, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+
+            # 解析organic搜索结果
+            organic = data.get("organic", [])
+            for item in organic[:max_results]:
+                results.append({
+                    'title': item.get('title', ''),
+                    'url': item.get('link', ''),
+                    'snippet': item.get('snippet', '')
+                })
+
+            # 如果有知识图谱结果，也加入
+            kg = data.get("knowledgeGraph", {})
+            if kg and kg.get("description"):
+                results.insert(0, {
+                    'title': kg.get('title', '知识图谱'),
+                    'url': kg.get('descriptionLink') or kg.get('website', ''),
+                    'snippet': kg.get('description', '')
+                })
+
+            logger.info(f"Google Serper搜索 '{query}' 获取到 {len(results)} 条结果")
+            return results
+            
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 0.5
+                logger.warning(f"Google Serper搜索失败 (尝试 {attempt + 1}/{max_retries}): {e}，{wait_time}秒后重试...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"Google Serper搜索失败 (已重试{max_retries}次): {e}")
+    
+    return results
+
+
+def do_web_search(user_query):
+    """
+    完整的联网搜索流程：query改写 -> 搜索 -> 汇总结果。
+    返回 (search_queries, all_results) 元组。
+    """
+    # 1. Query改写
+    search_queries = rewrite_query_for_search(user_query)
+    
+    # 2. 对每个搜索词进行搜索
+    all_results = []
+    seen_urls = set()
+    for sq in search_queries:
+        results = web_search(sq, max_results=5)
+        for r in results:
+            if r['url'] not in seen_urls:
+                seen_urls.add(r['url'])
+                all_results.append(r)
+    
+    # 限制总结果数
+    all_results = all_results[:10]
+    logger.info(f"联网搜索完成: 原始query='{user_query}', 改写为={search_queries}, 获取到{len(all_results)}条结果")
+    return search_queries, all_results
+
+
+def build_search_enhanced_messages(user_query, search_results, search_queries):
+    """
+    构建搜索增强的消息列表，将搜索结果作为上下文注入。
+    """
+    # 获取服务器当前时间（北京时间 UTC+8）
+    import pytz
+    beijing_tz = pytz.timezone('Asia/Shanghai')
+    current_time = datetime.datetime.now(beijing_tz)
+    current_time_str = current_time.strftime('%Y年%m月%d日 %H:%M:%S')
+    current_weekday = ['星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日'][current_time.weekday()]
+    
+    # 检查是否有搜索结果
+    if not search_results:
+        # 搜索失败时的特殊处理
+        system_prompt = f"""你是一个严谨的智能助手，具备联网搜索能力。
+
+【重要提示】：本次联网搜索失败（网络连接问题），无法获取最新信息。
+
+【回答规则】：
+1. 明确告知用户：由于联网搜索失败，无法提供最新的实时信息
+2. 对于时间敏感的问题（如"今天是几号"、"最新新闻"等），必须明确说明无法回答
+3. 对于一般性知识问题，可以基于训练数据回答，但需要说明：
+   - 信息可能不是最新的
+   - 训练数据截止时间
+4. 建议用户稍后重试或使用其他方式获取实时信息
+5. 回答要诚实、客观，不要编造或猜测实时信息
+
+用户问题：{user_query}
+"""
+    else:
+        # 有搜索结果时的正常处理
+        context_parts = []
+        for i, r in enumerate(search_results, 1):
+            context_parts.append(f"[{i}] {r['title']}\n来源: {r['url']}\n摘要: {r['snippet']}")
+        
+        search_context = "\n\n".join(context_parts)
+        
+        system_prompt = f"""你是一个严谨的智能助手，具备联网搜索能力。以下是根据用户问题从互联网搜索到的最新信息：
+
+【服务器当前时间（北京时间）】：{current_time_str} {current_weekday}
+
+搜索关键词: {', '.join(search_queries)}
+搜索结果:
+{search_context}
+
+【回答规则】：
+1. **时间类问题优先使用服务器时间**：如果用户问"现在几点"、"今天几号"等实时问题，必须以【服务器当前时间】为准，搜索结果仅作参考
+2. **检查搜索结果的时效性**：
+   - 用户问"最近"、"近期"、"今年"等时间敏感问题时，必须检查搜索结果中的时间信息
+   - 如果搜索结果中的事件时间与当前时间（{current_time.year}年{current_time.month}月）相差较远（如2023年的事件），必须明确指出这些信息已过时
+   - 优先使用与当前时间最接近的搜索结果
+   - 如果所有搜索结果都是过时的，应说明"搜索结果主要是X年的信息，可能不是最新的"
+3. 搜索结果是第一权威来源：涉及事实性信息（如谁开发的、什么时候发布的、具体数据等）时，必须以搜索结果为准，不得与搜索结果矛盾
+4. 来源标注：凡是引用搜索结果中的事实，必须标注来源编号（如 [1]、[2] 等）
+5. 模型知识可补充：如果搜索结果已覆盖核心事实，你可以用自身知识补充背景解释、原理分析等，但不能编造具体事实（如人名、机构名、数字等）
+6. 冲突处理：如果你的知识与搜索结果矛盾，以搜索结果为准
+7. 信息不足时：如果搜索结果不足以回答某个方面，可以说明：根据现有搜索结果未找到该信息
+8. 回答要准确、客观、全面，组织清晰，适当使用列表或分段提升可读性
+"""
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_query}
+    ]
+    return messages
+
+
+@app.route('/api/chat/search_enhanced', methods=['POST'])
+def chat_search_enhanced():
+    """
+    联网搜索增强的聊天接口。
+    流程：用户query -> query改写 -> 搜索引擎搜索 -> 搜索结果+query -> 大模型回答
+    
+    请求体：{
+        "message": "用户问题",
+        "stream": true/false,  // 是否流式输出，默认false
+        "mode": "chat"/"reasoner"  // 模式，默认chat
+    }
+    
+    非流式返回：{
+        "success": true,
+        "reply": "AI回答内容",
+        "search_queries": ["改写后的搜索词"],
+        "search_results": [{"title": "", "url": "", "snippet": ""}],
+        "reasoning_content": ""  // 仅reasoner模式
+    }
+    
+    流式返回：SSE格式，与OpenAI兼容
+    """
+    data = request.get_json(silent=True) or {}
+    user_message = (data.get('message') or '').strip()
+    is_stream = data.get('stream', False)
+    mode = data.get('mode', 'chat')  # chat 或 reasoner
+    session_id = (data.get('session_id') or '').strip()  # 前端传入的会话ID，用于后端自动保存AI回复
+    
+    if not user_message:
+        return jsonify({'success': False, 'message': '缺少message参数'}), 400
+    
+    try:
+        # 1. 联网搜索
+        search_queries, search_results = do_web_search(user_message)
+        
+        # 2. 构建搜索增强的消息
+        messages = build_search_enhanced_messages(user_message, search_results, search_queries)
+        
+        # 3. 根据模式调整消息
+        if mode == 'chat':
+            # Chat模式：添加 /no_think 标记禁用推理
+            messages[-1]["content"] = messages[-1]["content"] + " /no_think"
+        # reasoner模式不加 /no_think，让模型进行推理
+        
+        # 4. 调用大模型生成回答
+        if is_stream:
+            # 流式输出
+            def generate():
+                full_content = ''       # 累积完整AI回复内容
+                reasoning_content = ''  # 累积推理过程（reasoner模式）
+                try:
+                    # 先发送搜索信息事件
+                    search_info = {
+                        "type": "search_info",
+                        "search_queries": search_queries,
+                        "search_results": search_results
+                    }
+                    yield f"data: {json.dumps(search_info, ensure_ascii=False)}\n\n"
+                    
+                    # 调用大模型流式输出
+                    resp = call_llm(messages, stream=True, timeout=120)
+                    has_done = False
+                    for line in resp.iter_lines(decode_unicode=True):
+                        if line:
+                            # 直接转发SSE数据
+                            if line.startswith('data:'):
+                                yield f"{line}\n\n"
+                                if '[DONE]' in line:
+                                    has_done = True
+                                else:
+                                    # 解析并累积内容
+                                    try:
+                                        chunk_data = json.loads(line[5:].strip())
+                                        if chunk_data.get('choices') and chunk_data['choices'][0].get('delta'):
+                                            delta = chunk_data['choices'][0]['delta']
+                                            if delta.get('content'):
+                                                full_content += delta['content']
+                                            if delta.get('reasoning_content'):
+                                                reasoning_content += delta['reasoning_content']
+                                    except (json.JSONDecodeError, KeyError, IndexError):
+                                        pass
+                            elif not line.startswith(':'):
+                                yield f"data: {line}\n\n"
+                    # 确保流结束时发送[DONE]信号
+                    if not has_done:
+                        yield "data: [DONE]\n\n"
+                except Exception as e:
+                    logger.error(f"流式搜索增强回答失败: {e}")
+                    error_data = {"error": str(e)}
+                    yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                finally:
+                    # 流式输出结束后，自动保存AI回复到数据库
+                    if session_id and (full_content.strip() or reasoning_content.strip()):
+                        try:
+                            # 附加搜索来源到内容末尾
+                            save_content = full_content
+                            if search_results:
+                                save_content += '\n\n---\n**搜索来源：**\n'
+                                for idx, sr in enumerate(search_results):
+                                    save_content += f"{idx + 1}. [{sr.get('title', '')}]({sr.get('url', '')})\n"
+                            
+                            connection = get_db_connection()
+                            if connection:
+                                try:
+                                    with connection.cursor() as cursor:
+                                        sql = """
+                                            INSERT INTO conversation_detail 
+                                            (session_id, from_who, round, timestamp, content, think_msg, create_time, has_report)
+                                            VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s)
+                                        """
+                                        cursor.execute(sql, (
+                                            session_id, 'ai', 1, datetime.datetime.now(),
+                                            save_content, reasoning_content, 0
+                                        ))
+                                        sql1 = "UPDATE chat_list SET update_time = NOW() WHERE session_id = %s"
+                                        cursor.execute(sql1, (session_id,))
+                                    connection.commit()
+                                    logger.info(f"[search_enhanced] 后端自动保存AI回复成功: session_id={session_id}, content_len={len(save_content)}, reasoning_len={len(reasoning_content)}")
+                                except Exception as db_err:
+                                    logger.error(f"[search_enhanced] 后端自动保存AI回复失败: {db_err}")
+                                finally:
+                                    connection.close()
+                        except Exception as save_err:
+                            logger.error(f"[search_enhanced] 保存AI回复异常: {save_err}")
+            
+            return Response(
+                stream_with_context(generate()),
+                mimetype='text/event-stream',
+                headers={
+                    'Cache-Control': 'no-cache',
+                    'Connection': 'keep-alive',
+                    'X-Accel-Buffering': 'no',
+                    'Access-Control-Allow-Origin': '*'
+                }
+            )
+        else:
+            # 非流式输出
+            reply = call_llm(messages, stream=False, timeout=120)
+            return jsonify({
+                'success': True,
+                'reply': reply,
+                'search_queries': search_queries,
+                'search_results': search_results
+            })
+    
+    except Exception as e:
+        logger.error(f"搜索增强聊天失败: {e}")
+        return jsonify({'success': False, 'message': f'搜索增强失败: {str(e)}'}), 500
+
+
 #健康检查接口
 @app.route('/api/health', methods=['GET'])
 def health_check():
@@ -1660,5 +2207,10 @@ def health_check():
 
 
 if __name__ == '__main__':
+    # 禁用 Werkzeug 的 HTTP 访问日志
+    import logging
+    # log = logging.getLogger('werkzeug')
+    # log.setLevel(logging.ERROR)  # 只显示错误，不显示 INFO 级别的访问日志
+    
     # 生产环境请修改debug=False，并配置合适的host和port
-    app.run(debug=False, host='0.0.0.0', port=5000)
+    app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)

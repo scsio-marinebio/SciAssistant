@@ -1,4 +1,3 @@
-# Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
 # Copyright (c) 2026 South China Sea Institute of Oceanology, Chinese Academy of Sciences (SCSIO, CAS). All rights reserved.
 import json
 import logging
@@ -6,12 +5,18 @@ import time
 import os
 import sys
 import uuid
+import copy
+from types import SimpleNamespace
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Union
 from dataclasses import dataclass, field
 from pathlib import Path
-import litellm
+from .. import get_thread_session_id, get_thread_workspace_path
+try:
+    import litellm
+except ImportError:  # The current agents use the centralized requests-based LLM client.
+    litellm = None
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +53,7 @@ class AgentResponse:
     reasoning_trace: List[Dict[str, Any]] = field(default_factory=list)
     agent_name: str = ""
     execution_time: float = 0.0
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -335,9 +341,34 @@ class BaseAgent(ABC):
     def get_session_info(self) -> Optional[Dict[str, Any]]:
         """Get information about the current server-managed session"""
         try:
-            # First check environment variables (set by cli/a.py)
-            env_session_id = os.environ.get('AGENT_SESSION_ID')
-            env_workspace_path = os.environ.get('AGENT_WORKSPACE_PATH')
+            # Prefer the instance-bound client session. Process environment is
+            # shared by concurrent requests and is therefore only a legacy fallback.
+            client = getattr(self.mcp_tools, 'client', self.mcp_tools)
+            client_session_id = getattr(client, '_session_id', None)
+            if client_session_id:
+                env_workspace = get_thread_workspace_path().strip()
+                workspace_path = None
+                if env_workspace:
+                    candidate = Path(env_workspace)
+                    if candidate.name == client_session_id:
+                        workspace_path = str(candidate)
+                if workspace_path is None:
+                    workspace_path = str(
+                        Path(__file__).resolve().parents[3]
+                        / 'workspaces'
+                        / client_session_id
+                    )
+                return {
+                    "session_id": client_session_id,
+                    "workspace_path": workspace_path,
+                    "server_managed": True,
+                    "agent_name": self.config.agent_name,
+                    "source": "mcp_client",
+                }
+            # Prefer request-scoped thread context; legacy scripts can still
+            # reach environment values through the context getters' fallback.
+            env_session_id = get_thread_session_id()
+            env_workspace_path = get_thread_workspace_path()
             
             if env_session_id and env_workspace_path:
                 return {
@@ -345,7 +376,7 @@ class BaseAgent(ABC):
                     "workspace_path": env_workspace_path,
                     "server_managed": True,
                     "agent_name": self.config.agent_name,
-                    "source": "environment"
+                    "source": "request_context"
                 }
             
             # Then try the adapter's get_session_info method if available
@@ -456,6 +487,258 @@ class BaseAgent(ABC):
                 self.logger.warning(f"Fallback schema building failed: {e}")
         
         return schemas
+
+    def _get_tool_input_schema(self, tool_name: str) -> Dict[str, Any]:
+        """Return a tool's input schema without imposing extra compatibility rules."""
+        for schema in getattr(self, "tool_schemas", []) or []:
+            if not isinstance(schema, dict):
+                continue
+            function_schema = schema.get("function")
+            if not isinstance(function_schema, dict):
+                continue
+            if function_schema.get("name") != tool_name:
+                continue
+            parameters = function_schema.get("parameters")
+            return parameters if isinstance(parameters, dict) else {}
+
+        tool_info = getattr(self, "available_tools", {}).get(tool_name)
+        input_schema = getattr(tool_info, "input_schema", None)
+        return input_schema if isinstance(input_schema, dict) else {}
+
+    def _append_assistant_tool_turn(
+        self,
+        conversation_history: List[Dict[str, Any]],
+        llm_turn: Any,
+        fallback_content: str,
+    ) -> None:
+        """Append an assistant turn using the active transport's history format."""
+        if getattr(llm_turn, "tool_call_mode", "text") == "native":
+            message = getattr(llm_turn, "assistant_message", None)
+            if not isinstance(message, dict):
+                raise ValueError("Native tool-call response is missing assistant_message")
+            conversation_history.append(copy.deepcopy(message))
+            return
+        conversation_history.append({
+            "role": "assistant",
+            "content": fallback_content,
+        })
+
+    @staticmethod
+    def _coerce_llm_tool_turn(value: Any) -> Any:
+        """Keep older text-returning mocks/callers compatible during migration."""
+        if isinstance(value, str):
+            return SimpleNamespace(
+                content=value,
+                reasoning_content="",
+                finish_reason=None,
+                tool_calls=[],
+                assistant_message={"role": "assistant", "content": value},
+                tool_call_mode="text",
+            )
+        return value
+
+    def _append_tool_result_turn(
+        self,
+        conversation_history: List[Dict[str, Any]],
+        tool_call: Dict[str, Any],
+        tool_result: Any,
+        tool_call_mode: str,
+    ) -> None:
+        """Append a tool result without mixing native and text protocols."""
+        serialized_result = json.dumps(tool_result, ensure_ascii=False, default=str)
+        if tool_call_mode == "native":
+            tool_call_id = tool_call.get("id") if isinstance(tool_call, dict) else None
+            if not isinstance(tool_call_id, str) or not tool_call_id:
+                raise ValueError("Native tool result cannot be appended without tool_call_id")
+            conversation_history.append({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": serialized_result,
+            })
+            return
+        conversation_history.append({
+            "role": "user",
+            "content": f"[工具返回结果] {serialized_result} /no_think",
+        })
+
+    def _validate_tool_call_arguments(
+        self,
+        tool_name: str,
+        arguments: Any
+    ) -> Optional[Dict[str, Any]]:
+        """Validate low-risk schema invariants before invoking a tool."""
+        schema_tool_names = set()
+        glued_candidates = set()
+        for schema in getattr(self, "tool_schemas", []) or []:
+            if not isinstance(schema, dict):
+                continue
+            function_schema = schema.get("function")
+            if not isinstance(function_schema, dict):
+                continue
+            schema_name = function_schema.get("name")
+            if not isinstance(schema_name, str) or not schema_name:
+                continue
+            schema_tool_names.add(schema_name)
+            parameters = function_schema.get("parameters")
+            properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
+            if not isinstance(properties, dict):
+                continue
+            for property_name in properties:
+                if (
+                    isinstance(property_name, str)
+                    and tool_name == f"{schema_name}{property_name}"
+                ):
+                    glued_candidates.add((schema_name, property_name))
+
+        available_tool_names = set(getattr(self, "available_tools", {}) or {})
+        if tool_name not in schema_tool_names and tool_name not in available_tool_names:
+            suggested_tool = None
+            suggested_argument = None
+            if len(glued_candidates) == 1:
+                suggested_tool, suggested_argument = next(iter(glued_candidates))
+            return {
+                "success": False,
+                "error_code": "TOOL_CALL_PROTOCOL_FAILED",
+                "error": f"Tool '{tool_name}' is not declared for this agent.",
+                "tool_name": tool_name,
+                "suggested_tool_name": suggested_tool,
+                "suggested_argument_name": suggested_argument,
+                "missing_required_fields": [],
+                "invalid_fields": ["tool_name"],
+                "retryable": True,
+            }
+
+        if not isinstance(arguments, dict):
+            return {
+                "success": False,
+                "error_code": "TOOL_ARGUMENT_VALIDATION_FAILED",
+                "error": (
+                    f"Tool '{tool_name}' arguments must be a JSON object, "
+                    f"got {type(arguments).__name__}."
+                ),
+                "tool_name": tool_name,
+                "missing_required_fields": [],
+                "invalid_fields": ["arguments"],
+                "retryable": True,
+            }
+
+        input_schema = self._get_tool_input_schema(tool_name)
+        properties = input_schema.get("properties", {})
+        if not isinstance(properties, dict):
+            properties = {}
+        required_fields = input_schema.get("required", [])
+        if not isinstance(required_fields, list):
+            required_fields = []
+        missing_fields = [
+            field_name
+            for field_name in required_fields
+            if isinstance(field_name, str) and field_name not in arguments
+        ]
+        if missing_fields:
+            return {
+                "success": False,
+                "error_code": "TOOL_ARGUMENT_VALIDATION_FAILED",
+                "error": (
+                    f"Tool '{tool_name}' is missing required arguments: "
+                    f"{', '.join(missing_fields)}."
+                ),
+                "tool_name": tool_name,
+                "missing_required_fields": missing_fields,
+                "invalid_fields": [],
+                "retryable": True,
+            }
+
+        invalid_fields = []
+        unknown_fields = [
+            field_name
+            for field_name in arguments
+            if properties and field_name not in properties
+        ]
+        invalid_fields.extend(unknown_fields)
+
+        expected_types = {
+            "string": str,
+            "array": list,
+            "object": dict,
+            "boolean": bool,
+            "integer": int,
+            "number": (int, float),
+        }
+        for field_name, value in arguments.items():
+            field_schema = properties.get(field_name)
+            if not isinstance(field_schema, dict):
+                continue
+            expected_type = field_schema.get("type")
+            python_type = expected_types.get(expected_type)
+            type_matches = (
+                python_type is None
+                or isinstance(value, python_type)
+            )
+            if expected_type in {"integer", "number"} and isinstance(value, bool):
+                type_matches = False
+            if not type_matches:
+                invalid_fields.append(field_name)
+                continue
+
+            if expected_type == "array" and isinstance(value, list):
+                item_schema = field_schema.get("items")
+                if isinstance(item_schema, dict):
+                    item_type = item_schema.get("type")
+                    item_python_type = expected_types.get(item_type)
+                    item_properties = item_schema.get("properties", {})
+                    item_required = item_schema.get("required", [])
+                    for index, item in enumerate(value):
+                        if item_python_type is not None and not isinstance(item, item_python_type):
+                            invalid_fields.append(f"{field_name}[{index}]")
+                            continue
+                        if isinstance(item, dict):
+                            if isinstance(item_required, list):
+                                invalid_fields.extend(
+                                    f"{field_name}[{index}].{required_name}"
+                                    for required_name in item_required
+                                    if isinstance(required_name, str) and required_name not in item
+                                )
+                            if isinstance(item_properties, dict) and item_properties:
+                                invalid_fields.extend(
+                                    f"{field_name}[{index}].{item_name}"
+                                    for item_name in item
+                                    if item_name not in item_properties
+                                )
+                                for item_name, item_value in item.items():
+                                    nested_schema = item_properties.get(item_name)
+                                    if not isinstance(nested_schema, dict):
+                                        continue
+                                    nested_expected_type = nested_schema.get("type")
+                                    nested_python_type = expected_types.get(nested_expected_type)
+                                    nested_matches = (
+                                        nested_python_type is None
+                                        or isinstance(item_value, nested_python_type)
+                                    )
+                                    if (
+                                        nested_expected_type in {"integer", "number"}
+                                        and isinstance(item_value, bool)
+                                    ):
+                                        nested_matches = False
+                                    if not nested_matches:
+                                        invalid_fields.append(
+                                            f"{field_name}[{index}].{item_name}"
+                                        )
+
+        invalid_fields = list(dict.fromkeys(invalid_fields))
+        if invalid_fields:
+            return {
+                "success": False,
+                "error_code": "TOOL_ARGUMENT_VALIDATION_FAILED",
+                "error": (
+                    f"Tool '{tool_name}' has unknown or type-invalid arguments: "
+                    f"{', '.join(invalid_fields)}."
+                ),
+                "tool_name": tool_name,
+                "missing_required_fields": [],
+                "invalid_fields": invalid_fields,
+                "retryable": True,
+            }
+        return None
     
     def execute_tool_call(self, tool_call) -> Dict[str, Any]:
         """Execute a tool call and return results using proper MCP architecture"""
@@ -464,7 +747,18 @@ class BaseAgent(ABC):
         try:
             # Parse arguments
             arguments = tool_call["arguments"]
-            
+
+            validation_error = self._validate_tool_call_arguments(tool_name, arguments)
+            if validation_error:
+                self.logger.warning(
+                    "[tool argument validation] tool=%s code=%s missing=%s invalid=%s",
+                    tool_name,
+                    validation_error.get("error_code"),
+                    validation_error.get("missing_required_fields", []),
+                    validation_error.get("invalid_fields", []),
+                )
+                return validation_error
+
             # Check if tool is available
             if tool_name not in self.available_tools:
                 return {
@@ -498,6 +792,31 @@ class BaseAgent(ABC):
                 
                 # Convert MCPClientResult to standard format
                 if hasattr(result, 'success'):
+                    # 传输层失败（网络/JSON-RPC error）直接返回，无需解包业务结果
+                    if not result.success:
+                        return {
+                            "success": False,
+                            "data": result.data,
+                            "error": result.error,
+                            "metadata": getattr(result, 'metadata', {})
+                        }
+
+                    # [FIX] 传输成功时，业务 success/error/data 藏在
+                    # result.data.content[0].text 的 JSON 串里，必须解包，否则工具业务失败
+                    # 会被传输层 success=True 掩盖（曾导致最终报告缺第3、5章）。
+                    business = self._unwrap_mcp_business_result(result.data)
+                    if business is not None:
+                        transport_metadata = getattr(result, 'metadata', {}) or {}
+                        business_metadata = dict(business.get("metadata") or transport_metadata)
+                        business_metadata["mcp_transport_retry_count"] = transport_metadata.get("retry_count", 0)
+                        return {
+                            "success": business.get("success", True),
+                            "data": business.get("data"),
+                            "error": business.get("error"),
+                            "metadata": business_metadata
+                        }
+
+                    # 无法识别业务结构时回退原行为，保证不比现状差
                     return {
                         "success": result.success,
                         "data": result.data,
@@ -519,6 +838,41 @@ class BaseAgent(ABC):
                 "error": f"Tool execution failed: {str(e)}"
             }
     
+    def _unwrap_mcp_business_result(self, data):
+        """
+        从 MCP tools/call 的传输层返回中解包业务结果。
+
+        传输层结构: {"content": [{"type": "text", "text": "<业务结果的 JSON 字符串>"}]}
+        业务结果结构: {"success": bool, "data": ..., "error": ..., "metadata": {...}}
+
+        Returns:
+            dict  - 成功解包出的业务结果（必须携带 success 键才返回）
+            None  - 无法识别为标准 MCP content 结构 / 非 JSON / 缺 success 键，交由调用方回退
+        """
+        try:
+            if not isinstance(data, dict):
+                return None
+            content = data.get("content")
+            if not isinstance(content, list) or not content:
+                return None
+            first = content[0]
+            if not isinstance(first, dict):
+                return None
+            text = first.get("text")
+            if not isinstance(text, str):
+                return None
+
+            parsed = json.loads(text)
+            if not isinstance(parsed, dict):
+                return None
+            # 仅当解析结果确实携带业务 success 语义时才认定为业务结果
+            if "success" not in parsed:
+                return None
+            return parsed
+        except Exception as e:
+            self.logger.debug(f"[MCP解包] 业务结果解包失败，回退原始结果: {e}")
+            return None
+
     def log_reasoning(self, iteration: int, reasoning: str):
         """Log reasoning step in the trace"""
         self.reasoning_trace.append({
@@ -587,9 +941,10 @@ class BaseAgent(ABC):
         
         return self.execution_stats.copy()
     
-    def create_response(self, success: bool, result: Dict[str, Any] = None, 
-                       error: str = None, iterations: int = 0, 
-                       execution_time: float = 0.0) -> AgentResponse:
+    def create_response(self, success: bool, result: Dict[str, Any] = None,
+                       error: str = None, iterations: int = 0,
+                       execution_time: float = 0.0,
+                       metadata: Dict[str, Any] = None) -> AgentResponse:
         """Create a standardized agent response"""
         return AgentResponse(
             success=success,
@@ -598,7 +953,8 @@ class BaseAgent(ABC):
             iterations=iterations,
             reasoning_trace=self.reasoning_trace.copy(),
             agent_name=self.config.agent_name,
-            execution_time=execution_time
+            execution_time=execution_time,
+            metadata=metadata or {},
         )
     
     def validate_config(self) -> bool:
