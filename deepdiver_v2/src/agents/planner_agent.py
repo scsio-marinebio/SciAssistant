@@ -1195,6 +1195,7 @@ $tool_call_format"""
                 model_name=planner_model_name,
                 provider=model_config.get("provider") or get_model_provider(planner_model_name),
                 enabled=model_config.get("pangu_ultra_moe_compat_enabled", False),
+                compat_profile=model_config.get("compat_profile", "auto"),
             )
             ultra_writer_max_invocations = max(
                 1,

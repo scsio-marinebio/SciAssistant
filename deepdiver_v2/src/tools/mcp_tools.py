@@ -5020,6 +5020,7 @@ class MCPTools:
             rag_references = []  # RAG 知识库引用
             user_file_references = []  # 用户文件引用
             other_references = []  # 其他引用
+            web_reference_urls = {}  # Original source ID -> web URL; Writer IDs stay unchanged
 
             # 为每个文件构建参考文献条目
             for num in reference_numbers:
@@ -5637,6 +5638,10 @@ class MCPTools:
                         logger.info(f"添加用户文件引用 {num}: {reference_entry}")
                     else:
                         other_references.append((num, reference_entry))
+                        if (normalized_file_path
+                                and not normalized_file_path.startswith('library_refs/')
+                                and url_source.startswith(('http://', 'https://'))):
+                            web_reference_urls[num] = url_source
                         logger.info(f"添加其他引用 {num}: {reference_entry}")
                 else:
                     # 默认引用条目
@@ -5654,11 +5659,43 @@ class MCPTools:
 
             # 创建原始序号到连续序号的映射，使参考文献序号连续
             # RAG 来源优先，用户文件次之，其他文件在后
-            old_to_new_num = {}
             all_sorted_refs = rag_references + user_file_references + other_references  # RAG 优先
 
+            # Merge duplicate web URLs only after all existing validity filters. Keep
+            # file_analysis.jsonl and the source IDs already used by Writer intact.
+            from urllib.parse import urlsplit
+
+            def reference_url_key(url):
+                try:
+                    parsed = urlsplit(url.strip())
+                    if parsed.scheme.lower() not in ('http', 'https') or not parsed.hostname:
+                        return None
+                    return (parsed.scheme.lower(), parsed.netloc.lower(),
+                            parsed.path.rstrip('/'), parsed.query)
+                except ValueError:
+                    return None
+
+            unique_refs = []
+            seen_web_urls = {}
+            duplicate_to_original = {}
+            for old_num, entry in all_sorted_refs:
+                url_key = reference_url_key(web_reference_urls[old_num]) if old_num in web_reference_urls else None
+                if url_key is not None and url_key in seen_web_urls:
+                    duplicate_to_original[old_num] = seen_web_urls[url_key]
+                    continue
+                if url_key is not None:
+                    seen_web_urls[url_key] = old_num
+                unique_refs.append((old_num, entry))
+            all_sorted_refs = unique_refs
+            if duplicate_to_original:
+                logger.info("报告参考来源按 URL 合并 %s 条重复记录: %s",
+                            len(duplicate_to_original), duplicate_to_original)
+
+            old_to_new_num = {}
             for new_num, (old_num, _) in enumerate(all_sorted_refs, 1):
                 old_to_new_num[old_num] = new_num
+            for duplicate_num, original_num in duplicate_to_original.items():
+                old_to_new_num[duplicate_num] = old_to_new_num[original_num]
 
             logger.info(f"\n序号重新映射: {old_to_new_num}")
 
@@ -5673,6 +5710,12 @@ class MCPTools:
                     f'<sup><a href="#ref-{unique_id}-{new_num}" style="text-decoration: none;">[{new_num}]</a></sup>',
                     merged_content
                 )
+
+            # Adjacent source IDs can now resolve to the same displayed citation.
+            if duplicate_to_original:
+                citation_sup = (r'<sup><a href="#ref-[^"]+-\d+" '
+                                r'style="text-decoration: none;">\[\d+\]</a></sup>')
+                merged_content = re.sub(rf'({citation_sup})(?:[ \t]*\1)+', r'\1', merged_content)
 
             # 【兜底处理】检查并移除未匹配的纯文本引用
             # 查找所有未被转换为上标的 [数字] 引用（即没有对应参考文献的引用）
@@ -6037,6 +6080,19 @@ class MCPTools:
             sections.append("\n".join(section_lines).strip())
         return sections
 
+    @staticmethod
+    def _first_chapter_is_abstract(outline: str) -> bool:
+        """The report merge adds its own abstract before numbered chapters."""
+        heading = re.search(r"^\s*##\s*1[.\uFF0E\u3001]\s*([^\r\n]+)", outline or "", re.MULTILINE)
+        if not heading:
+            return False
+        title = heading.group(1).strip().strip("*_ ")
+        return bool(re.match(
+            r"^(?:\u6458\u8981|\u6267\u884c\u6458\u8981|abstract|executive summary)(?:$|[\s:：—\-（(])",
+            title,
+            re.IGNORECASE,
+        ))
+
     @classmethod
     def _validate_classifier_contract(
         cls,
@@ -6099,7 +6155,8 @@ class MCPTools:
             model: Optional[str] = None,
             temperature: float = 0.3,
             max_tokens: int = 16384,
-            reasoning_text: str = ""
+            reasoning_text: str = "",
+            internal_reclassification: bool = False,
     ) -> MCPToolResult:
         """
         Classify and organize search result files according to a structured outline for comprehensive long-form content generation.
@@ -6125,7 +6182,7 @@ class MCPTools:
             human_in_loop_file = self.workspace_path / '.human_in_loop'
             logger.info(f"[HITL DEBUG] 检查文件: {human_in_loop_file} (workspace={self.workspace_path})")
             logger.info(f"[HITL DEBUG] 文件存在: {human_in_loop_file.exists()}")
-            if human_in_loop_file.exists():
+            if not internal_reclassification and human_in_loop_file.exists():
                 try:
                     with open(human_in_loop_file, 'r', encoding='utf-8') as f:
                         content = f.read().strip().lower()
@@ -6140,7 +6197,7 @@ class MCPTools:
 
             # 检查 workspace 中的 .user_outline 文件
             user_outline_file = self.workspace_path / '.user_outline'
-            if user_outline_file.exists():
+            if not internal_reclassification and user_outline_file.exists():
                 user_outline_path = str(user_outline_file)
 
             if human_in_loop and not user_outline_path:
@@ -6176,17 +6233,6 @@ class MCPTools:
                     }
                 )
 
-            # Auto模式：保存大纲和reasoning提示到文件供前端轮询展示（不暂停执行）
-            if not human_in_loop:
-                outline_generated_path = self.workspace_path / ".outline_generated"
-                if not reasoning_text:
-                    reasoning_text = "基于提供的研究资料，我将为您撰写这篇综合研究报告。让我首先生成一个系统性的研究大纲："
-                # 使用明确分隔符，便于前端准确分离reasoning和outline
-                full_content = f"{reasoning_text}\n\n---OUTLINE_START---\n\n{outline}"
-                with open(outline_generated_path, 'w', encoding='utf-8') as f:
-                    f.write(full_content)
-                logger.info(f"Auto模式: 大纲已保存到 {outline_generated_path}，继续执行")
-
             # 如果有用户确认的大纲，使用用户的大纲
             if user_outline_path and os.path.exists(user_outline_path):
                 with open(user_outline_path, 'r', encoding='utf-8') as f:
@@ -6197,6 +6243,28 @@ class MCPTools:
 
             # 处理输入的key_files - 使用四个分析维度
             # 获取本地的文件进行分析
+
+            if self._first_chapter_is_abstract(outline):
+                return MCPToolResult(
+                    success=False,
+                    error=(
+                        "INVALID_OUTLINE_FIRST_CHAPTER_ABSTRACT: The report merge automatically "
+                        "adds an abstract. Change Chapter 1 to an introduction or substantive "
+                        "topic, then classify the revised outline."
+                    ),
+                    metadata={"error_type": "invalid_outline_first_chapter_abstract"},
+                )
+
+            # Auto模式：保存大纲和reasoning提示到文件供前端轮询展示（不暂停执行）
+            if not human_in_loop and not internal_reclassification:
+                outline_generated_path = self.workspace_path / ".outline_generated"
+                if not reasoning_text:
+                    reasoning_text = "基于提供的研究资料，我将为您撰写这篇综合研究报告。让我首先生成一个系统性的研究大纲："
+                # 使用明确分隔符，便于前端准确分离reasoning和outline
+                full_content = f"{reasoning_text}\n\n---OUTLINE_START---\n\n{outline}"
+                with open(outline_generated_path, 'w', encoding='utf-8') as f:
+                    f.write(full_content)
+                logger.info(f"Auto模式: 大纲已保存到 {outline_generated_path}，继续执行")
 
             import os
             import json
@@ -6503,6 +6571,15 @@ Before you finalize your output, you MUST verify:
 
 """
 
+            if internal_reclassification:
+                user_file_priority_note = """
+FOCUSED CHAPTER SOURCE RECOVERY:
+- Select at most 11 original files that directly support this chapter's headings and named cases.
+- When a heading names an organization, product, project, or case, prioritize its primary source over broad background surveys.
+- Do not fill slots with generic context while direct case evidence is available.
+- Keep the chapter outline exactly unchanged and return the standard paragraph/file_path_list format.
+"""
+
             system_prompt = f"""You are an expert content organizer specializing in multi-dimensional file classification. 
 Your task is to classify research files according to a given outline by analyzing four key dimensions.
 
@@ -6520,7 +6597,8 @@ CLASSIFICATION INSTRUCTIONS:
 4. Use core content insights to find connections to outline sections, ensure the relevance of the assignment.
 5. Files should be assigned to multiple sections when they contain information spanning different topics
 6. Prioritize comprehensive coverage: Ensure every paragraph/chapter gets file assignments when any relevant content exists
-7.Note that if the first chapter is an abstract or introduction, a corresponding file must be assigned and there cannot be an empty file.
+7. For chapter headings naming specific cases or organizations, assign their directly relevant original files before broad surveys.
+8. If the first chapter is an introduction, assign relevant files to it; do not leave its file list empty.
 
 CRITICAL REQUIREMENT - OUTLINE STRUCTURE PRESERVATION:
 - The number of files assigned to each chapter cannot exceed 11, so if the number of files exceeds 11, you need the most relevant files.
@@ -6577,6 +6655,7 @@ OUTLINE TO ORGANIZE CONTENT:
                 model_name=model_name,
                 provider=provider,
                 enabled=model_config.get("pangu_ultra_moe_compat_enabled", False),
+                compat_profile=model_config.get("compat_profile", "auto"),
             )
             if ultra_compat_enabled:
                 system_prompt += (
@@ -6863,10 +6942,16 @@ OUTLINE TO ORGANIZE CONTENT:
             return None
 
         if line.startswith("## "):
-            return _normalize_report_heading_text(line)
+            normalized = _normalize_report_heading_text(line)
+        else:
+            parsed = _parse_numbered_report_heading(line)
+            normalized = parsed.normalized if parsed else None
 
-        parsed = _parse_numbered_report_heading(line)
-        return parsed.normalized if parsed else None
+        if normalized is None:
+            return None
+        # Comparison only: fold typographic hyphens inside Latin/alphanumeric
+        # compounds. Do not rewrite report text, dashes or mathematical minus.
+        return re.sub(r"(?<=[A-Za-z0-9])[\u2010\u2011](?=[A-Za-z0-9])", "-", normalized)
 
     @classmethod
     def _extract_expected_chapter_headings(cls, current_chapter_outline: str) -> List[str]:
@@ -7115,6 +7200,56 @@ CURRENT CHAPTER CONTENT:
             repaired_content = repaired_text.split("<chapter_content>")[1].split("</chapter_content>")[0].strip()
         return cls._correct_title_format(repaired_content, overall_outline)
 
+    def _write_chapter_file_atomically(self, target_file_path: str, content: str) -> MCPToolResult:
+        """Run the existing file-write checks before replacing an accepted chapter."""
+        staging_dir = None
+        staged_path = None
+        try:
+            normalized_input = str(target_file_path or "").replace("\\", "/")
+            canonical_target = suggested_canonical_part_path(target_file_path)
+            target = self._safe_join(canonical_target)
+            if canonical_target != normalized_input and target.exists():
+                return MCPToolResult(
+                    success=False,
+                    error=(
+                        f"非规范章节路径 {target_file_path} 将覆盖已有章节。"
+                        f"请改用 {canonical_target} 并一次写入完整章节。"
+                    ),
+                )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # Keep the original basename and report ancestry so file_write applies
+            # exactly the same marker and numeric-citation normalization as before.
+            staging_dir = Path(tempfile.mkdtemp(prefix=".chapter-write-", dir=str(target.parent)))
+            staged_path = staging_dir / target.name
+            relative_staged_path = os.path.relpath(staged_path, self.workspace_path)
+            written = self.file_write(file_path=relative_staged_path, content=content, create_dirs=True)
+            if not written.success:
+                return written
+            file_size = staged_path.stat().st_size
+            accepted = MCPToolResult(
+                success=True,
+                data=f"Written chapter to {canonical_target}",
+                metadata={"file_size": file_size, "encoding": "utf-8"},
+            )
+            os.replace(staged_path, target)
+            return accepted
+        except Exception as exc:
+            logger.warning("Atomic chapter write failed for %s: %s", target_file_path, exc)
+            return MCPToolResult(success=False, error=str(exc))
+        finally:
+            # Cleanup errors must never turn a committed replacement into a
+            # reported failure (the caller would otherwise reuse the old summary).
+            if staged_path is not None:
+                try:
+                    staged_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning("Could not remove staged chapter %s: %s", staged_path, exc)
+            if staging_dir is not None:
+                try:
+                    staging_dir.rmdir()
+                except OSError as exc:
+                    logger.warning("Could not remove chapter staging directory %s: %s", staging_dir, exc)
+
     def section_writer(
             self,
             written_chapters_summary: str,
@@ -7141,6 +7276,7 @@ CURRENT CHAPTER CONTENT:
             temperature: Creativity level for the AI response (0-1)
             max_tokens: Maximum tokens for the AI response
         """
+        chapter_file_unchanged = True
         try:
             # Get configuration
             from config.config import get_model_config, get_storage_config
@@ -7220,8 +7356,9 @@ CURRENT CHAPTER CONTENT:
                             prompt_files += (
                                 "\nBACKGROUND ONLY (not a citable source):\n" + file_content +
                                 "\nDo not cite this file or copy its numeric citations. "
-                                "If no original evidence is supplied, state the evidence limitation "
-                                "and present recommendations as proposals, not verified facts.\n"
+                                "If no original evidence is supplied, omit unsupported specific claims "
+                                "and present recommendations as proposals, not verified facts. "
+                                "Do not add source-availability notices to the report.\n"
                             )
                             continue
                         doc_time = file_info.get('doc_time', 'Not specified')
@@ -7294,7 +7431,7 @@ CURRENT CHAPTER CONTENT:
                 )
                 heading_instruction_section_writer = (
                     "Other points to note:\n"
-                    "- If the first chapter is an **Abstract** or **Introduction**, do not include subheadings (level-2 or finer bullet points)—begin the content directly under the level-1 heading.\n"
+                    "- If the first chapter is an **Introduction**, do not include subheadings (level-2 or finer bullet points)—begin the content directly under the level-1 heading.\n"
                     "- CONTENT LENGTH: Each section should contain approximately 2500 words to ensure comprehensive coverage.\n"
                     "- **CRITICAL HEADING FORMAT RULES:**\n"
                     '  * **Level 1 chapter headings**: Use Markdown "##" format, e.g. "## 2. Molecular Mechanisms"\n'
@@ -7332,7 +7469,7 @@ CURRENT CHAPTER CONTENT:
                 )
                 heading_instruction_section_writer = (
                     "其他注意事项：\n"
-                    "- 如果第一章是**摘要**或**引言**，不要包含子标题（二级或更细的要点）——直接在二级标题下开始内容。\n"
+                    "- 如果第一章是**引言**，不要包含子标题（二级或更细的要点）——直接在二级标题下开始内容。\n"
                     "- 内容长度：每个章节应包含约2500字，以确保全面覆盖。\n"
                     "- **关键标题格式规则：**\n"
                     '  * **一级章节标题**：使用 Markdown "##" 格式，如 "## 2. 分子机制"\n'
@@ -7437,7 +7574,7 @@ Strictly follow the following format for output:
                     return MCPToolResult(
                         success=False,
                         error=f"section writer 输出仍包含内部标记: {marker_issues[:10]}",
-                        metadata={"internal_marker_issues": marker_issues[:10]},
+                        metadata={"internal_marker_issues": marker_issues[:10], "chapter_file_unchanged": True},
                     )
 
                 logger.debug(f"Content before correction: {content[:200]}...")
@@ -7476,7 +7613,8 @@ Strictly follow the following format for output:
                         error=(
                             "section writer failed: chapter structure mismatch with outline. "
                             f"expected={structure_validation.get('expected')}, actual={structure_validation.get('actual')}"
-                        )
+                        ),
+                        metadata={"chapter_file_unchanged": True},
                     )
                 # [方案2] 正文完整性校验（空子节 / 截断检测）——仅新增分支，正常章节零影响。
                 # 主力：定向补全（保留已有正文、只补空子节）；兜底：默认 A（显式失败并触发整章重试），仅调试时可显式配置 B 写入告警产物。
@@ -7593,7 +7731,8 @@ Strictly follow the following format for output:
                                 error=(
                                     "section writer failed: chapter body incomplete after completion attempts. "
                                     f"empty_sections={body_validation.get('empty_sections')}, truncated={body_validation.get('truncated')}"
-                                )
+                                ),
+                                metadata={"chapter_file_unchanged": True},
                             )
                         else:
                             logger.warning(
@@ -7648,6 +7787,9 @@ Strictly follow the following format for output:
                     content, source_evidence, cross_evidence, repair_citations_only,
                     chinese=not is_english_query,
                 )
+                final_ids = citation_ids(content)
+                citation_review['final_missing'] = bool(source_evidence) and not final_ids
+                citation_review['final_citation_count'] = len(final_ids)
                 if citation_review['repair_attempted'] or citation_review['no_original_evidence']:
                     logger.warning("[ChapterCitations] %s: %s", target_file_path, citation_review)
                 # Summary must describe the accepted content, not the uncorrected initial response.
@@ -7686,27 +7828,11 @@ Strictly follow the following format for output:
                     {"role": "assistant", "content": summary_ai_response}
                 ]
 
-                # 把当前内容写入到target_file_path中
-                # [FIX-P1] 写入前先删除已存在的目标文件，防止旧内容残留
-                target_full_path = self._safe_join(target_file_path)
-                if os.path.exists(target_full_path):
-                    try:
-                        os.remove(target_full_path)
-                        logger.info(f"[section_writer] 清理旧章节文件: {target_full_path}")
-                    except Exception as e:
-                        logger.warning(f"[section_writer] 清理旧章节文件失败: {e}")
-
-                write_result = self.file_write(file_path=target_file_path,
-                                               content=content,
-                                               create_dirs=True)
-                if not write_result.success:
-                    raise Exception(f"File write failed: {write_result.error}")
-
                 chapter_payload = {
                     "chapter_summary": summary,
                     "structure_validation": structure_validation
                 }
-                return MCPToolResult(
+                accepted = MCPToolResult(
                     success=True,
                     data=chapter_payload,
                     metadata={
@@ -7719,17 +7845,28 @@ Strictly follow the following format for output:
                         'truncated': body_validation.get("truncated", False),
                     }
                 )
+                # Build the response before committing the chapter, so response
+                # preparation cannot fail after the accepted file is replaced.
+                write_result = self._write_chapter_file_atomically(target_file_path, content)
+                if not write_result.success:
+                    raise Exception(f"File write failed: {write_result.error}")
+                chapter_file_unchanged = False
+                return accepted
 
             except Exception as e:
                 logger.error(f"AI model call failed: {e}")
                 return MCPToolResult(
                     success=False,
-                    error=f"section writer failed: {str(e)}"
+                    error=f"section writer failed: {str(e)}",
+                    metadata={"chapter_file_unchanged": chapter_file_unchanged},
                 )
 
         except Exception as e:
             logger.error(f"section writer failed: {e}")
-            return MCPToolResult(success=False, error=str(e))
+            return MCPToolResult(
+                success=False, error=str(e),
+                metadata={"chapter_file_unchanged": chapter_file_unchanged},
+            )
 
     def prepare_writer_sources(self, key_files: List[Dict], user_query: str) -> MCPToolResult:
         """Internal one-shot registration check, before Writer assigns source IDs."""
@@ -13715,6 +13852,11 @@ MCP_TOOL_SCHEMAS = {
                     "type": "string",
                     "default": "",
                     "description": "Your reasoning process text explaining how you analyzed the research materials and why you generated this specific outline structure. This text will be displayed to the user before the outline. Write it in the same language as the user's query. Example: '基于提供的研究资料，我分析了关于[主题]的多个维度，包括[维度1]、[维度2]等。结合用户的查询需求，我将为您撰写一篇综合研究报告，大纲结构如下：'"
+                },
+                "internal_reclassification": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Internal focused chapter source recovery; does not publish or replace the report outline"
                 }
             },
             "required": ["key_files", "outline"]

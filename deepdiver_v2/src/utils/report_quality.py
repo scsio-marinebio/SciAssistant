@@ -115,10 +115,10 @@ def normalize_report_artifacts(content: str, *, source_citations: bool = False) 
     # may convert it; the final delivery gate must report it instead. Preserve
     # ordinary Markdown link labels such as [web36](https://example.com).
     if source_citations:
-        # Repeated prefixes are unambiguous only in raw source-citation mode.
+        # One shared or repeated webpage prefix is unambiguous in source mode.
         # Leave Markdown links and malformed/mixed labels for the existing gate.
         normalized = re.sub(
-            r"\[\s*(webp(?:aeg|age)\s*\d+(?:\s*[,;，、]\s*webp(?:aeg|age)\s*\d+)+)\s*\](?!\()",
+            r"\[\s*(webp(?:aeg|age)\s*\d+(?:\s*[,;，；、]\s*(?:webp(?:aeg|age)\s*)?\d+)+)\s*\](?!\()",
             normalize_named_citation, normalized, flags=re.IGNORECASE,
         )
         normalized = re.sub(

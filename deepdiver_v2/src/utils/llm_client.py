@@ -264,7 +264,7 @@ def llm_chat(
             "attempt=%s/%s timeout=%ss messages=%s chars=%s max_tokens=%s "
             "enable_thinking=%s chat_template_think=%s thinking_type=%s "
             "chat_template_enable_thinking=%s reasoning_effort=%s tool_call_mode=%s tools=%s "
-            "request_fingerprint=%s",
+            "compat_profile=%s request_fingerprint=%s",
             model_name,
             provider,
             url,
@@ -284,6 +284,7 @@ def llm_chat(
             body.get("reasoning_effort"),
             resolved_tool_call_mode,
             len(body.get("tools") or []),
+            model_cfg.get("compat_profile", "auto"),
             request_fingerprint,
         )
         try:

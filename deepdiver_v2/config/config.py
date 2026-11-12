@@ -35,6 +35,17 @@ def normalize_tool_call_mode(value: Optional[str]) -> str:
     return mode
 
 
+def normalize_model_compat_profile(value: Optional[str]) -> str:
+    """Select local compatibility independently of a deployment's model ID."""
+    profile = (value or "auto").strip().lower() or "auto"
+    if profile not in {"auto", "none", "pangu_ultra_moe"}:
+        raise ValueError(
+            "MODEL_COMPAT_PROFILE must be 'auto', 'none', or 'pangu_ultra_moe', "
+            f"got {value!r}"
+        )
+    return profile
+
+
 @dataclass
 class APIConfig:
     """Configuration class for API keys and settings"""
@@ -49,6 +60,8 @@ class APIConfig:
     # Endpoint/template profile for observability and future endpoint-specific
     # adapters. Generic malformed-tag recovery is schema/signature driven.
     model_api_profile: str = "default"
+    # auto preserves legacy exact-name matching; explicit profiles support aliases.
+    model_compat_profile: str = "auto"  # auto | none | pangu_ultra_moe
     # Tool-call transport is a deployment capability, not a model-name rule.
     # Keep text as the compatibility default; enable native only after the
     # configured endpoint/model combination has passed a direct probe.
@@ -59,7 +72,7 @@ class APIConfig:
     model_thinking_format: Optional[str] = None
     model_thinking_mode: Optional[str] = None
     model_reasoning_effort: Optional[str] = None
-    # Exact-model compatibility switch. It never applies to legacy pangu models.
+    # Requires a matching compatibility profile and provider=pangu.
     pangu_ultra_moe_compat_enabled: bool = False
     pangu_ultra_classifier_max_format_retries: int = 1
     pangu_ultra_classifier_temperature: float = 0.0
@@ -133,6 +146,9 @@ class APIConfig:
         self.model_api_profile = os.getenv(
             'MODEL_API_PROFILE', self.model_api_profile
         ).strip().lower()
+        self.model_compat_profile = normalize_model_compat_profile(
+            os.getenv('MODEL_COMPAT_PROFILE', self.model_compat_profile)
+        )
         self.model_tool_call_mode = normalize_tool_call_mode(
             os.getenv('MODEL_TOOL_CALL_MODE', self.model_tool_call_mode)
         )
@@ -259,6 +275,7 @@ class APIConfig:
             "model": self.model_name,
             "provider": self.model_provider,
             "api_profile": self.model_api_profile,
+            "compat_profile": self.model_compat_profile,
             "tool_call_mode": self.model_tool_call_mode,
             "chat_template": self.model_chat_template,
             "spaces_between_special_tokens": self.model_spaces_between_special_tokens,
@@ -309,8 +326,13 @@ def is_pangu_ultra_moe_compat_enabled(
     model_name: Optional[str] = None,
     provider: Optional[str] = None,
     enabled: Optional[bool] = None,
+    compat_profile: Optional[str] = None,
 ) -> bool:
-    """Return True only for the explicitly enabled pangu_ultra_moe adapter."""
+    """Gate Ultra compatibility by opt-in profile, provider, and master switch.
+
+    auto keeps the original exact-name behavior. An explicit Ultra profile lets
+    trusted deployments use their own model ID without rewriting API requests.
+    """
     resolved_name = (model_name or config.model_name or "").strip().lower()
     resolved_provider = (provider or config.model_provider or "").strip().lower()
     if not resolved_provider or resolved_provider == "auto":
@@ -318,10 +340,16 @@ def is_pangu_ultra_moe_compat_enabled(
     resolved_enabled = (
         config.pangu_ultra_moe_compat_enabled if enabled is None else bool(enabled)
     )
+    resolved_profile = normalize_model_compat_profile(
+        config.model_compat_profile if compat_profile is None else compat_profile
+    )
     return (
         resolved_enabled
         and resolved_provider == "pangu"
-        and resolved_name == "pangu_ultra_moe"
+        and (
+            resolved_profile == "pangu_ultra_moe"
+            or (resolved_profile == "auto" and resolved_name == "pangu_ultra_moe")
+        )
     )
 
 

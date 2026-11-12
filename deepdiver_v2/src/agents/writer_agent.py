@@ -184,6 +184,9 @@ class WriterAgent(BaseAgent):
         if not isinstance(arguments, dict):
             return []
 
+        # Only the program-owned citation recovery may bypass outline publishing
+        # and confirmation. Never accept this flag from a model-generated call.
+        arguments.pop("internal_reclassification", None)
         trusted_values = {
             "key_files": self._trusted_section_writer_context.get("key_files"),
             "outline": self._trusted_section_writer_context.get("overall_outline"),
@@ -333,6 +336,149 @@ class WriterAgent(BaseAgent):
         summary = data.get("chapter_summary", "") if isinstance(data, dict) else ""
         if isinstance(summary, str) and summary.strip():
             self._trusted_chapter_summaries.append(summary.strip())
+
+    def _write_chapter_with_citation_recovery(
+        self, tool_call: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Recover missing citations once, independently of chapter quality review."""
+        result = self.execute_tool_call(tool_call)
+        if not result.get("success"):
+            return result
+
+        arguments = dict(tool_call.get("arguments") or {})
+        session_id = getattr(self, "_bound_session_id", None) or "-"
+        task_id = getattr(self, "task_id", None) or "-"
+        target = arguments.get("target_file_path", "unknown")
+        tool_calls = 1
+        rewrite_used = False
+        review = (result.get("metadata") or {}).get("citation_review") or {}
+        missing = bool(review.get("final_missing", review.get("missing")))
+        trusted_context = getattr(self, "_trusted_section_writer_context", {}) or {}
+        source_pool = trusted_context.get("key_files") or arguments.get("key_files") or []
+
+        if missing and not review.get("no_original_evidence") and source_pool:
+            focused_args = {
+                "outline": arguments.get("current_chapter_outline", ""),
+                "key_files": source_pool,
+                "temperature": 0,
+                "internal_reclassification": True,
+            }
+            self.logger.info(
+                "[ChapterCitations] session=%s task=%s target=%s "
+                "stage=source_reselection_start available=%s",
+                session_id, task_id, target, len(source_pool),
+            )
+            try:
+                tool_calls += 1
+                focused_result = self.execute_tool_call({
+                    "name": "search_result_classifier", "arguments": focused_args,
+                })
+                contract_error = self._classification_contract_error(focused_args, focused_result)
+                if focused_result.get("success") and not contract_error:
+                    focused_sections = self._parse_classification_result(focused_result["data"])
+                    selected_paths = focused_sections[0]["file_paths"][:11]
+                    arguments["key_files"] = self._select_key_files_by_paths(source_pool, selected_paths)
+                    self.logger.info(
+                        "[ChapterCitations] session=%s task=%s target=%s "
+                        "stage=source_reselection_result selected=%s",
+                        session_id, task_id, target, len(arguments["key_files"]),
+                    )
+                else:
+                    self.logger.warning(
+                        "[ChapterCitations] session=%s task=%s target=%s "
+                        "stage=source_reselection_failed reason=%s",
+                        session_id, task_id, target,
+                        contract_error or focused_result.get("error", "unknown error"),
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    "[ChapterCitations] session=%s task=%s target=%s "
+                    "stage=source_reselection_failed reason=%s",
+                    session_id, task_id, target, exc,
+                )
+
+            # Reuse the baseline writer contract; do not add V3 revision inputs.
+            arguments["task_content"] = str(arguments.get("task_content") or "") + (
+                "\n\nCITATION RECOVERY FOR THIS CHAPTER:\n"
+                "Rewrite this chapter using the supplied original sources. Cite supported "
+                "case facts and important factual claims with their exact global source IDs. "
+                "Remove or generalize any specific assertion that the sources do not support. "
+                "Preserve the chapter headings, required scope and language. Do not invent "
+                "citations. Do not insert source-availability or evidence-limitation notices "
+                "into the report."
+            )
+            rewrite_used = True
+            self.logger.info(
+                "[ChapterCitations] session=%s task=%s target=%s stage=rewrite_start",
+                session_id, task_id, target,
+            )
+            try:
+                tool_calls += 1
+                rewritten = self.execute_tool_call({"name": "section_writer", "arguments": arguments})
+            except Exception as exc:
+                rewritten = {"success": False, "error": str(exc)}
+            if rewritten.get("success"):
+                result = rewritten
+                review = (result.get("metadata") or {}).get("citation_review") or {}
+            else:
+                rewrite_metadata = rewritten.get("metadata") or {}
+                unchanged = (
+                    rewrite_metadata.get("chapter_file_unchanged") is True
+                    and rewrite_metadata.get("mcp_transport_retry_count", 0) == 0
+                )
+                unchanged = unchanged or rewritten.get("error_code") == "TOOL_ARGUMENT_VALIDATION_FAILED"
+                if not unchanged:
+                    # A lost response does not prove the server left the chapter
+                    # untouched. Never attach the previous summary to an unknown draft.
+                    self.logger.error(
+                        "[ChapterCitations] session=%s task=%s target=%s "
+                        "stage=rewrite_state_unknown error=%s",
+                        session_id, task_id, target, rewritten.get("error", "unknown error"),
+                    )
+                    return {
+                        "success": False,
+                        "error": rewritten.get("error", "Citation rewrite outcome is unknown"),
+                        "error_code": "CITATION_REWRITE_STATE_UNKNOWN",
+                        "metadata": {
+                            "write_state_unknown": True,
+                            "citation_rewrite_used": True,
+                            "citation_warning": True,
+                            "citation_recovery_tool_calls": tool_calls,
+                            "retryable": False,
+                        },
+                    }
+                # The server commits chapters atomically, so the earlier successful
+                # result and its summary still describe the chapter on disk.
+                self.logger.warning(
+                    "[ChapterCitations] session=%s task=%s target=%s "
+                    "stage=rewrite_failed_using_prior_draft error=%s",
+                    session_id, task_id, target, rewritten.get("error", "unknown error"),
+                )
+
+        warning = bool(
+            review.get("final_missing", review.get("missing"))
+            or review.get("no_original_evidence")
+        )
+        if warning:
+            self.logger.warning(
+                "[ChapterCitations] session=%s task=%s target=%s "
+                "stage=unresolved_after_recovery no_original_evidence=%s",
+                session_id, task_id, target, review.get("no_original_evidence", False),
+            )
+        elif rewrite_used:
+            self.logger.info(
+                "[ChapterCitations] session=%s task=%s target=%s "
+                "stage=recovered final_citation_count=%s",
+                session_id, task_id, target, review.get("final_citation_count", "unknown"),
+            )
+        result = dict(result)
+        result["metadata"] = dict(result.get("metadata") or {})
+        result["metadata"].update({
+            "citation_rewrite_used": rewrite_used,
+            "citation_warning": warning,
+            "citation_recovery_tool_calls": tool_calls,
+        })
+        return result
 
     def _record_tool_validation_failure(
         self,
@@ -646,7 +792,7 @@ Then you strictly follow the steps given below:
                 - "3.2 Methods" (plain text, under "## 3. xxx")
             - This structure is CRITICAL for the final PDF table of contents.
             - REMINDER: Every Level 2 heading (1.1, 1.2, 2.1, 2.2, 2.3, 2.4, etc.) MUST be plain text without any markdown symbols!
-        - **Note3:** The number of chapters must not exceed 7, dynamic evaluation can be performed based on the collected content. For example, if there is a lot of content, more chapters can be generated, and vice versa. But each chapter should only include Level 1 and Level 2 headings. Also, please generate more Level 2 headings (suggest 3-6) to ensure the content is rich and detailed. However, if the first chapter is an abstract or introduction, do not generate subheadings (level-2 headings)—only include the main heading (level-1). Additionally, tailor the outline style based on the type of document. For example, in a research report, the first chapter should preferably be titled \"Abstract\" or \"Introduction.\"  
+        - **Note3:** The number of chapters must not exceed 7, dynamic evaluation can be performed based on the collected content. For example, if there is a lot of content, more chapters can be generated, and vice versa. But each chapter should only include Level 1 and Level 2 headings. Also, please generate more Level 2 headings (suggest 3-6) to ensure the content is rich and detailed. The final report merge automatically adds a separate abstract before Chapter 1, so do not create a chapter titled "Abstract", "摘要", "Executive Summary", or an equivalent title. The first chapter may be an introduction when appropriate; if so, do not generate subheadings (level-2 headings)—only include the main heading (level-1).
         
         2. FILE CLASSIFICATION  
         - Use the search_result_classifier tool to reasonably split the outline generated above and accurately assign key files to each chapter of the outline.
@@ -792,7 +938,7 @@ For each function call, return a JSON object with function name and arguments:
                     + ("\nUse only original Key Files for citations; verify each claim against their content.\n"
                        if original_paths else
                        "\nNo verified original sources are available. Key Files are background routing only. "
-                       "Write without numeric citations and clearly disclose the evidence limitation.\n")
+                       "Do not invent citations or unsupported factual claims.\n")
                 )
                 selected_files = [{'file_path': path} for path in (original_paths or background_paths)]
                 task_input.key_files = selected_files
@@ -924,6 +1070,7 @@ For each function call, return a JSON object with function name and arguments:
                 model_name=model_name,
                 provider=provider,
                 enabled=model_config.get("pangu_ultra_moe_compat_enabled", False),
+                compat_profile=model_config.get("compat_profile", "auto"),
             )
             and bool(model_config.get("pangu_ultra_writer_fallback_enabled", False))
         )
@@ -1203,7 +1350,7 @@ For each function call, return a JSON object with function name and arguments:
             )
             retries_used = 0
             while True:
-                tool_result = self.execute_tool_call(tool_call)
+                tool_result = self._write_chapter_with_citation_recovery(tool_call)
                 action_iteration += 1
                 self.log_action(action_iteration, "section_writer", tool_call["arguments"], tool_result)
                 if tool_result.get("success"):
@@ -1592,6 +1739,18 @@ For each function call, return a JSON object with function name and arguments:
                                 llm_turn.tool_call_mode,
                             )
                             metadata = tool_result.get("metadata") or {}
+                            if (
+                                is_phase2
+                                and metadata.get("error_type") == "invalid_outline_first_chapter_abstract"
+                            ):
+                                terminal_error = tool_result.get("error", "Invalid confirmed outline")
+                                terminal_metadata = {
+                                    "error_type": "invalid_outline_first_chapter_abstract",
+                                    "retryable": False,
+                                    "stage": "writer",
+                                }
+                                classifier_circuit_open = True
+                                break
                             if metadata.get("non_retryable_in_writer"):
                                 if self._should_use_ultra_classifier_fallback(model_config):
                                     overall_outline = arguments.get("outline", "")
@@ -1758,7 +1917,7 @@ For each function call, return a JSON object with function name and arguments:
                                         key_files_count,
                                         write_file_path or "unknown"
                                     )
-                                    tool_result = self.execute_tool_call(tool_call)
+                                    tool_result = self._write_chapter_with_citation_recovery(tool_call)
                                     
                                     # 如果成功，更新计数器
                                     if tool_result.get("success"):
@@ -1799,7 +1958,7 @@ For each function call, return a JSON object with function name and arguments:
                                     key_files_count,
                                     write_file_path or "unknown"
                                 )
-                                tool_result = self.execute_tool_call(tool_call)
+                                tool_result = self._write_chapter_with_citation_recovery(tool_call)
                                 
                                 # 更新计数（无章节编号的情况）
                                 if tool_result.get("success"):

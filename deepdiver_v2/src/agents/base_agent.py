@@ -806,11 +806,14 @@ class BaseAgent(ABC):
                     # 会被传输层 success=True 掩盖（曾导致最终报告缺第3、5章）。
                     business = self._unwrap_mcp_business_result(result.data)
                     if business is not None:
+                        transport_metadata = getattr(result, 'metadata', {}) or {}
+                        business_metadata = dict(business.get("metadata") or transport_metadata)
+                        business_metadata["mcp_transport_retry_count"] = transport_metadata.get("retry_count", 0)
                         return {
                             "success": business.get("success", True),
                             "data": business.get("data"),
                             "error": business.get("error"),
-                            "metadata": business.get("metadata", getattr(result, 'metadata', {}))
+                            "metadata": business_metadata
                         }
 
                     # 无法识别业务结构时回退原行为，保证不比现状差
